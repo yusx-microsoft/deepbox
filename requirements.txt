@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+itsdangerous>=2.1
+websockets>=12.0
+httpx>=0.27
+pywinpty>=2.0 ; sys_platform == "win32"

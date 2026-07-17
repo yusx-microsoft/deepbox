@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>deepbox</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"/>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#c9d1d9;--acc:#2f81f7;}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+  header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header b{font-size:16px}
+  main{display:flex;height:calc(100vh - 49px)}
+  .side{width:320px;border-right:1px solid var(--border);overflow:auto;padding:12px}
+  .content{flex:1;display:flex;flex-direction:column}
+  button{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid var(--border);color:var(--fg)}
+  input,select{background:#0d1117;border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:6px 8px;width:100%}
+  .card{border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px;background:var(--panel)}
+  .row{display:flex;gap:6px;align-items:center}
+  .muted{color:#8b949e;font-size:12px}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
+  .on{background:#3fb950}.off{background:#6e7681}
+  .agent{padding:6px;border-radius:6px;cursor:pointer}
+  .agent:hover{background:#21262d}
+  .token{font-family:monospace;font-size:12px;word-break:break-all;background:#0d1117;padding:8px;border-radius:6px;border:1px solid var(--border)}
+  #term{flex:1;padding:6px;background:#000}
+  .center{max-width:340px;margin:80px auto}
+  .stack>*{margin-bottom:8px}
+  h4{margin:6px 0}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
