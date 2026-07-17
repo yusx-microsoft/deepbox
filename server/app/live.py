@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import pyte
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "sessions"
+from .config import settings
+
+DATA_DIR = settings.data_dir / "sessions"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_COLS = 120

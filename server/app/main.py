@@ -3,6 +3,7 @@ WebSocket endpoints (human terminal + devbox connector)."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from fastapi import (
@@ -12,7 +13,7 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, BadSignature
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session as OrmSession
 
 from . import models
@@ -23,13 +24,13 @@ from .util import (
     new_id, new_token, hash_token, hash_password, verify_password,
 )
 from .hub import hub, DevboxConn, HumanConn
+from .config import settings
 from .live import live_registry
 
-SECRET = "dev-secret-change-me"
-signer = URLSafeSerializer(SECRET, salt="deepbox-session")
+signer = URLSafeSerializer(settings.secret, salt="deepbox-session")
 
 app = FastAPI(title="deepbox")
-models.init_db()
+models.init_db(settings.database_url)
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
@@ -41,6 +42,25 @@ def db() -> OrmSession:
         yield s
     finally:
         s.close()
+
+
+@app.get("/api/health", include_in_schema=False)
+async def health():
+    """Liveness only; intentionally contains no user or infrastructure data."""
+    return {"status": "ok", "protocol_version": PROTOCOL_VERSION}
+
+
+@app.get("/api/ready", include_in_schema=False)
+async def ready(s: OrmSession = Depends(db)):
+    """Readiness: database responds and the recording directory is writable."""
+    try:
+        s.execute(text("SELECT 1"))
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        if not os.access(settings.data_dir, os.W_OK):
+            raise OSError("data directory is not writable")
+    except Exception:
+        raise HTTPException(503, "not ready")
+    return {"status": "ready", "protocol_version": PROTOCOL_VERSION}
 
 
 # ---------------------------------------------------------------- auth helpers
@@ -101,7 +121,8 @@ def _login_response(user: User) -> JSONResponse:
     resp = JSONResponse({"id": user.id, "username": user.username,
                          "display_name": user.display_name})
     resp.set_cookie("deepbox_session", signer.dumps({"uid": user.id}),
-                    httponly=True, samesite="lax")
+                    httponly=True, samesite=settings.cookie_samesite,
+                    secure=settings.cookie_secure)
     return resp
 
 
@@ -299,7 +320,7 @@ async def ws_devbox(ws: WebSocket):
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     else:
-        token = ws.query_params.get("token", "")
+        token = ""  # tokens in query strings leak into URLs/logs; never accept them
     s = models.SessionLocal()
     tok = s.scalar(select(Token).where(Token.hash == hash_token(token)))
     if not tok or tok.revoked_at is not None:
@@ -375,6 +396,11 @@ async def ws_devbox(ws: WebSocket):
 # ---------------------------------------------------------------- WS: human (terminal)
 @app.websocket("/ws/term")
 async def ws_term(ws: WebSocket):
+    # Browser cookies authenticate this socket, so reject cross-origin WS
+    # attempts before reading the session cookie.
+    if not settings.origin_allowed(ws.headers.get("origin")):
+        await ws.close(code=4003)
+        return
     cookie = ws.cookies.get("deepbox_session")
     try:
         uid = signer.loads(cookie)["uid"] if cookie else None

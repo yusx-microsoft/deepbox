@@ -2,7 +2,7 @@
 interactive CLI (via PTY) to the platform.
 
 Run:
-    set DEEPBOX_SERVER_URL=http://localhost:8000
+    set DEEPBOX_SERVER_URL=http://localhost:8077
     set DEEPBOX_TOKEN=hpc_box_...
     python -m connector
 """
@@ -18,7 +18,10 @@ from collections import deque
 import httpx
 import websockets
 
+from .diagnostics import explain_connection_error, run_doctor
 from .pty_session import PtySession, resolve_cmd, DEFAULT_CMDS
+
+PROTOCOL_VERSION = 2
 
 
 def ws_url(server_url: str) -> str:
@@ -44,11 +47,15 @@ class Connector:
         self.ws = None
 
     async def fetch_me(self):
-        async with httpx.AsyncClient() as c:
+        async with httpx.AsyncClient(timeout=10.0) as c:
             r = await c.get(f"{self.server_url}/api/me",
                             headers={"Authorization": f"Bearer {self.token}"})
             r.raise_for_status()
             data = r.json()
+        server_protocol = data.get("protocol_version")
+        if server_protocol != PROTOCOL_VERSION:
+            raise RuntimeError(
+                f"protocol mismatch: connector={PROTOCOL_VERSION}, server={server_protocol}")
         self.agents = {a["id"]: a for a in data["agents"]}
         print(f"[connector] devbox={data['name']} agents={[a['handle'] for a in data['agents']]}")
         return data
@@ -70,10 +77,12 @@ class Connector:
                          json={"capabilities": caps})
 
     async def run(self):
+        print(f"[connector] authenticating with {self.server_url} (protocol {PROTOCOL_VERSION})")
         me = await self.fetch_me()
         caps = self.probe_runtimes()
         await self.report_runtimes(me["devbox_id"], caps)
         print(f"[connector] runtimes available: {caps}")
+        print(f"[connector] opening WebSocket {ws_url(self.server_url)}")
 
         async with websockets.connect(
                 ws_url(self.server_url),
@@ -177,17 +186,27 @@ class Connector:
 async def main():
     ap = argparse.ArgumentParser("deepbox-connector")
     ap.add_argument("--server-url", default=os.environ.get("DEEPBOX_SERVER_URL",
-                                                            "http://localhost:8000"))
+                                                            "http://localhost:8077"))
     ap.add_argument("--token", default=os.environ.get("DEEPBOX_TOKEN"))
+    ap.add_argument("--doctor", action="store_true",
+                    help="check URL, TLS, health, protocol, and authentication, then exit")
     args = ap.parse_args()
+
+    if args.doctor:
+        checks = await asyncio.to_thread(run_doctor, args.server_url, args.token or "",
+                                         PROTOCOL_VERSION)
+        for check in checks:
+            print(f"[{'OK' if check.ok else 'FAIL'}] {check.name}: {check.detail}")
+        raise SystemExit(0 if all(check.ok for check in checks) else 1)
+
     if not args.token:
         raise SystemExit("Set DEEPBOX_TOKEN or pass --token")
     c = Connector(args.server_url, args.token)
     while True:
         try:
             await c.run()
-        except Exception as e:
-            print(f"[connector] disconnected: {e}; retry in 3s")
+        except Exception as exc:
+            print(f"[connector] disconnected: {explain_connection_error(exc)}; retry in 3s")
             await asyncio.sleep(3)
 
 
