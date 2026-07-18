@@ -1,9 +1,13 @@
+# Server (control plane) dependencies.
+# This is the file Azure Oryx installs during zip deploy, so it MUST remain
+# Linux-installable and must NOT pull in Windows-only packages such as
+# pywinpty. Connector-only dependencies live in requirements-connector.txt.
 fastapi>=0.110
 uvicorn[standard]>=0.29
+gunicorn>=21.2
 sqlalchemy>=2.0
 itsdangerous>=2.1
 websockets>=12.0
 httpx>=0.27
-pywinpty>=2.0 ; sys_platform == "win32"
 pyte>=0.8.2
 python-dotenv>=1.0

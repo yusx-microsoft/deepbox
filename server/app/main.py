@@ -94,6 +94,8 @@ def devbox_from_bearer(request: Request, s: OrmSession) -> Devbox:
 # ---------------------------------------------------------------- auth routes
 @app.post("/api/auth/register")
 async def register(request: Request, s: OrmSession = Depends(db)):
+    if not settings.registration_enabled:
+        raise HTTPException(403, "registration disabled")
     body = await request.json()
     username = body["username"].strip()
     if s.scalar(select(User).where(User.username == username)):

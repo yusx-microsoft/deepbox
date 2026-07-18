@@ -10,5 +10,6 @@ if __name__ == "__main__":
         host=settings.host,
         port=settings.port,
         proxy_headers=True,
-        forwarded_allow_ips="127.0.0.1",
+        forwarded_allow_ips=settings.forwarded_allow_ips,
+        workers=1,
     )
