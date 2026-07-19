@@ -1,6 +1,7 @@
 # deepbox 产品设计
 
-> 状态：Draft v1
+> 状态：Draft v2 — 已落地首个 UI foundation（Terminal-first Switchboard），
+> 见 §7.5。
 >
 > deepbox 是一个面向 AI coding agent 的**持久会话控制平面**。用户把自己 Devbox 上的
 > Claude Code、Codex CLI、GitHub Copilot CLI 等 agent 连接到平台，然后可以从浏览器查看、
@@ -344,6 +345,51 @@ Session workspace
 → 当前控制者可移交
 → 超时/断开后 lease 自动释放
 ```
+
+### 7.5 已实现的 UI foundation（Terminal-first Switchboard）
+
+> 本节描述当前 `web/` 中**已经实现**的界面，而非 §7.1–7.4 的长期目标。
+> 未实现的多 Session tab、URL routing、command blocks 等仍属规划，不在此列。
+
+**设计方向。** 借鉴 Tailscale 的机器清单、Linear 的密度与键盘手感、
+Vercel/Geist 的克制暗色层级，但不复制其品牌。刻意避免紫蓝发光渐变、玻璃拟态、
+AI 星光/机器人意象与营销式 hero。UI 用 sans，终端用 mono；终端永远是视觉主角。
+
+**视觉系统。** `web/styles.css` 是 token 驱动的深色主题（surface/border/text/
+status/accent 全部走 CSS 变量），细边框、单一低饱和青绿 accent、语义状态色。
+它在 `index.html` 内联 reset 之后加载，成为样式的唯一事实来源。所有状态
+（devbox online/offline、agent online/busy/offline、keyboard lease）都是
+「圆点 + 文字」，从不只靠颜色表达。提供清晰的 `:focus-visible`、
+`prefers-reduced-motion` 降级，以及窄屏（≤820px）下 fleet 面板与终端纵向堆叠的
+响应式布局。
+
+**主 shell 布局。**
+
+```text
+topbar（克制品牌 + 搜索/⌘K 入口 + owner 入口 + 用户 + 退出）
+├── 左：Fleet 面板（标题、online/total 汇总、搜索框、紧凑 devbox/agent 清单）
+└── 右：Terminal stage（会话 header + xterm 主区域；未选 agent 时显示空状态与快捷提示）
+```
+
+Devbox 为紧凑 panel，展示名称、状态文字、opaque capability 概览与「+ Agent /
+Rotate token / Delete」操作；agent 行显示 monogram、handle、runtime label 与
+状态文字，hover/选中时露出 History 操作。
+
+**Command palette（⌘K / Ctrl+K）。** 一个 overlay（不引入路由），可筛选并打开
+agent、打开某 agent 的 history、创建 devbox、进入 owner 控制台（仅 owner）。
+Escape 关闭，ArrowUp/ArrowDown 移动选择，Enter 执行。
+
+**模态与一次性 token。** createDevbox / createAgent、删除确认与错误提示都用
+app 内自定义 modal/form，取代浏览器 `prompt/alert/confirm`。一次性 devbox token
+只在内存中渲染进 modal DOM，绝不写入 storage、cookie、URL 或日志。
+
+**xterm 主题。** 终端配色与 UI token 对齐（青绿光标、语义 ANSI 调色板），
+resize、reconnect、replay/DVR、collaboration lease 行为保持不变。
+
+**纯函数层。** DOM-free 的可测逻辑集中在 UMD 模块 `web/ui.js`（fleet 汇总、
+devbox/agent 过滤、command 生成与筛选、runtime label / initials、状态映射、
+HTML escape），由 `app.js` 用与 replay/collaboration 相同的缓存 Promise 方式
+动态加载，并由 `web/ui.test.js`（node:test）覆盖。
 
 ---
 
