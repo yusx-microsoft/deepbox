@@ -381,7 +381,8 @@ Escape 关闭，ArrowUp/ArrowDown 移动选择，Enter 执行。
 
 **模态与一次性 token。** createDevbox / createAgent、删除确认与错误提示都用
 app 内自定义 modal/form，取代浏览器 `prompt/alert/confirm`。一次性 devbox token
-只在内存中渲染进 modal DOM，绝不写入 storage、cookie、URL 或日志。
+只在内存中渲染进 modal DOM，绝不写入 storage、cookie、URL 或日志；用户可一键复制 raw token
+或完整 Windows connector 命令，避免从换行文本中手工抄录。
 
 **xterm 主题。** 终端配色与 UI token 对齐（青绿光标、语义 ANSI 调色板），
 resize、reconnect、replay/DVR、collaboration lease 行为保持不变。

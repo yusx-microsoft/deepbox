@@ -3,11 +3,11 @@ const assert = require('node:assert/strict');
 const ui = require('./ui.js');
 
 const fleet = [
-  {id: 'b1', name: 'workstation', online: true, capabilities: {runtimes: ['opaque-adapter']}, agents: [
+  {id: 'b1', name: 'workstation', online: true, agents: [
     {id: 'a1', handle: 'claude', display_name: 'Claude', runtime: 'claude-code', presence: 'online'},
     {id: 'a2', handle: 'codex', display_name: 'Codex', runtime: 'codex-cli', presence: 'offline'},
   ]},
-  {id: 'b2', name: 'laptop', online: false, capabilities: [], agents: [
+  {id: 'b2', name: 'laptop', online: false, agents: [
     {id: 'a3', handle: 'copilot', display_name: 'Copilot', runtime: 'copilot-cli', presence: 'busy'},
   ]},
 ];
@@ -29,6 +29,16 @@ test('runtimeLabel keeps adapter-owned runtime IDs opaque', () => {
   assert.equal(ui.runtimeLabel('claude-code'), 'claude-code');
   assert.equal(ui.runtimeLabel('mystery-runtime'), 'mystery-runtime');
   assert.equal(ui.runtimeLabel(''), 'runtime');
+});
+
+test('windowsConnectorCommand is complete and directly copyable', () => {
+  assert.equal(
+    ui.windowsConnectorCommand('https://deepbox.example', 'hpc_box_test'),
+    'set "DEEPBOX_SERVER_URL=https://deepbox.example"\n' +
+      'set "DEEPBOX_TOKEN=hpc_box_test"\n' +
+      'python -m connector --doctor\n' +
+      'python -m connector'
+  );
 });
 
 test('status helpers always return a text label', () => {

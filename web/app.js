@@ -379,13 +379,51 @@ async function createDevbox() {
 // Present a one-time devbox token. Rendered from memory into a modal only;
 // never written to localStorage, cookies, the URL or the console.
 async function showToken(tok){
+  const command = ui.windowsConnectorCommand(location.origin, tok);
+  const bindCopy = (overlay, selector, text)=>{
+    const button = overlay.querySelector(selector);
+    if(!button) return;
+    button.onclick = async ()=>{
+      const original = button.textContent;
+      try {
+        await copyText(text);
+        button.textContent = 'Copied';
+        setTimeout(()=>{ if(button.isConnected) button.textContent = original; }, 1400);
+      } catch(e) {
+        button.textContent = 'Copy failed';
+        setTimeout(()=>{ if(button.isConnected) button.textContent = original; }, 1800);
+      }
+    };
+  };
   await showModal({
     title:'Devbox token \u2014 shown once',
-    desc:'Copy the raw token now. The server stores only its hash, and this value will not be shown again.',
-    bodyHtml:`<div class="token">${esc(tok)}</div>
-      <div class="muted" style="margin-top:10px">Windows connector setup:</div>
-      <div class="token" style="color:var(--fg-muted)">set DEEPBOX_SERVER_URL=${esc(location.origin)}\nset DEEPBOX_TOKEN=${esc(tok)}\n.venv\\Scripts\\python -m connector</div>`,
-    actions:[{label:'Done', primary:true, value:true}]});
+    desc:'Copy this token now. The server stores only its hash and cannot show it again.',
+    bodyHtml:`<div class="token-head"><b>Token</b><button class="ghost compact" id="copy-token">Copy token</button></div>
+      <div class="token">${esc(tok)}</div>
+      <div class="token-head"><b>Windows connector command</b><button class="ghost compact" id="copy-command">Copy command</button></div>
+      <div class="token token-command">${esc(command)}</div>`,
+    actions:[{label:'Done', primary:true, value:true}],
+    onReady:(overlay)=>{
+      bindCopy(overlay, '#copy-token', tok);
+      bindCopy(overlay, '#copy-command', command);
+    }});
+}
+
+async function copyText(text){
+  if(navigator.clipboard && window.isSecureContext){
+    await navigator.clipboard.writeText(String(text));
+    return;
+  }
+  const area = document.createElement('textarea');
+  area.value = String(text);
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand('copy');
+  area.remove();
+  if(!copied) throw new Error('Clipboard unavailable');
 }
 async function rotateToken(id){
   const res = await api(`/api/devboxes/${id}/tokens`,{method:'POST'});
@@ -935,7 +973,7 @@ function closeOverlay(){
 }
 
 // Generic modal. Returns a Promise resolving to the chosen action's value.
-function showModal({title, desc, bodyHtml, actions}){
+function showModal({title, desc, bodyHtml, actions, onReady}){
   return new Promise(resolve=>{
     closeOverlay();
     const overlay = document.createElement('div');
@@ -952,6 +990,7 @@ function showModal({title, desc, bodyHtml, actions}){
     overlay.onclick = (e)=>{ if(e.target===overlay) done(null); };
     document.addEventListener('keydown', onKey);
     document.body.appendChild(overlay);
+    if(onReady) onReady(overlay);
     overlay.querySelectorAll('[data-a]').forEach(b=>
       b.onclick = ()=> done(acts[Number(b.dataset.a)].value));
   });

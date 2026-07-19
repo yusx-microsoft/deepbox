@@ -300,10 +300,13 @@ h2,h3,h4{margin:0;font-weight:650;letter-spacing:-0.01em}
 .list-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--border-faint)}
 .list-row:first-child{border-top:none}
 .token{
-  font-family:var(--font-mono);font-size:12px;word-break:break-all;
+  font-family:var(--font-mono);font-size:12px;word-break:break-all;white-space:pre-wrap;
   background:var(--well);padding:11px 12px;border-radius:var(--radius-sm);
   border:1px solid var(--border-strong);color:var(--accent-strong);line-height:1.6;margin-top:8px;
 }
+.token-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;color:var(--fg-muted);font-size:12px}
+.token-head:first-child{margin-top:0}
+.token-command{color:var(--fg-muted);word-break:normal;overflow-wrap:anywhere}
 
 /* ---- replay bar -------------------------------------------------------- */
 

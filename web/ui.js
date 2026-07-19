@@ -32,6 +32,20 @@
     return value || 'runtime';
   }
 
+  // Generate the exact Windows connector bootstrap command shown after a
+  // devbox token is minted. Keeping this pure makes wrapping/copy regressions
+  // testable without a browser.
+  function windowsConnectorCommand(serverUrl, token){
+    const server = String(serverUrl == null ? '' : serverUrl).trim();
+    const secret = String(token == null ? '' : token).trim();
+    return [
+      'set "DEEPBOX_SERVER_URL=' + server + '"',
+      'set "DEEPBOX_TOKEN=' + secret + '"',
+      'python -m connector --doctor',
+      'python -m connector',
+    ].join('\n');
+  }
+
   // ---- status helpers ----------------------------------------------------
 
   // Devbox connection state -> {state, label}. Text is never colour-only.
@@ -90,8 +104,8 @@
     return hay.indexOf(needle) !== -1;
   }
 
-  // Filter a fleet by a free-text query. A devbox is kept when it matches by
-  // name/capability OR when any of its agents match; matching agents are kept.
+  // Filter a fleet by a free-text query. A devbox is kept when its name or ID
+  // matches, or when any of its agents match; matching agents are kept.
   function filterDevboxes(devboxes, query){
     const needle = normalize(query);
     const list = Array.isArray(devboxes) ? devboxes : [];
@@ -206,6 +220,7 @@
     escapeHtml: escapeHtml,
     initials: initials,
     runtimeLabel: runtimeLabel,
+    windowsConnectorCommand: windowsConnectorCommand,
     devboxStatus: devboxStatus,
     agentStatus: agentStatus,
     fleetSummary: fleetSummary,

@@ -187,7 +187,8 @@ reset 之后加载，故外部主题为唯一事实来源）。
   history、创建 devbox、进入 owner（仅 owner）；`↑/↓` 导航、`Enter` 执行、`Esc` 关闭。
 - **模态**：createDevbox / createAgent / 删除确认 / 错误提示都用 app 内自定义
   modal/form 取代浏览器 `prompt/alert/confirm`。**一次性 token 只渲染进内存中的
-  modal DOM，绝不写 storage/cookie/URL/日志。**
+  modal DOM，绝不写 storage/cookie/URL/日志。** modal 提供 Copy token 和 Copy command；完整 Windows
+  命令由 `web/ui.js::windowsConnectorCommand()` 纯函数生成，剪贴板 API 不可用时回退到临时 textarea。
 - **终端**：`setupTerm()` 建 xterm 实例（主题对齐 UI token）+ FitAddon。
   点某个 agent → 优先 resume 仍存活的 live PTY，否则 `POST .../sessions` 建会话 →
   连 `/ws/term`：`term.onData` 发 `input` 帧；收 `output`/`restore` 帧 `term.write()`；
