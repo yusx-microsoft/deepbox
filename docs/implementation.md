@@ -30,10 +30,28 @@
 ## 2. 服务端（`server/app/`）
 
 ### 2.1 `models.py` — 数据层
-SQLAlchemy 2.0 声明式模型 + SQLite。六张表：
-`user / devbox / token / agent / session / message`。
+SQLAlchemy 2.0 声明式模型 + SQLite。八张表：
+`user / devbox / token / agent / session / message / bootstrap_state / invitation`。
 - 用 `mapped_column` 强类型；`init_db()` 建表并暴露 `SessionLocal` 工厂。
 - 关系用 `cascade="all, delete-orphan"`：删 user 级联删它的 devbox/token/agent。
+- **P1 Cut 1 附加列/表**（对既有 SQLite 库用 `_migrate()` 做**加列式**迁移，不改数据）：
+  - `user.role`（默认 `member`，取值 `owner`/`member`）、`user.disabled_at`（可空）。
+  - `bootstrap_state`：单例行 `id=1`，与首个 owner **同一事务**插入；主键唯一性构成
+    持久、并发安全的原子闩锁——并发首启只有一方提交成功。
+  - `invitation`：仅存 `token_hash`（SHA-256），带 `expires_at / redeemed_at /
+    revoked_at`；兑换是单条条件 `UPDATE`，保证一次性、过期/吊销即失效。
+
+### 2.1a P1 Cut 1 路由（onboarding）
+详见 `onboarding.md`。摘要：
+- `GET /api/auth/bootstrap-status` → 安全布尔；`POST /api/auth/bootstrap` → 一次性建首个 owner，
+  凭据按 SHA-256 比对，任何非法/不可用一律通用 `404`，从不回显 token/hash。
+- `POST/GET/DELETE /api/invitations`（owner）：铸造（有界 TTL、明文只回一次）、列出元数据、吊销。
+  浏览器生成 `/#invite=...` fragment 链接（不进入 HTTP/access log），首次加载立即从地址栏移除并仅在内存保留；
+  注入登录表单前做 HTML attribute escaping。
+- `POST /api/auth/register` 支持 `invite_code`：原子兑换、创建 member。开发自注册仍受
+  `DEEPBOX_REGISTRATION_ENABLED` 控制，生产须保持 false。
+- `GET /api/users`、`POST /api/users/{id}/disable|enable`（owner）：禁用/恢复成员；禁用用户无法登录，
+  现有浏览器会话与 connector bearer token 失效，活跃 WebSocket 立即关闭；绝不禁用最后一个启用的 owner（含自锁）。
 
 ### 2.2 `util.py` — 凭证与 id
 - `new_id()`：`uuid4().hex`。

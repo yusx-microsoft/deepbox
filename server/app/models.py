@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import datetime as dt
 from sqlalchemy import (
-    create_engine, String, Text, ForeignKey, DateTime, JSON,
+    create_engine, String, Text, ForeignKey, DateTime, JSON, inspect, text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker,
 )
 
 PROTOCOL_VERSION = 2
+
+ROLE_OWNER = "owner"
+ROLE_MEMBER = "member"
+VALID_ROLES = {ROLE_OWNER, ROLE_MEMBER}
 
 
 def now() -> dt.datetime:
@@ -26,6 +30,8 @@ class User(Base):
     username: Mapped[str] = mapped_column(String, unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String)
     display_name: Mapped[str] = mapped_column(String)
+    role: Mapped[str] = mapped_column(String, default=ROLE_MEMBER)
+    disabled_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
     devboxes: Mapped[list["Devbox"]] = relationship(
@@ -95,6 +101,33 @@ class Message(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
 
+class BootstrapState(Base):
+    """Singleton row (id=1) that records first-owner bootstrap has occurred.
+
+    Its unique primary key provides a persistent, concurrency-safe atomic
+    latch: the first transaction to insert id=1 (together with the owner user)
+    wins; any concurrent claim fails the unique constraint and loses.
+    """
+    __tablename__ = "bootstrap_state"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_user_id: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="RESTRICT"))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+
+
+class Invitation(Base):
+    """Single-use invitation. Only the SHA-256 token hash is stored."""
+    __tablename__ = "invitation"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    created_by: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"))
+    note: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime)
+    redeemed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    redeemed_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 _engine = None
 SessionLocal: sessionmaker | None = None
 
@@ -104,4 +137,26 @@ def init_db(url: str = "sqlite:///deepbox.db"):
     _engine = create_engine(url, connect_args={"check_same_thread": False})
     SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     Base.metadata.create_all(_engine)
+    _migrate(_engine)
     return _engine
+
+
+def _migrate(engine) -> None:
+    """Additive migrations for pre-existing SQLite databases.
+
+    Only adds new nullable/defaulted columns; never drops or rewrites data.
+    """
+    inspector = inspect(engine)
+    if "user" not in inspector.get_table_names():
+        return
+    user_cols = {c["name"] for c in inspector.get_columns("user")}
+    stmts: list[str] = []
+    if "role" not in user_cols:
+        stmts.append(
+            f"ALTER TABLE user ADD COLUMN role VARCHAR DEFAULT '{ROLE_MEMBER}'"
+        )
+    if "disabled_at" not in user_cols:
+        stmts.append("ALTER TABLE user ADD COLUMN disabled_at DATETIME")
+    with engine.begin() as conn:
+        for stmt in stmts:
+            conn.execute(text(stmt))

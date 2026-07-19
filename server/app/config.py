@@ -5,6 +5,7 @@ fails closed when the signing secret or browser origin allowlist is missing.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,7 @@ class Settings:
     port: int
     forwarded_allow_ips: str
     registration_enabled: bool
+    bootstrap_token_hash: str | None
 
     @property
     def production(self) -> bool:
@@ -131,6 +133,15 @@ def load_settings() -> Settings:
     # Registration is open by default for local development but fails closed
     # in production unless an operator explicitly enables it.
     registration_default = environment != "production"
+    # The bootstrap token is used exactly once to create the first owner. We
+    # never retain the plaintext: only its SHA-256 hash lives in Settings, and
+    # the plaintext env var is cleared from the process environment.
+    bootstrap_raw = os.getenv("DEEPBOX_BOOTSTRAP_TOKEN", "").strip()
+    bootstrap_token_hash = (
+        hashlib.sha256(bootstrap_raw.encode()).hexdigest() if bootstrap_raw else None
+    )
+    if "DEEPBOX_BOOTSTRAP_TOKEN" in os.environ:
+        del os.environ["DEEPBOX_BOOTSTRAP_TOKEN"]
     result = Settings(
         environment=environment,
         platform=platform,
@@ -145,6 +156,7 @@ def load_settings() -> Settings:
         port=_port(),
         forwarded_allow_ips=forwarded_allow_ips,
         registration_enabled=_bool("DEEPBOX_REGISTRATION_ENABLED", registration_default),
+        bootstrap_token_hash=bootstrap_token_hash,
     )
     result.validate()
     return result

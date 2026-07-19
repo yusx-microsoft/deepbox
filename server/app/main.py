@@ -2,8 +2,10 @@
 WebSocket endpoints (human terminal + devbox connector)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 
 from fastapi import (
@@ -18,7 +20,8 @@ from sqlalchemy.orm import Session as OrmSession
 
 from . import models
 from .models import (
-    User, Devbox, Token, Agent, Session, Message, PROTOCOL_VERSION, now,
+    User, Devbox, Token, Agent, Session, Message, BootstrapState, Invitation,
+    PROTOCOL_VERSION, ROLE_OWNER, ROLE_MEMBER, now,
 )
 from .util import (
     new_id, new_token, hash_token, hash_password, verify_password,
@@ -75,7 +78,26 @@ def current_user(request: Request, s: OrmSession) -> User:
     user = s.get(User, data.get("uid"))
     if not user:
         raise HTTPException(401, "user gone")
+    if user.disabled_at is not None:
+        raise HTTPException(403, "account disabled")
     return user
+
+
+def require_owner(request: Request, s: OrmSession) -> User:
+    u = current_user(request, s)
+    if u.role != ROLE_OWNER:
+        raise HTTPException(403, "owner only")
+    return u
+
+
+def _hash_secret(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _as_utc(value):
+    """Normalize SQLite's timezone-naive UTC datetimes for safe comparison."""
+    utc = now().tzinfo
+    return value.replace(tzinfo=utc) if value.tzinfo is None else value.astimezone(utc)
 
 
 def devbox_from_bearer(request: Request, s: OrmSession) -> Devbox:
@@ -86,26 +108,77 @@ def devbox_from_bearer(request: Request, s: OrmSession) -> Devbox:
     tok = s.scalar(select(Token).where(Token.hash == hash_token(full)))
     if not tok or tok.revoked_at is not None:
         raise HTTPException(401, "invalid token")
+    devbox = s.get(Devbox, tok.devbox_id)
+    owner = s.get(User, devbox.owner_user_id) if devbox else None
+    if not owner or owner.disabled_at is not None:
+        raise HTTPException(401, "invalid token")
     tok.last_used_at = now()
     s.commit()
-    return s.get(Devbox, tok.devbox_id)
+    return devbox
 
 
 # ---------------------------------------------------------------- auth routes
 @app.post("/api/auth/register")
 async def register(request: Request, s: OrmSession = Depends(db)):
-    if not settings.registration_enabled:
-        raise HTTPException(403, "registration disabled")
+    """Development-only self-registration.
+
+    Production keeps DEEPBOX_REGISTRATION_ENABLED=false; invitations are the
+    onboarding mechanism there. When an invite code is supplied it is redeemed
+    atomically and the created user is a member.
+    """
     body = await request.json()
+    invite_code = (body.get("invite_code") or "").strip()
     username = body["username"].strip()
+    if invite_code:
+        return _redeem_invitation(s, invite_code, username, body)
+
     if s.scalar(select(User).where(User.username == username)):
         raise HTTPException(400, "username taken")
+    if not settings.registration_enabled:
+        raise HTTPException(403, "registration disabled")
     user = User(
         id=new_id(), username=username,
         password_hash=hash_password(body["password"]),
         display_name=body.get("display_name") or username,
+        role=ROLE_MEMBER,
     )
     s.add(user)
+    s.commit()
+    return _login_response(user)
+
+
+def _redeem_invitation(s: OrmSession, invite_code: str, username: str,
+                       body: dict) -> JSONResponse:
+    # Keep every failed invitation claim opaque, including username conflicts,
+    # so an untrusted code cannot be used as an account-enumeration oracle.
+    if not username or not body.get("password"):
+        raise HTTPException(404, "not found")
+    if s.scalar(select(User.id).where(User.username == username)) is not None:
+        raise HTTPException(404, "not found")
+    token_hash = _hash_secret(invite_code)
+    claim_time = now()
+    user_id = new_id()
+    user = User(
+        id=user_id, username=username,
+        password_hash=hash_password(body["password"]),
+        display_name=body.get("display_name") or username,
+        role=ROLE_MEMBER,
+    )
+    s.add(user)
+    s.flush()
+    # Atomic single-use redemption: only unredeemed, unrevoked, unexpired rows
+    # can be claimed, and the row is stamped in the same conditional UPDATE.
+    result = s.execute(
+        text(
+            "UPDATE invitation SET redeemed_at=:now, redeemed_by=:uid "
+            "WHERE token_hash=:th AND redeemed_at IS NULL "
+            "AND revoked_at IS NULL AND expires_at > :now"
+        ),
+        {"now": claim_time, "uid": user_id, "th": token_hash},
+    )
+    if result.rowcount != 1:
+        s.rollback()
+        raise HTTPException(404, "not found")
     s.commit()
     return _login_response(user)
 
@@ -116,12 +189,14 @@ async def login(request: Request, s: OrmSession = Depends(db)):
     user = s.scalar(select(User).where(User.username == body["username"].strip()))
     if not user or not verify_password(body["password"], user.password_hash):
         raise HTTPException(401, "bad credentials")
+    if user.disabled_at is not None:
+        raise HTTPException(401, "bad credentials")
     return _login_response(user)
 
 
 def _login_response(user: User) -> JSONResponse:
     resp = JSONResponse({"id": user.id, "username": user.username,
-                         "display_name": user.display_name})
+                         "display_name": user.display_name, "role": user.role})
     resp.set_cookie("deepbox_session", signer.dumps({"uid": user.id}),
                     httponly=True, samesite=settings.cookie_samesite,
                     secure=settings.cookie_secure)
@@ -138,7 +213,170 @@ async def logout():
 @app.get("/api/me/user")
 async def me_user(request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
-    return {"id": u.id, "username": u.username, "display_name": u.display_name}
+    return {"id": u.id, "username": u.username, "display_name": u.display_name,
+            "role": u.role}
+
+
+# ---------------------------------------------------------------- bootstrap
+def _bootstrap_available(s: OrmSession) -> bool:
+    """True only if a bootstrap token is configured, no bootstrap has occurred,
+    and no user exists yet."""
+    if not settings.bootstrap_token_hash:
+        return False
+    if s.get(BootstrapState, 1) is not None:
+        return False
+    if s.scalar(select(User.id).limit(1)) is not None:
+        return False
+    return True
+
+
+@app.get("/api/auth/bootstrap-status")
+async def bootstrap_status(s: OrmSession = Depends(db)):
+    """Safe boolean only — never echoes the token or hash."""
+    return {"available": _bootstrap_available(s)}
+
+
+@app.post("/api/auth/bootstrap")
+async def bootstrap(request: Request, s: OrmSession = Depends(db)):
+    """Create the first owner exactly once. Token compared by hash; response
+    is a generic 404 for any invalid/unavailable case (no token echo/log)."""
+    if not settings.bootstrap_token_hash:
+        raise HTTPException(404, "not found")
+    body = await request.json()
+    provided = (body.get("token") or "")
+    if not secrets.compare_digest(_hash_secret(provided), settings.bootstrap_token_hash):
+        raise HTTPException(404, "not found")
+    # Any pre-existing user makes bootstrap unavailable.
+    if s.scalar(select(User.id).limit(1)) is not None:
+        raise HTTPException(404, "not found")
+    username = (body.get("username") or "").strip()
+    if not username or not body.get("password"):
+        raise HTTPException(404, "not found")
+    user = User(
+        id=new_id(), username=username,
+        password_hash=hash_password(body["password"]),
+        display_name=body.get("display_name") or username,
+        role=ROLE_OWNER,
+    )
+    s.add(user)
+    s.flush()
+    # Insert the singleton latch in the SAME transaction as the owner. The
+    # unique primary key (id=1) makes any concurrent claim lose.
+    s.add(BootstrapState(id=1, owner_user_id=user.id))
+    try:
+        s.commit()
+    except Exception:
+        s.rollback()
+        raise HTTPException(404, "not found")
+    return _login_response(user)
+
+
+# ---------------------------------------------------------------- invitations
+def _invitation_json(inv: Invitation) -> dict:
+    """Safe metadata only — never includes the token or its hash."""
+    expired = _as_utc(inv.expires_at) <= now()
+    return {
+        "id": inv.id,
+        "note": inv.note,
+        "created_at": _as_utc(inv.created_at).isoformat(),
+        "expires_at": _as_utc(inv.expires_at).isoformat(),
+        "redeemed_at": _as_utc(inv.redeemed_at).isoformat() if inv.redeemed_at else None,
+        "revoked_at": _as_utc(inv.revoked_at).isoformat() if inv.revoked_at else None,
+        "status": ("revoked" if inv.revoked_at else
+                   "redeemed" if inv.redeemed_at else
+                   "expired" if expired else "active"),
+    }
+
+
+@app.post("/api/invitations")
+async def create_invitation(request: Request, s: OrmSession = Depends(db)):
+    u = require_owner(request, s)
+    body = await request.json()
+    ttl_hours = int(body.get("ttl_hours") or 24)
+    ttl_hours = max(1, min(ttl_hours, 24 * 30))  # bounded TTL: 1h..30d
+    import datetime as _dt
+    raw = "deepbox_inv_" + secrets.token_hex(24)
+    inv = Invitation(
+        id=new_id(), token_hash=_hash_secret(raw), created_by=u.id,
+        note=(body.get("note") or None),
+        expires_at=now() + _dt.timedelta(hours=ttl_hours),
+    )
+    s.add(inv)
+    s.commit()
+    # Plaintext returned exactly once; never stored or logged.
+    out = _invitation_json(inv)
+    out["token"] = raw
+    return out
+
+
+@app.get("/api/invitations")
+async def list_invitations(request: Request, s: OrmSession = Depends(db)):
+    require_owner(request, s)
+    rows = s.scalars(select(Invitation).order_by(Invitation.created_at.desc())).all()
+    return [_invitation_json(i) for i in rows]
+
+
+@app.delete("/api/invitations/{invitation_id}")
+async def revoke_invitation(invitation_id: str, request: Request,
+                            s: OrmSession = Depends(db)):
+    require_owner(request, s)
+    inv = s.get(Invitation, invitation_id)
+    if not inv:
+        raise HTTPException(404, "not found")
+    if inv.revoked_at is None and inv.redeemed_at is None:
+        inv.revoked_at = now()
+        s.commit()
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- user mgmt
+def _user_json(u: User) -> dict:
+    return {"id": u.id, "username": u.username, "display_name": u.display_name,
+            "role": u.role, "disabled": u.disabled_at is not None,
+            "disabled_at": u.disabled_at.isoformat() if u.disabled_at else None}
+
+
+def _enabled_owner_count(s: OrmSession, exclude_id: str | None = None) -> int:
+    q = select(User).where(User.role == ROLE_OWNER, User.disabled_at.is_(None))
+    return sum(1 for u in s.scalars(q).all() if u.id != exclude_id)
+
+
+@app.get("/api/users")
+async def list_users(request: Request, s: OrmSession = Depends(db)):
+    require_owner(request, s)
+    rows = s.scalars(select(User).order_by(User.created_at.asc())).all()
+    return [_user_json(u) for u in rows]
+
+
+@app.post("/api/users/{user_id}/disable")
+async def disable_user(user_id: str, request: Request, s: OrmSession = Depends(db)):
+    actor = require_owner(request, s)
+    target = s.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "not found")
+    if target.disabled_at is not None:
+        return _user_json(target)
+    # Never disable the last enabled owner (covers self-lockout too).
+    if target.role == ROLE_OWNER and _enabled_owner_count(s, exclude_id=target.id) == 0:
+        raise HTTPException(400, "cannot disable the last enabled owner")
+    target.disabled_at = now()
+    devbox_ids = set(s.scalars(
+        select(Devbox.id).where(Devbox.owner_user_id == target.id)
+    ).all())
+    s.commit()
+    await hub.disconnect_user(target.id, devbox_ids)
+    return _user_json(target)
+
+
+@app.post("/api/users/{user_id}/enable")
+async def enable_user(user_id: str, request: Request, s: OrmSession = Depends(db)):
+    require_owner(request, s)
+    target = s.get(User, user_id)
+    if not target:
+        raise HTTPException(404, "not found")
+    target.disabled_at = None
+    s.commit()
+    return _user_json(target)
 
 
 # ---------------------------------------------------------------- devbox mgmt
@@ -330,6 +568,11 @@ async def ws_devbox(ws: WebSocket):
         s.close()
         return
     d = s.get(Devbox, tok.devbox_id)
+    owner = s.get(User, d.owner_user_id) if d else None
+    if d is None or not owner or owner.disabled_at is not None:
+        await ws.close(code=4001)
+        s.close()
+        return
     agent_ids = {a.id for a in d.agents}
     d.last_seen_at = now()
     for a in d.agents:
@@ -411,6 +654,14 @@ async def ws_term(ws: WebSocket):
     if not uid:
         await ws.close(code=4001)
         return
+    _u = models.SessionLocal()
+    try:
+        _user = _u.get(User, uid)
+        if not _user or _user.disabled_at is not None:
+            await ws.close(code=4001)
+            return
+    finally:
+        _u.close()
     await ws.accept()
     conn = HumanConn(ws=ws, user_id=uid)
     hub.add_human(conn)

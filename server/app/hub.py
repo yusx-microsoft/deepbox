@@ -78,6 +78,28 @@ class Hub:
         conn.sessions.pop(session_id, None)
         self.session_watchers.get(session_id, set()).discard(conn)
 
+    async def disconnect_user(
+        self, user_id: str, devbox_ids: set[str], code: int = 4001
+    ) -> tuple[int, int]:
+        """Immediately close a disabled user's human and connector sockets."""
+        async with self._lock:
+            humans = [c for c in self.humans if c.user_id == user_id]
+            devboxes = [
+                c for did, c in self.devboxes.items() if did in devbox_ids
+            ]
+            for conn in humans:
+                self.remove_human(conn)
+            for conn in devboxes:
+                self.devboxes.pop(conn.devbox_id, None)
+                for agent_id in conn.agent_ids:
+                    self.agent_to_devbox.pop(agent_id, None)
+        for conn in [*humans, *devboxes]:
+            try:
+                await conn.ws.close(code=code)
+            except Exception:
+                pass
+        return len(humans), len(devboxes)
+
     async def to_devbox(self, agent_id: str, frame: dict) -> bool:
         conn = self.devbox_for_agent(agent_id)
         if not conn:

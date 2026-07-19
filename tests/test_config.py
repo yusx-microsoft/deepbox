@@ -27,6 +27,7 @@ def make_settings(**overrides):
         port=8077,
         forwarded_allow_ips="127.0.0.1",
         registration_enabled=True,
+        bootstrap_token_hash=None,
     )
     base.update(overrides)
     return Settings(**base)
@@ -153,6 +154,26 @@ class RegistrationTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             settings = load_settings()
         self.assertTrue(settings.registration_enabled)
+
+
+class BootstrapTokenConfigTests(unittest.TestCase):
+    def test_no_bootstrap_token_means_none(self):
+        with patch.dict(os.environ, clean_env(), clear=True):
+            settings = load_settings()
+        self.assertIsNone(settings.bootstrap_token_hash)
+
+    def test_only_hash_retained_and_plaintext_cleared(self):
+        import hashlib
+        raw = "super-secret-bootstrap-token"
+        env = clean_env({"DEEPBOX_BOOTSTRAP_TOKEN": raw})
+        with patch.dict(os.environ, env, clear=True):
+            settings = load_settings()
+            # Plaintext env var must be cleared during load.
+            self.assertNotIn("DEEPBOX_BOOTSTRAP_TOKEN", os.environ)
+        expected = hashlib.sha256(raw.encode()).hexdigest()
+        self.assertEqual(settings.bootstrap_token_hash, expected)
+        # Settings must never hold the plaintext anywhere.
+        self.assertNotIn(raw, repr(settings))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
 // deepbox minimal SPA
 const app = document.getElementById('app');
 let me = null, devboxes = [], term = null, fit = null, termWS = null, curSession = null;
+const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+const queryParams = new URLSearchParams(location.search);
+let pendingInvite = hashParams.get('invite') || queryParams.get('invite') || '';
+if (pendingInvite) history.replaceState(null, '', location.pathname);
 
 async function api(path, opts={}) {
   const r = await fetch(path, {credentials:'same-origin',
@@ -10,23 +14,60 @@ async function api(path, opts={}) {
 }
 
 // ---------------- auth ----------------
-function renderLogin() {
+async function renderLogin() {
+  // First-owner bootstrap form when available.
+  let status = {available:false};
+  try { status = await api('/api/auth/bootstrap-status'); } catch {}
+  if (status.available) return renderBootstrap();
+
+  const inviteFromUrl = pendingInvite;
   app.innerHTML = `<div class="center stack card">
     <h2>deepbox</h2>
     <div class="muted">Connect your devbox agents. Chat like you're local.</div>
     <input id="u" placeholder="username"/>
     <input id="p" type="password" placeholder="password"/>
-    <div class="row"><button id="login">Login</button><button class="ghost" id="reg">Register</button></div>
+    <div class="row"><button id="login">Login</button></div>
+    <h4>Have an invite code?</h4>
+    <input id="inv" placeholder="invite code" value="${escapeHtml(inviteFromUrl)}"/>
+    <input id="rd" placeholder="display name (optional)"/>
+    <div class="row"><button class="ghost" id="reg">Register with invite</button></div>
     <div id="err" class="muted"></div></div>`;
-  const go = async (path) => {
+  login.onclick = async () => {
     try {
-      me = await api(path, {method:'POST', body: JSON.stringify({
+      me = await api('/api/auth/login', {method:'POST', body: JSON.stringify({
         username:u.value, password:p.value})});
       boot();
     } catch(e){ err.textContent = e.message; }
   };
-  login.onclick = ()=>go('/api/auth/login');
-  reg.onclick = ()=>go('/api/auth/register');
+  reg.onclick = async () => {
+    try {
+      me = await api('/api/auth/register', {method:'POST', body: JSON.stringify({
+        username:u.value, password:p.value, display_name:rd.value||undefined,
+        invite_code:inv.value||undefined})});
+      pendingInvite = '';
+      boot();
+    } catch(e){ err.textContent = e.message; }
+  };
+}
+
+function renderBootstrap() {
+  app.innerHTML = `<div class="center stack card">
+    <h2>deepbox — first owner setup</h2>
+    <div class="muted">Create the first owner account with the bootstrap token.</div>
+    <input id="bt" type="password" placeholder="bootstrap token"/>
+    <input id="bu" placeholder="username"/>
+    <input id="bp" type="password" placeholder="password"/>
+    <input id="bd" placeholder="display name (optional)"/>
+    <div class="row"><button id="bgo">Create owner</button></div>
+    <div id="err" class="muted"></div></div>`;
+  bgo.onclick = async () => {
+    try {
+      me = await api('/api/auth/bootstrap', {method:'POST', body: JSON.stringify({
+        token:bt.value, username:bu.value, password:bp.value,
+        display_name:bd.value||undefined})});
+      boot();
+    } catch(e){ err.textContent = 'Setup failed.'; }
+  };
 }
 
 // ---------------- main shell ----------------
@@ -46,6 +87,7 @@ function renderShell() {
     <span class="muted">${me.display_name}</span>
     <span style="flex:1"></span>
     <button class="ghost" id="newbox">+ Devbox</button>
+    ${me.role==='owner'?'<button class="ghost" id="owner">Owner</button>':''}
     <button class="ghost" id="logout">Logout</button>
   </header>
   <main>
@@ -58,9 +100,90 @@ function renderShell() {
   </main>`;
   logout.onclick = async()=>{ await api('/api/auth/logout',{method:'POST'}); me=null; renderLogin(); };
   newbox.onclick = createDevbox;
+  if(me.role==='owner') document.getElementById('owner').onclick = renderOwner;
   renderSide();
   setupTerm();
 }
+
+// ---------------- owner admin ----------------
+async function renderOwner(){
+  let invites=[], users=[];
+  try { [invites, users] = await Promise.all([
+    api('/api/invitations'), api('/api/users')]); } catch(e){}
+  app.innerHTML = `
+  <header>
+    <b>deepbox — owner</b>
+    <span style="flex:1"></span>
+    <button class="ghost" id="back">← Back</button>
+  </header>
+  <main style="display:block;padding:16px;overflow:auto">
+    <div class="card">
+      <h4>Invitations</h4>
+      <div class="row">
+        <input id="inote" placeholder="note (optional)"/>
+        <input id="ittl" type="number" value="24" title="TTL hours" style="width:120px"/>
+        <button id="mint">Mint invite</button>
+      </div>
+      <div id="mintout"></div>
+      <div id="invlist" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h4>Members</h4>
+      <div id="userlist"></div>
+    </div>
+  </main>`;
+  document.getElementById('back').onclick = renderShell;
+
+  const renderInv = () => {
+    document.getElementById('invlist').innerHTML = invites.map(i=>`
+      <div class="row" style="border-top:1px solid var(--border);padding:4px 0">
+        <span>${i.note?escapeHtml(i.note):'<span class="muted">(no note)</span>'}</span>
+        <span class="muted">${i.status}, expires ${i.expires_at}</span>
+        <span style="flex:1"></span>
+        ${i.status==='active'?`<button class="ghost" data-revoke="${i.id}">revoke</button>`:''}
+      </div>`).join('') || '<div class="muted">No invitations.</div>';
+    document.querySelectorAll('[data-revoke]').forEach(b=>b.onclick=async()=>{
+      await api(`/api/invitations/${b.dataset.revoke}`,{method:'DELETE'});
+      invites = await api('/api/invitations'); renderInv();
+    });
+  };
+  const renderUsers = () => {
+    document.getElementById('userlist').innerHTML = users.map(u=>`
+      <div class="row" style="border-top:1px solid var(--border);padding:4px 0">
+        <b>${escapeHtml(u.display_name)}</b>
+        <span class="muted">@${escapeHtml(u.username)} · ${u.role}${u.disabled?' · disabled':''}</span>
+        <span style="flex:1"></span>
+        ${u.role==='member'?(u.disabled
+          ?`<button class="ghost" data-enable="${u.id}">enable</button>`
+          :`<button class="ghost" data-disable="${u.id}">disable</button>`):''}
+      </div>`).join('') || '<div class="muted">No users.</div>';
+    document.querySelectorAll('[data-disable]').forEach(b=>b.onclick=async()=>{
+      try{ await api(`/api/users/${b.dataset.disable}/disable`,{method:'POST'}); }
+      catch(e){ alert(e.message); }
+      users = await api('/api/users'); renderUsers();
+    });
+    document.querySelectorAll('[data-enable]').forEach(b=>b.onclick=async()=>{
+      await api(`/api/users/${b.dataset.enable}/enable`,{method:'POST'});
+      users = await api('/api/users'); renderUsers();
+    });
+  };
+  renderInv(); renderUsers();
+
+  document.getElementById('mint').onclick = async()=>{
+    const res = await api('/api/invitations',{method:'POST',body:JSON.stringify({
+      note:inote.value||undefined, ttl_hours:Number(ittl.value)||24})});
+    // Show plaintext + prefilled invite URL exactly once; not retained.
+    // URL fragments never reach the HTTP server or its access logs.
+    const url = `${location.origin}${location.pathname}#invite=${encodeURIComponent(res.token)}`;
+    document.getElementById('mintout').innerHTML =
+      `<div class="token">Invite code (shown once): ${escapeHtml(res.token)}<br><br>`+
+      `Invite URL: <a href="${url}">${escapeHtml(url)}</a></div>`;
+    invites = await api('/api/invitations'); renderInv();
+  };
+}
+
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 function renderSide() {
   const side = document.getElementById('side');
