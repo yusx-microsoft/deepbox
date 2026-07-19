@@ -207,5 +207,231 @@ class MergedRecordingTests(RecordingBaseCase):
         self.assertIn("hello world", ls.restore_bytes())
 
 
+class ReadRangeAndMetadataTests(RecordingBaseCase):
+    def _seed(self, n=5):
+        for i in range(1, n + 1):
+            self.store.persist_output(
+                self.db, devbox_id=self.dbxA,
+                frame=_frame(self.sid, self.pty, i, f"d{i}", elapsed=float(i)))
+
+    def test_read_range_orders_by_frame_id(self):
+        self._seed(3)
+        rows = self.store.read_range(self.db, self.sid)
+        self.assertEqual([r.seq for r in rows], [1, 2, 3])
+        ids = [r.id for r in rows]
+        self.assertEqual(ids, sorted(ids))
+
+    def test_read_range_after_cursor(self):
+        self._seed(4)
+        rows = self.store.read_range(self.db, self.sid)
+        after = rows[1].id
+        tail = self.store.read_range(self.db, self.sid, after_frame_id=after)
+        self.assertEqual([r.seq for r in tail], [3, 4])
+
+    def test_read_range_limit(self):
+        self._seed(5)
+        rows = self.store.read_range(self.db, self.sid, limit=2)
+        self.assertEqual(len(rows), 2)
+
+    def test_metadata_summary(self):
+        self._seed(3)
+        meta = self.store.metadata(self.db, self.sid)
+        self.assertEqual(meta["frame_count"], 3)
+        self.assertEqual(meta["redacted_count"], 0)
+        self.assertEqual(meta["pty_instance_ids"], [self.pty])
+        self.assertIsNotNone(meta["first_frame_id"])
+        self.assertIsNotNone(meta["last_frame_id"])
+
+    def test_delete_removes_frames_and_checkpoints(self):
+        self._seed(3)
+        rows = self.store.read_range(self.db, self.sid)
+        self.store.checkpoint(self.db, self.sid, frame_id=rows[-1].id,
+                              screen="X", event_index=3)
+        n = self.store.delete(self.db, self.sid)
+        self.assertEqual(n, 3)
+        self.assertEqual(self._count(), 0)
+        self.assertEqual(self.store.checkpoints(self.db, self.sid), [])
+
+
+class CheckpointTests(RecordingBaseCase):
+    def _seed(self, n):
+        rows = []
+        for i in range(1, n + 1):
+            r = self.store.persist_output(
+                self.db, devbox_id=self.dbxA,
+                frame=_frame(self.sid, self.pty, i, f"d{i}", elapsed=float(i)))
+            rows.append(r.frame)
+        return rows
+
+    def test_checkpoint_idempotent_per_frame(self):
+        rows = self._seed(2)
+        c1 = self.store.checkpoint(self.db, self.sid, frame_id=rows[-1].id,
+                                   screen="A", event_index=2)
+        c2 = self.store.checkpoint(self.db, self.sid, frame_id=rows[-1].id,
+                                   screen="B", event_index=2)
+        self.assertEqual(c1.id, c2.id)
+        self.assertEqual(c2.screen, "B")
+        self.assertEqual(len(self.store.checkpoints(self.db, self.sid)), 1)
+
+    def test_latest_checkpoint_at_cursor(self):
+        rows = self._seed(4)
+        self.store.checkpoint(self.db, self.sid, frame_id=rows[0].id, screen="1")
+        self.store.checkpoint(self.db, self.sid, frame_id=rows[2].id, screen="3")
+        cp = self.store.latest_checkpoint(self.db, self.sid,
+                                          at_frame_id=rows[1].id)
+        self.assertEqual(cp.frame_id, rows[0].id)
+        cp2 = self.store.latest_checkpoint(self.db, self.sid)
+        self.assertEqual(cp2.frame_id, rows[2].id)
+
+    def test_maybe_checkpoint_cadence(self):
+        store = RecordingStore(checkpoint_interval=3)
+        made = []
+        for i in range(1, 7):
+            r = store.persist_output(
+                self.db, devbox_id=self.dbxA,
+                frame=_frame(self.sid, self.pty, i, f"d{i}", elapsed=float(i)))
+            cp = store.maybe_checkpoint(self.db, self.sid, frame=r.frame,
+                                        screen_fn=lambda i=i: f"screen{i}")
+            if cp:
+                made.append(cp.event_index)
+        self.assertEqual(made, [3, 6])
+
+    def test_multiple_pty_streams_disambiguated(self):
+        # Two interleaved pty streams: checkpoint frame_id is unambiguous.
+        r1 = self.store.persist_output(
+            self.db, devbox_id=self.dbxA,
+            frame=_frame(self.sid, "ptyA", 1, "a1"))
+        r2 = self.store.persist_output(
+            self.db, devbox_id=self.dbxA,
+            frame=_frame(self.sid, "ptyB", 1, "b1"))
+        self.assertNotEqual(r1.frame.id, r2.frame.id)
+        cp = self.store.checkpoint(self.db, self.sid, frame_id=r2.frame.id,
+                                   screen="S", event_index=2)
+        tail = self.store.read_range(self.db, self.sid, after_frame_id=cp.frame_id)
+        self.assertEqual(tail, [])
+
+
+class RetentionTests(RecordingBaseCase):
+    def _seed_old(self, n=3, days_old=40):
+        import datetime as dt
+        old = models.now() - dt.timedelta(days=days_old)
+        rows = []
+        for i in range(1, n + 1):
+            r = self.store.persist_output(
+                self.db, devbox_id=self.dbxA,
+                frame=_frame(self.sid, self.pty, i, f"secret{i}", elapsed=float(i)))
+            rows.append(r.frame.id)
+        for fid in rows:
+            f = self.db.get(models.RecordingFrame, fid)
+            f.created_at = old
+        self.db.commit()
+        return [self.db.get(models.RecordingFrame, fid) for fid in rows]
+
+    def test_permanent_never_redacts(self):
+        sess = self.db.get(models.Session, self.sid)
+        sess.retention = models.RETENTION_PERMANENT
+        self.db.commit()
+        self._seed_old()
+        n = self.store.redact_expired(self.db)
+        self.assertEqual(n, 0)
+
+    def test_30d_redacts_old_payload_keeps_ledger(self):
+        sess = self.db.get(models.Session, self.sid)
+        sess.retention = models.RETENTION_30D
+        self.db.commit()
+        rows = self._seed_old(days_old=40)
+        seqs_before = [r.seq for r in rows]
+        hashes_before = [r.payload_hash for r in rows]
+        n = self.store.redact_expired(self.db)
+        self.assertEqual(n, 3)
+        got = self.db.query(models.RecordingFrame).order_by(
+            models.RecordingFrame.seq).all()
+        # Ledger identity preserved.
+        self.assertEqual([r.seq for r in got], seqs_before)
+        self.assertEqual([r.payload_hash for r in got], hashes_before)
+        # Payload redacted.
+        for r in got:
+            self.assertEqual(r.data, "")
+            self.assertIsNotNone(r.redacted_at)
+
+    def test_30d_keeps_recent(self):
+        sess = self.db.get(models.Session, self.sid)
+        sess.retention = models.RETENTION_30D
+        self.db.commit()
+        self._seed_old(days_old=3)
+        n = self.store.redact_expired(self.db)
+        self.assertEqual(n, 0)
+
+    def test_none_redacts_immediately(self):
+        sess = self.db.get(models.Session, self.sid)
+        sess.retention = models.RETENTION_NONE
+        self.db.commit()
+        self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                  frame=_frame(self.sid, self.pty, 1, "x"))
+        n = self.store.redact_expired(self.db)
+        self.assertEqual(n, 0)  # persist_output already enforced the policy
+        self.assertIsNotNone(self.db.query(models.RecordingFrame).one().redacted_at)
+
+    def test_redacted_excluded_from_durable_events(self):
+        sess = self.db.get(models.Session, self.sid)
+        sess.retention = models.RETENTION_NONE
+        self.db.commit()
+        self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                  frame=_frame(self.sid, self.pty, 1, "topsecret"))
+        self.store.redact_expired(self.db)
+        events = RecordingStore.durable_events(self.db, self.sid)
+        self.assertEqual(events, [])
+        rows = self.store.read_range(self.db, self.sid)
+        self.assertEqual(rows, [])
+
+    def test_set_retention_validates_persists_and_enforces(self):
+        self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                  frame=_frame(self.sid, self.pty, 1, "erase"))
+        sess = self.db.get(models.Session, self.sid)
+        redacted = self.store.set_retention(
+            self.db, sess, models.RETENTION_NONE)
+        self.assertEqual(redacted, 1)
+        self.assertEqual(self.db.get(models.Session, self.sid).retention,
+                         models.RETENTION_NONE)
+        self.assertEqual(self.db.query(models.RecordingFrame).one().data, "")
+
+    def test_set_retention_rejects_invalid_policy(self):
+        sess = self.db.get(models.Session, self.sid)
+        with self.assertRaises(ValueError):
+            self.store.set_retention(self.db, sess, "forever-ish")
+        self.assertEqual(sess.retention, models.RETENTION_30D)
+
+    def test_none_policy_redacts_new_payload_but_keeps_duplicate_ledger(self):
+        sess = self.db.get(models.Session, self.sid)
+        self.store.set_retention(self.db, sess, models.RETENTION_NONE)
+        committed = []
+        self.store.commit_hook = lambda row: committed.append(
+            (row.data, row.redacted_at))
+        frame = _frame(self.sid, self.pty, 1, "secret")
+        first = self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                          frame=frame)
+        self.assertEqual(committed[0][0], "")
+        self.assertIsNotNone(committed[0][1])
+        self.assertEqual(first.outcome, NEW)
+        self.assertEqual(first.frame.data, "")
+        self.assertIsNotNone(first.frame.redacted_at)
+        duplicate = self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                              frame=frame)
+        self.assertEqual(duplicate.outcome, DUPLICATE)
+
+    def test_redacted_duplicate_still_acks(self):
+        # Duplicate-ACK semantics must survive redaction: same seq re-sent maps
+        # to DUPLICATE (identity row preserved), not CONFLICT/NEW.
+        sess = self.db.get(models.Session, self.sid)
+        sess.retention = models.RETENTION_NONE
+        self.db.commit()
+        self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                  frame=_frame(self.sid, self.pty, 1, "dup"))
+        self.store.redact_expired(self.db)
+        r = self.store.persist_output(self.db, devbox_id=self.dbxA,
+                                      frame=_frame(self.sid, self.pty, 1, "dup"))
+        self.assertEqual(r.outcome, DUPLICATE)
+
+
 if __name__ == "__main__":
     unittest.main()

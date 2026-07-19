@@ -30,8 +30,8 @@
 - ✅ 必须区分两个需求，用两种机制：
   1. **"现在屏幕长什么样"**（重连时要立刻看到）→ 用**服务端无头终端模拟器**维护当前屏幕状态，
      序列化成一小段"重绘字节"发过去。**有界**（只和屏幕尺寸有关），对 TUI 完美。
-  2. **"这个会话从头到尾发生了什么"**（回放/审计）→ 用**磁盘录制**（asciicast，带时间戳），
-     完整、不丢、可离线回放。
+  2. **"这个会话从头到尾发生了什么"**（回放/审计）→ 用 server SQLite 中的 Protocol v3
+     **durable `RecordingFrame`** 记录；API 可导出 asciicast v2，也可返回 events + checkpoints 做随机 seek。
 
 ---
 
@@ -42,7 +42,7 @@
 │                        │   │                            │   │                     │
 │  PtySession (claude)   │   │  LiveSession (每会话一个)  │   │  Viewer A (笔记本)  │
 │  ▲ 持久存活            │   │   ├ pyte 屏幕(权威当前态)  │◀─▶│  Viewer B (手机)    │
-│  │ 不随浏览器关闭      │──▶│   ├ 磁盘录制 .cast (DVR)   │   │  Viewer C (同事)    │
+│  │ 不随浏览器关闭      │──▶│   ├ SQLite durable frames  │   │  Viewer C (同事)    │
 │  │ 只随 connector 进程 │out│   └ subscribers 广播集合   │   │                     │
 │  └ 或 terminate 结束    │   │                            │   │  attach → restore   │
 └────────────────────────┘   └────────────────────────────┘   │        → live 流    │
@@ -77,47 +77,24 @@
 
 ## 5. Server 端：LiveSession 与 Recorder
 
-每个 `session_id` 对应一个内存 `LiveSession`：
-
-```python
-LiveSession:
-    screen   : pyte.Screen        # 权威"当前屏幕"，含颜色/光标，尺寸 = cols×rows
-    stream   : pyte.Stream        # 把字节喂进 screen
-    cast_fp  : 追加写 data/sessions/<id>.cast  (asciicast v2)
-    subscribers : set[HumanConn]  # 正在看这个会话的所有浏览器
-    dims, start_time, ended, exit_code
-```
-
-**输出到达时**（connector `output` 帧）：
-```
-feed(data):
-    screen 消费 data        → 更新当前屏幕（供重连 restore）
-    cast 追加 [t,"o",data]  → 落盘（供 DVR 回放）
-    broadcast output 给所有 subscribers → live 观看
-```
+每个 `session_id` 对应一个内存 `LiveSession`（pyte 当前屏幕 + subscribers），持久事实源则是
+SQLite `RecordingFrame`。connector 的 output 先按 `(session_id, pty_instance_id, seq)` durable
+commit，server 才发送 ACK；随后同一字节更新 pyte 并广播给 live viewer。相同 seq + payload hash
+可安全 re-ACK，冲突 payload fail closed。
 
 **重连 restore**（attach 时）：`serialize_screen(screen)` 把 pyte 当前屏幕转成一段
-"清屏 + 逐行带 SGR 颜色重绘 + 定位光标"的字节，发一帧 `restore`。浏览器写进一个干净的
-xterm 就**瞬间还原到当前画面**——无论离开了 1 秒还是 1 小时。
+"清屏 + 逐行带 SGR 颜色重绘 + 定位光标"的字节，发一帧 `restore`。server 进程重启后，
+`LiveRegistry` 通过 `durable_events()` 重建 screen，再接收 connector 磁盘 spool 精确补发的缺失 seq。
+connector transport 重启不杀 PTY；supervisor/sessiond 重启目前仍会结束其托管的 PTY。
 
-**服务器重启也不丢**由三段机制共同保证：
-1. connector 的 PTY reader 只写入本地 FIFO；WS 不可用时输出帧留在队列，重连后按序补发，
-   不再让网络异常杀死 PTY reader。
-2. connector 重连后上报仍存活的 `(agent_id, session_id)`，server/UI 因而知道应该 **resume
-   同一进程**，而不是误建新 session。
-3. `get_or_create` 若发现 `.cast` 已存在，把历史 `o` 事件重播进 `pyte.HistoryScreen`，重建
-   当前屏幕和有限 scrollback；随后接上 connector 补发的离线期间输出。
-
-当前 FIFO 在 connector 内存中，因此覆盖 **server 重启 / 网络中断（connector 进程仍在）**；
-connector 自己重启时 PTY 也会消失。未来若要覆盖整台 devbox/connector 重启，需要把 PTY
-托管给 tmux/ConPTY 守护进程，并把 FIFO 做成本地磁盘 spool。
-
-**DVR 回放**：`GET /api/sessions/{id}/recording` 吐出 `.cast` 文件；web 的"回放"模式按时间戳
-播放（或秒进）。这是本地终端完全没有的能力——审计、复盘、分享一段 agent 工作过程。
+**DVR 回放**：`GET /api/sessions/{id}/recording` 从 durable rows 动态导出 asciicast v2；
+`GET /api/sessions/{id}/replay` 返回 events、checkpoint 和 metadata。web seek 先恢复目标时间之前最近的
+checkpoint，再应用 cursor 更大的 output event，因而相同时间戳的帧也不会漏放。Session retention
+支持 `none/7d/30d/permanent`：过期 payload 被清空且 checkpoint 删除，但 seq/hash ledger 保留。
 
 ---
 
-## 6. 帧协议变更（protocol v2）
+## 6. 帧协议（browser attach + connector protocol v3）
 
 浏览器 → server：
 - `attach {session_id}`（原 `open`）
@@ -134,8 +111,10 @@ server → 浏览器：
 
 server ↔ connector：
 - `open`（幂等，确保 PTY 在）
-- `input` / `resize`
-- `terminate`（杀 PTY）——注意 detach **不**下发任何东西给 connector
+- `output {session_id, pty_instance_id, seq, kind, data}` → durable commit 后 `ack`
+- gap → `resend_from`；相同 seq/hash → duplicate re-ACK；不同 payload → fail closed
+- `input {client_input_id}` → connector 去重并返回 `input_ack`
+- `resize` / `terminate`；detach **不**下发任何东西给 connector
 
 ---
 
@@ -155,9 +134,9 @@ server ↔ connector：
 
 - **restore 快照有界**：只和屏幕尺寸有关（~几十 KB），与会话时长无关。
 - **pyte 内存有界**：屏幕 + 有限 scrollback。
-- **.cast 磁盘**：随时长线性增长（纯文本，可压缩/轮转）；这是"完整历史"的必要成本，
-  且不参与 live 路径，不影响实时性。
-- 未来可加：`.cast` 大小上限 + 轮转；idle 会话回收策略（默认**不回收**以保证持久性）。
+- **durable recording**：SQLite rows 随时长线性增长，且位于 ACK 路径以提供 delivery 语义；
+  默认 30d retention，也可选 none/7d/permanent。清理 payload 不删除 dedup identity row。
+- checkpoint interval 有界 seek 重放量；checkpoint 含完整屏幕，因此 retention 清理同步删除相关 checkpoint。
 
 ---
 

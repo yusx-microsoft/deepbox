@@ -616,6 +616,91 @@ async def session_recording(session_id: str, request: Request, s: OrmSession = D
                              media_type="application/x-asciicast")
 
 
+@app.get("/api/sessions/{session_id}/replay")
+async def session_replay(session_id: str, request: Request,
+                         s: OrmSession = Depends(db)):
+    """Owner-scoped structured replay payload for the Cut 6 replay UI.
+
+    Returns the asciicast header, the ordered durable event list (redacted
+    frames are omitted so redacted payload can never leak), and persisted
+    checkpoints keyed by durable frame cursor to support O(1) seek.
+    """
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess or sess.user_id != u.id:
+        raise HTTPException(404, "not found")
+    from .live import cast_header
+
+    header = cast_header(session_id)
+    cols = header.get("width", 80)
+    rows = header.get("height", 24)
+
+    frames = recording_store.read_range(s, session_id)  # non-redacted, by id
+    events = []
+    last = 0.0
+    for idx, f in enumerate(frames):
+        t = f.elapsed if f.elapsed is not None else last
+        if t < last:
+            t = last
+        last = t
+        events.append({
+            "index": idx,
+            "frame_id": f.id,
+            "time": round(float(t), 6),
+            "kind": f.kind or "o",
+            "data": f.data,
+        })
+
+    checkpoints = []
+    for cp in recording_store.checkpoints(s, session_id):
+        checkpoints.append({
+            "frame_id": cp.frame_id,
+            "event_index": cp.event_index,
+            "time": round(float(cp.elapsed), 6) if cp.elapsed is not None else None,
+            "cols": cp.cols,
+            "rows": cp.rows,
+            "screen": cp.screen,
+        })
+
+    meta = recording_store.metadata(s, session_id)
+    return {
+        "session_id": session_id,
+        "header": header,
+        "cols": cols,
+        "rows": rows,
+        "retention": getattr(sess, "retention", None),
+        "duration": round(float(last), 6),
+        "event_count": len(events),
+        "events": events,
+        "checkpoints": checkpoints,
+        "metadata": {
+            "frame_count": meta["frame_count"],
+            "redacted_count": meta["redacted_count"],
+            "pty_instance_ids": meta["pty_instance_ids"],
+        },
+    }
+
+
+@app.patch("/api/sessions/{session_id}/retention")
+async def update_session_retention(session_id: str, request: Request,
+                                   s: OrmSession = Depends(db)):
+    """Update a session's recording retention policy and enforce it now."""
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess or sess.user_id != u.id:
+        raise HTTPException(404, "not found")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON")
+    retention = body.get("retention") if isinstance(body, dict) else None
+    if retention not in models.VALID_RETENTIONS:
+        raise HTTPException(422, "retention must be none, 7d, 30d, or permanent")
+    redacted = recording_store.set_retention(s, sess, retention)
+    return {"session_id": session_id, "retention": retention,
+            "redacted_frames": redacted}
+
+
 # ---------------------------------------------------------------- runtime REST (connector)
 @app.get("/api/me")
 async def me_devbox(request: Request, s: OrmSession = Depends(db)):
@@ -699,6 +784,17 @@ async def ws_devbox(ws: WebSocket):
                         ls = live_registry.get_or_create(sid)
                         ls.feed_live_output(frame.get("data", ""))
                         await hub.to_session_humans(sid, frame)
+                        # Auto-checkpoint the live screen after durable NEW
+                        # output so the replay UI can seek without full replay.
+                        try:
+                            from .live import serialize_screen
+                            recording_store.maybe_checkpoint(
+                                s, sid, frame=result.frame,
+                                screen_fn=lambda ls=ls: serialize_screen(ls.screen),
+                                cols=getattr(ls, "cols", 80),
+                                rows=getattr(ls, "rows", 24))
+                        except Exception:
+                            logger.debug("checkpoint failed", exc_info=True)
                         await ws.send_json({
                             "type": "ack", "session_id": sid,
                             "pty_instance_id": frame.get("pty_instance_id"),

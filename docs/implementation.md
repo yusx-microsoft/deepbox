@@ -21,9 +21,9 @@
         HumanConn                          Hub (内存路由表)                    DevboxConn + PtySession
 ```
 
-**一句话**：server 是一个纯粹的**字节流交换机**。它不解析、不理解、不存储 CLI 的输出内容，
-只负责把"哪个用户的按键"送到"哪台 devbox 的哪个 PTY"，再把 PTY 的输出送回"正在看这个
-会话的浏览器"。智能（Claude）100% 跑在用户机器上。
+**一句话**：server 是一个纯粹的**字节流交换机 + durable recording control plane**。它不解析、
+不理解 CLI 输出语义，也绝不运行模型或持有模型密钥；它只路由按键/PTY 字节，并把 Protocol v3
+输出按 retention policy 持久化供恢复与回放。智能（Claude/Copilot/Codex）100% 跑在用户机器上。
 
 ---
 
@@ -251,10 +251,31 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
 
 ---
 
+## 7.1 P2 Cut 6：Replay、Checkpoint 与 Retention
+
+- `server/app/recording.py` 以 `RecordingFrame.id` 作为跨 PTY stream 的 durable cursor；
+  `durable_events()` 生成按 cursor 排序的 replay event，`maybe_checkpoint()` 周期性保存完整终端屏幕，
+  `metadata()` 只返回回放所需统计，不解析 runtime/model。
+- `GET /api/sessions/{id}/recording` 输出兼容 asciicast v2；`GET /api/sessions/{id}/replay`
+  返回 header、events、checkpoints、duration 与 metadata，且两者都执行 session owner 隔离。
+- `PATCH /api/sessions/{id}/retention` 只接受 `none/7d/30d/permanent`，策略与执行在
+  `RecordingStore.set_retention()` 同一操作完成。清理时 payload 清空、`redacted_at` 置位并删除可能含
+  已过期内容的 checkpoint；seq/hash ledger 不删，因此 ACK 丢失后的 identical duplicate 仍可安全 re-ACK。
+  `none` 对后续新 output 也在 `persist_output()` 返回（即 server ACK）前清空持久 payload。
+- `web/replay.js` 是可独立测试的纯 replay helper；`web/app.js` 动态加载它，并提供 Session 历史列表、
+  播放/暂停、0.5x/1x/2x/8x、timeline seek、首尾跳转、最终屏幕、asciicast 下载与 retention selector。
+  seek 恢复 `time <= target` 的最近 checkpoint，再严格应用 `cursor > checkpoint.cursor` 的 output event；
+  replay mode 禁用 xterm stdin，返回 live 时重建 terminal/WS 状态。
+- 回归覆盖 retention 即时执行、未来 `none` 帧、redaction 后 duplicate ACK、checkpoint 清理、
+  server 字段到 browser replay 字段的归一化，以及相同时间戳下的 cursor seek。
+
+---
+
 ## 8. 现在的边界
 
-- output 已写 asciicast DVR，并维护有限 scrollback；connector 断线时使用**内存** FIFO 作前置去抖，
-  持久性由 **P2 Cut 5 磁盘 spool**（seq/ACK/fsync/resume）保证：每帧落盘后才可发送、精确 seq ACK 后才移除。
+- output 由 server Protocol v3 `RecordingFrame` durable store 记录，并可导出 asciicast v2 / JSON replay；
+  connector 断线时使用**内存** FIFO 作前置去抖，持久性由 **P2 Cut 5 磁盘 spool**（seq/ACK/fsync/resume）保证：
+  每帧落盘后才可发送、server durable commit 后才 ACK、connector 精确 seq ACK 后才移除。
 - **P2 Cut 4 已拆分** supervisor（会话所有权）/ transport（WS）：transport 重启/断开不再 kill PTY。
   拆分既可跑在**进程内** `LoopbackChannel`（`python -m connector` 默认 all-in-one），
   也可跑真实**双进程**：`--mode supervisor` 长驻拥有 PTY 并经命名管道 / Unix socket（`0600`）

@@ -16,6 +16,20 @@ ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
 VALID_ROLES = {ROLE_OWNER, ROLE_MEMBER}
 
+# Session-level recording retention policies.
+RETENTION_NONE = "none"          # keep no durable payload (redact eagerly)
+RETENTION_7D = "7d"
+RETENTION_30D = "30d"
+RETENTION_PERMANENT = "permanent"
+VALID_RETENTIONS = {RETENTION_NONE, RETENTION_7D, RETENTION_30D, RETENTION_PERMANENT}
+# Number of days after which payload is redacted; None => never.
+RETENTION_DAYS = {
+    RETENTION_NONE: 0,
+    RETENTION_7D: 7,
+    RETENTION_30D: 30,
+    RETENTION_PERMANENT: None,
+}
+
 
 def now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -89,6 +103,8 @@ class Session(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"))
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String, default="Session")
+    # Recording retention policy: none|7d|30d|permanent (see VALID_RETENTIONS).
+    retention: Mapped[str] = mapped_column(String, default=RETENTION_30D)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
 
@@ -156,9 +172,40 @@ class RecordingFrame(Base):
     elapsed: Mapped[float | None] = mapped_column(Float, nullable=True)
     timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    # Retention: when the payload has been redacted the seq/hash identity row is
+    # preserved (Protocol v3 duplicate-ACK ledger) but ``data`` is blanked.
+    redacted_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-_engine = None
+class RecordingCheckpoint(Base):
+    """Periodic full-screen snapshot enabling O(1) replay seek.
+
+    Keyed by a *durable frame cursor* — the ``RecordingFrame.id`` of the last
+    frame folded into ``screen`` — so a checkpoint refers to an unambiguous
+    point across interleaved ``pty_instance_id`` streams. Seeking to time T
+    means: load the newest checkpoint whose ``frame_id`` <= the target frame,
+    restore ``screen``, then replay only the frames after it.
+    """
+    __tablename__ = "recording_checkpoint"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id", "frame_id",
+            name="uq_recording_checkpoint_frame",
+        ),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("session.id", ondelete="CASCADE"), index=True)
+    # Durable frame cursor: RecordingFrame.id of the last applied frame.
+    frame_id: Mapped[int] = mapped_column(Integer, index=True)
+    # Event ordinal within the merged durable stream (0-based count of frames
+    # applied), so a replay client can align the checkpoint to its event list.
+    event_index: Mapped[int] = mapped_column(Integer, default=0)
+    elapsed: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cols: Mapped[int] = mapped_column(Integer, default=80)
+    rows: Mapped[int] = mapped_column(Integer, default=24)
+    screen: Mapped[str] = mapped_column(Text)  # rendered terminal snapshot
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 SessionLocal: sessionmaker | None = None
 
 
@@ -187,6 +234,18 @@ def _migrate(engine) -> None:
         )
     if "disabled_at" not in user_cols:
         stmts.append("ALTER TABLE user ADD COLUMN disabled_at DATETIME")
+    if "session" in inspector.get_table_names():
+        session_cols = {c["name"] for c in inspector.get_columns("session")}
+        if "retention" not in session_cols:
+            stmts.append(
+                f"ALTER TABLE session ADD COLUMN retention VARCHAR "
+                f"DEFAULT '{RETENTION_30D}'"
+            )
+    if "recording_frame" in inspector.get_table_names():
+        frame_cols = {c["name"] for c in inspector.get_columns("recording_frame")}
+        if "redacted_at" not in frame_cols:
+            stmts.append(
+                "ALTER TABLE recording_frame ADD COLUMN redacted_at DATETIME")
     with engine.begin() as conn:
         for stmt in stmts:
             conn.execute(text(stmt))

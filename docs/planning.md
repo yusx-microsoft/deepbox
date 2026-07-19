@@ -298,9 +298,15 @@ ack_state(session_id, pty_instance_id, last_acked_seq)
 
 ## Cut 4 — DVR Replay、Checkpoint 与 Retention
 
+> **进度（P2 Cut 6 已落地）**：历史 Session 列表、xterm 复用的播放/暂停/倍速/timeline seek、
+> 首尾跳转、最终屏幕与 asciicast 下载已接入。Server 以 Protocol v3 durable frame 为事实源提供
+> `/recording` 与 `/replay`；checkpoint 使用 durable `frame_id` cursor，浏览器 seek 时先恢复最近快照再应用后续事件。
+> Session retention 支持 `none/7d/30d/permanent`；变更策略立即执行，过期 payload 被清空、checkpoint 被删除，
+> 但 seq/hash identity row 保留以维持 duplicate ACK 安全。`none` 对后续新帧也在 ACK 前立即清空持久 payload。
+
 ### 目标
 
-把已有 `.cast` 文件变成用户可见的 Session 历史能力。
+把 Protocol v3 durable recording（兼容读取早期 `.cast`）变成用户可见的 Session 历史能力。
 
 ### Replay UI
 
@@ -328,11 +334,11 @@ seek：加载最近 checkpoint，再应用后续事件。
 
 ```python
 RecordingStore:
-    append()
-    read_range()
-    checkpoint()
-    delete()
-    metadata()
+    persist_output()
+    durable_events()
+    checkpoint() / maybe_checkpoint()
+    checkpoints() / metadata()
+    set_retention() / redact_expired()
 ```
 
 开发版可用本地文件；生产版可切对象存储。
