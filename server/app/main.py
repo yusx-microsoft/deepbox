@@ -25,7 +25,7 @@ from .models import (
     PROTOCOL_VERSION, ROLE_OWNER, ROLE_MEMBER, now,
 )
 from .util import (
-    new_id, new_token, hash_token, hash_password, verify_password,
+    new_id, new_token, hash_token, hash_password, verify_password_ex,
 )
 from .hub import hub, DevboxConn, HumanConn
 from .config import settings
@@ -33,6 +33,11 @@ from .live import live_registry
 from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID
 from .logging import configure_logging, log_event
 from .capacity import collect_capacity, transition_event
+from .audit import audit_event
+from .security import (
+    SAFE_METHODS, RateLimiter, RateLimitRule, build_security_headers,
+    is_origin_allowed,
+)
 from . import version as version_info
 
 import logging as _logging
@@ -40,6 +45,10 @@ import logging as _logging
 configure_logging(os.getenv("DEEPBOX_LOG_LEVEL", "INFO"))
 logger = _logging.getLogger("deepbox")
 _capacity_status = "ok"
+_api_limiter = RateLimiter(RateLimitRule(settings.rate_limit_api_per_minute, 60))
+_login_limiter = RateLimiter(RateLimitRule(settings.rate_limit_login_per_minute, 60))
+_token_limiter = RateLimiter(RateLimitRule(settings.rate_limit_token_per_minute, 60))
+_RATE_EXEMPT = {"/api/health", "/api/ready", "/api/version", "/api/auth/bootstrap-status"}
 
 
 def _durable_events_loader(session_id: str):
@@ -79,6 +88,46 @@ def observe_capacity(report, *, source: str) -> None:
 signer = URLSafeSerializer(settings.secret, salt="deepbox-session")
 
 app = FastAPI(title="deepbox")
+
+@app.middleware("http")
+async def security_baseline(request: Request, call_next):
+    """Production request guards plus baseline headers on every response."""
+    path = request.url.path
+    client = request.client.host if request.client else "unknown"
+    if settings.rate_limit_enabled and path.startswith("/api/") and path not in _RATE_EXEMPT:
+        if path == "/api/auth/login":
+            limiter, path_class = _login_limiter, "login"
+        elif "/tokens" in path or path.endswith("/devboxes"):
+            limiter, path_class = _token_limiter, "credentials"
+        else:
+            limiter, path_class = _api_limiter, "api"
+        decision = limiter.check((client, path_class))
+        if not decision.allowed:
+            audit_event("http.rate_limited", outcome="denied", request=request,
+                        resource_type="route", resource_id=path,
+                        details={"retry_after": decision.retry_after})
+            response = JSONResponse({"detail": "rate limit exceeded"}, status_code=429,
+                                    headers={"Retry-After": str(decision.retry_after)})
+            response.headers.update(build_security_headers(production=settings.production))
+            return response
+    # Browser mutation requests authenticated by ambient cookies must prove
+    # same-site intent. Bearer connector requests are not cookie-authenticated.
+    if (settings.production and request.method.upper() not in SAFE_METHODS
+            and request.cookies.get("deepbox_session")
+            and not request.headers.get("authorization", "").lower().startswith("bearer ")
+            and not is_origin_allowed(request.method, request.headers.get("origin"),
+                                      settings.allowed_origins)):
+        audit_event("http.csrf_rejected", outcome="denied", request=request,
+                    resource_type="route", resource_id=path)
+        response = JSONResponse({"detail": "origin not allowed"}, status_code=403)
+        response.headers.update(build_security_headers(production=True))
+        return response
+    response = await call_next(request)
+    response.headers.update(build_security_headers(production=settings.production))
+    if path.startswith("/api/auth/") or "/tokens" in path:
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
 models.init_db(settings.database_url)
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
@@ -207,7 +256,7 @@ async def register(request: Request, s: OrmSession = Depends(db)):
     invite_code = (body.get("invite_code") or "").strip()
     username = body["username"].strip()
     if invite_code:
-        return _redeem_invitation(s, invite_code, username, body)
+        return _redeem_invitation(s, invite_code, username, body, request)
 
     if s.scalar(select(User).where(User.username == username)):
         raise HTTPException(400, "username taken")
@@ -225,7 +274,7 @@ async def register(request: Request, s: OrmSession = Depends(db)):
 
 
 def _redeem_invitation(s: OrmSession, invite_code: str, username: str,
-                       body: dict) -> JSONResponse:
+                       body: dict, request: Request) -> JSONResponse:
     # Keep every failed invitation claim opaque, including username conflicts,
     # so an untrusted code cannot be used as an account-enumeration oracle.
     if not username or not body.get("password"):
@@ -257,17 +306,26 @@ def _redeem_invitation(s: OrmSession, invite_code: str, username: str,
         s.rollback()
         raise HTTPException(404, "not found")
     s.commit()
+    audit_event("invitation.redeemed", outcome="success", actor_user_id=user.id,
+                request=request, resource_type="invitation",
+                details={"username": username})
     return _login_response(user)
 
 
 @app.post("/api/auth/login")
 async def login(request: Request, s: OrmSession = Depends(db)):
     body = await request.json()
-    user = s.scalar(select(User).where(User.username == body["username"].strip()))
-    if not user or not verify_password(body["password"], user.password_hash):
+    username = body["username"].strip()
+    user = s.scalar(select(User).where(User.username == username))
+    check = verify_password_ex(body["password"], user.password_hash) if user else None
+    if not user or not check or not check.valid or user.disabled_at is not None:
+        audit_event("auth.login", outcome="denied", request=request,
+                    details={"username": username})
         raise HTTPException(401, "bad credentials")
-    if user.disabled_at is not None:
-        raise HTTPException(401, "bad credentials")
+    if check.replacement:
+        user.password_hash = check.replacement
+        s.commit()
+    audit_event("auth.login", outcome="success", actor_user_id=user.id, request=request)
     return _login_response(user)
 
 
@@ -380,6 +438,9 @@ async def create_invitation(request: Request, s: OrmSession = Depends(db)):
     )
     s.add(inv)
     s.commit()
+    audit_event("invitation.created", actor_user_id=u.id,
+                resource_type="invitation", resource_id=inv.id,
+                details={"ttl_hours": ttl_hours})
     # Plaintext returned exactly once; never stored or logged.
     out = _invitation_json(inv)
     out["token"] = raw
@@ -396,13 +457,15 @@ async def list_invitations(request: Request, s: OrmSession = Depends(db)):
 @app.delete("/api/invitations/{invitation_id}")
 async def revoke_invitation(invitation_id: str, request: Request,
                             s: OrmSession = Depends(db)):
-    require_owner(request, s)
+    actor = require_owner(request, s)
     inv = s.get(Invitation, invitation_id)
     if not inv:
         raise HTTPException(404, "not found")
     if inv.revoked_at is None and inv.redeemed_at is None:
         inv.revoked_at = now()
         s.commit()
+    audit_event("invitation.revoked", actor_user_id=actor.id,
+                resource_type="invitation", resource_id=inv.id)
     return {"ok": True}
 
 
@@ -442,17 +505,21 @@ async def disable_user(user_id: str, request: Request, s: OrmSession = Depends(d
     ).all())
     s.commit()
     await hub.disconnect_user(target.id, devbox_ids)
+    audit_event("user.disabled", actor_user_id=actor.id,
+                resource_type="user", resource_id=target.id)
     return _user_json(target)
 
 
 @app.post("/api/users/{user_id}/enable")
 async def enable_user(user_id: str, request: Request, s: OrmSession = Depends(db)):
-    require_owner(request, s)
+    actor = require_owner(request, s)
     target = s.get(User, user_id)
     if not target:
         raise HTTPException(404, "not found")
     target.disabled_at = None
     s.commit()
+    audit_event("user.enabled", actor_user_id=actor.id,
+                resource_type="user", resource_id=target.id)
     return _user_json(target)
 
 
@@ -480,6 +547,8 @@ async def create_devbox(request: Request, s: OrmSession = Depends(db)):
     full, h, preview = new_token()
     s.add(Token(id=new_id(), devbox_id=d.id, hash=h, preview=preview))
     s.commit()
+    audit_event("devbox.created", actor_user_id=u.id,
+                resource_type="devbox", resource_id=d.id)
     return {"devbox": _devbox_json(d), "token": full, "token_preview": preview}
 
 
@@ -501,16 +570,60 @@ async def delete_devbox(devbox_id: str, request: Request, s: OrmSession = Depend
     return {"ok": True}
 
 
+def _token_json(token: Token) -> dict:
+    return {"id": token.id, "preview": token.preview,
+            "created_at": token.created_at.isoformat(),
+            "last_used_at": token.last_used_at.isoformat() if token.last_used_at else None,
+            "revoked_at": token.revoked_at.isoformat() if token.revoked_at else None}
+
+
+@app.get("/api/devboxes/{devbox_id}/tokens")
+async def list_tokens(devbox_id: str, request: Request, s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    d = s.get(Devbox, devbox_id)
+    if not d or d.owner_user_id != u.id:
+        raise HTTPException(404, "not found")
+    rows = s.scalars(select(Token).where(Token.devbox_id == d.id)
+                     .order_by(Token.created_at.desc())).all()
+    return [_token_json(row) for row in rows]
+
+
 @app.post("/api/devboxes/{devbox_id}/tokens")
 async def rotate_token(devbox_id: str, request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     d = s.get(Devbox, devbox_id)
     if not d or d.owner_user_id != u.id:
         raise HTTPException(404, "not found")
+    issued_at = now()
+    for token in s.scalars(select(Token).where(
+            Token.devbox_id == d.id, Token.revoked_at.is_(None))).all():
+        token.revoked_at = issued_at
     full, h, preview = new_token()
-    s.add(Token(id=new_id(), devbox_id=d.id, hash=h, preview=preview))
+    token = Token(id=new_id(), devbox_id=d.id, hash=h, preview=preview)
+    s.add(token)
     s.commit()
-    return {"token": full, "token_preview": preview}
+    await hub.disconnect_devbox(d.id)
+    audit_event("devbox.token_rotated", actor_user_id=u.id,
+                resource_type="devbox", resource_id=d.id)
+    return {"token": full, "token_preview": preview, "token_id": token.id}
+
+
+@app.delete("/api/devboxes/{devbox_id}/tokens/{token_id}")
+async def revoke_token(devbox_id: str, token_id: str, request: Request,
+                       s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    d = s.get(Devbox, devbox_id)
+    token = s.get(Token, token_id)
+    if not d or d.owner_user_id != u.id or not token or token.devbox_id != d.id:
+        raise HTTPException(404, "not found")
+    if token.revoked_at is None:
+        token.revoked_at = now()
+        s.commit()
+        await hub.disconnect_devbox(d.id)
+    audit_event("devbox.token_revoked", actor_user_id=u.id,
+                resource_type="token", resource_id=token.id,
+                details={"devbox_id": d.id})
+    return {"ok": True}
 
 
 @app.post("/api/devboxes/{devbox_id}/agents")
@@ -681,6 +794,26 @@ async def session_replay(session_id: str, request: Request,
     }
 
 
+@app.delete("/api/sessions/{session_id}/recording")
+async def erase_session_recording(session_id: str, request: Request,
+                                  s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess or sess.user_id != u.id:
+        raise HTTPException(404, "not found")
+    result = recording_store.secure_erase(s, session_id)
+    audit_event("recording.erased", actor_user_id=u.id,
+                resource_type="session", resource_id=session_id,
+                details={"frame_count": result.frame_count,
+                         "newly_redacted": result.newly_redacted,
+                         "checkpoints_deleted": result.checkpoints_deleted})
+    return {"session_id": result.session_id,
+            "frame_count": result.frame_count,
+            "newly_redacted": result.newly_redacted,
+            "already_redacted": result.already_redacted,
+            "checkpoints_deleted": result.checkpoints_deleted}
+
+
 @app.patch("/api/sessions/{session_id}/retention")
 async def update_session_retention(session_id: str, request: Request,
                                    s: OrmSession = Depends(db)):
@@ -697,6 +830,9 @@ async def update_session_retention(session_id: str, request: Request,
     if retention not in models.VALID_RETENTIONS:
         raise HTTPException(422, "retention must be none, 7d, 30d, or permanent")
     redacted = recording_store.set_retention(s, sess, retention)
+    audit_event("recording.retention_changed", actor_user_id=u.id,
+                resource_type="session", resource_id=session_id,
+                details={"retention": retention, "redacted_frames": redacted})
     return {"session_id": session_id, "retention": retention,
             "redacted_frames": redacted}
 

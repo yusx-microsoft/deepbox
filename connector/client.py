@@ -53,6 +53,7 @@ from .ipc import (
     serve_channel,
 )
 from .pty_session import DEFAULT_CMDS
+from . import runtimes
 from .supervisor import SessionSupervisor
 from .spool import open_spool
 from .transport import (
@@ -169,13 +170,19 @@ class Connector:
         return data
 
     def probe_runtimes(self) -> list[str]:
+        """Detect which registered runtimes are installed on this box.
+
+        Iterates the runtime adapter registry (Cut 7) rather than a hard-coded
+        table, so adding a runtime is localized to a single adapter definition.
+        """
         caps = []
-        for rt, cmd in DEFAULT_CMDS.items():
-            if rt == "mock":
-                caps.append(rt)
+        for adapter in runtimes.all_adapters():
+            if adapter.probe_hint is not None:
+                if adapter.probe_hint():
+                    caps.append(adapter.id)
                 continue
-            if shutil.which(cmd[0]):
-                caps.append(rt)
+            if shutil.which(adapter.executable):
+                caps.append(adapter.id)
         return caps
 
     async def report_runtimes(self, devbox_id: str, caps: list[str]):

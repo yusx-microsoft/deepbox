@@ -28,9 +28,35 @@ Key events:
 | `connector.heartbeat` | a heartbeat ping was received (DEBUG) |
 | `capacity.threshold` | a capacity check crossed warn/alert |
 
+Security audit records are also one-line JSON (`server/app/audit.py`). They carry an
+event name, outcome, actor/resource metadata and optional request context; nested
+password/token/secret/cookie/authorization/API-key values are recursively redacted,
+and audit emission never interrupts the request path.
+
+## Security baseline configuration
+
+Production mode is selected with `DEEPBOX_ENV=production`. Startup then fails closed
+unless `DEEPBOX_ALLOWED_ORIGINS` (or `DEEPBOX_PUBLIC_URL`) supplies at least one browser
+origin and `DEEPBOX_COOKIE_SECURE=true`. Unsafe cookie-authenticated requests must carry
+an allowed `Origin`; `/ws/term` applies the same allowlist. Responses receive
+anti-sniffing, framing, referrer, permissions and CSP headers; production responses
+also receive HSTS.
+
+Rate limiting defaults on in production and can be controlled with:
+
+* `DEEPBOX_RATE_LIMIT_ENABLED`
+* `DEEPBOX_RATE_LIMIT_API_PER_MINUTE` (default 300)
+* `DEEPBOX_RATE_LIMIT_LOGIN_PER_MINUTE` (default 10)
+* `DEEPBOX_RATE_LIMIT_TOKEN_PER_MINUTE` (default 20)
+
+Limits use bounded in-process fixed windows keyed by client and route class. Health,
+readiness, version and bootstrap-status probes are exempt. With the current single
+App Service instance this is process-wide; a future multi-instance deployment must
+move the limiter to a shared backend.
+
 ## Connector visibility (online / offline / reconnect / heartbeat)
 
-The connector (`connector/client.py`, `PROTOCOL_VERSION = 2`) sends a
+The connector (`connector/client.py`, `PROTOCOL_VERSION = 3`) sends a
 `{"type":"heartbeat"}` frame every `HEARTBEAT_INTERVAL` (20s) while connected.
 The server refreshes the devbox `last_seen_at` and replies with
 `heartbeat_ack`. On reconnect the connector increments a local `connect_count`

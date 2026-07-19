@@ -14,22 +14,34 @@ import os
 import sys
 import shlex
 
+from . import runtimes
+
 IS_WIN = sys.platform == "win32"
 
-# Default launch commands per runtime. `mock` uses our own echo REPL so the
-# whole pipeline can be tested without any real CLI installed.
-DEFAULT_CMDS = {
-    "mock": [sys.executable, "-u", "-m", "connector.mockcli"],
-    "claude-code": ["claude"],
-    "copilot-cli": ["copilot"],
-    "codex-cli": ["codex"],
-}
+# Backward-compatible view of the historical launch table, now derived from the
+# runtime adapter registry (Cut 7). Kept so existing callers/tests that read
+# ``DEFAULT_CMDS`` keep working; the registry is the source of truth.
+DEFAULT_CMDS = {a.id: list(a.base_argv) for a in runtimes.all_adapters()}
 
 
-def resolve_cmd(runtime: str, launch_cmd: str | None) -> list[str]:
+def resolve_cmd(runtime: str, launch_cmd: str | None,
+                model: str | None = None,
+                permission_mode: str | None = None) -> list[str]:
+    """Resolve the launch argv for an agent.
+
+    An explicit ``launch_cmd`` override still wins (split without a shell and
+    validated). Otherwise the runtime adapter registry builds the exact argv
+    for ``(runtime, model, permission_mode)``. An unknown runtime falls back to
+    the mock runtime, preserving the historical default.
+    """
     if launch_cmd:
-        return shlex.split(launch_cmd, posix=not IS_WIN)
-    return DEFAULT_CMDS.get(runtime, DEFAULT_CMDS["mock"])
+        argv = shlex.split(launch_cmd, posix=not IS_WIN)
+        return runtimes.validate_argv(argv)
+    if not runtimes.has(runtime):
+        runtime = "mock"
+    return runtimes.build_command(runtime, model=model,
+                                  permission_mode=permission_mode)
+
 
 
 class PtySession:

@@ -78,6 +78,20 @@ class Hub:
         conn.sessions.pop(session_id, None)
         self.session_watchers.get(session_id, set()).discard(conn)
 
+    async def disconnect_devbox(self, devbox_id: str, code: int = 4001) -> bool:
+        """Immediately close and unregister one connector after credential revocation."""
+        async with self._lock:
+            conn = self.devboxes.pop(devbox_id, None)
+            if conn is None:
+                return False
+            for agent_id in conn.agent_ids:
+                self.agent_to_devbox.pop(agent_id, None)
+        try:
+            await conn.ws.close(code=code)
+        except Exception:
+            pass
+        return True
+
     async def disconnect_user(
         self, user_id: str, devbox_ids: set[str], code: int = 4001
     ) -> tuple[int, int]:

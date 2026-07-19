@@ -64,6 +64,12 @@ class Settings:
     db_size_alert_mb: float
     disk_free_warn_mb: float
     disk_free_alert_mb: float
+    # Production HTTP security controls. Development/test keep rate limiting off
+    # so local workflows and deterministic suites are unaffected.
+    rate_limit_enabled: bool = False
+    rate_limit_api_per_minute: int = 300
+    rate_limit_login_per_minute: int = 10
+    rate_limit_token_per_minute: int = 20
 
     @property
     def production(self) -> bool:
@@ -125,6 +131,13 @@ class Settings:
             )
         # Free-disk thresholds count down: alert triggers at a lower free
         # figure than warn, so the alert bound must not exceed the warn bound.
+        for name, value in (
+            ("DEEPBOX_RATE_LIMIT_API_PER_MINUTE", self.rate_limit_api_per_minute),
+            ("DEEPBOX_RATE_LIMIT_LOGIN_PER_MINUTE", self.rate_limit_login_per_minute),
+            ("DEEPBOX_RATE_LIMIT_TOKEN_PER_MINUTE", self.rate_limit_token_per_minute),
+        ):
+            if value < 1:
+                raise RuntimeError(f"{name} must be at least 1")
         if self.disk_free_alert_mb > self.disk_free_warn_mb:
             raise RuntimeError(
                 "DEEPBOX_DISK_FREE_ALERT_MB must be <= DEEPBOX_DISK_FREE_WARN_MB"
@@ -194,6 +207,10 @@ def load_settings() -> Settings:
         db_size_alert_mb=_float("DEEPBOX_DB_SIZE_ALERT_MB", 1024.0),
         disk_free_warn_mb=_float("DEEPBOX_DISK_FREE_WARN_MB", 1024.0),
         disk_free_alert_mb=_float("DEEPBOX_DISK_FREE_ALERT_MB", 256.0),
+        rate_limit_enabled=_bool("DEEPBOX_RATE_LIMIT_ENABLED", environment == "production"),
+        rate_limit_api_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_API_PER_MINUTE", "300")),
+        rate_limit_login_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_LOGIN_PER_MINUTE", "10")),
+        rate_limit_token_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_TOKEN_PER_MINUTE", "20")),
     )
     result.validate()
     return result

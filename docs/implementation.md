@@ -138,14 +138,17 @@ Protocol v3 的输出身份是 `(session_id, pty_instance_id, seq)`：
 6. 断线自动重连（外层 `while True` + 3s 退避）。WS 断开时 `supervisor.detach()`，
    PTY 继续跑、output 继续进 `pending`，重连后新 transport 按序补发并 resume 同一 PTY。
 
-`resolve_cmd(runtime, launch_cmd)`：把 runtime 名映射到实际命令。
-`launch_cmd` 优先（可自定义任意命令），否则用默认表：
-```
-mock         → python -m connector.mockcli   (无需任何真实 CLI 即可测全链路)
-claude-code  → claude
-copilot-cli  → copilot
-codex-cli    → codex
-```
+`connector/runtimes.py` 是 runtime 单一事实来源。`RuntimeAdapter` 描述稳定 id、label、
+`base_argv`、model flag/allowlist、permission mode argv、非机密 environment 和探测提示；
+注册表内置 `mock`、`claude-code`、`copilot-cli`、`codex-cli`。`client.probe_runtimes()`
+遍历注册表并把 install/version/path/features 作为 opaque capability JSON 上报，Server/Web
+不解析 runtime-specific 字段。
+
+`resolve_cmd(runtime, launch_cmd, model, permission_mode)`：显式 `launch_cmd` 仍优先，但只用
+`shlex.split` 拆成 argv；否则由共享 `build_command()` 构造 argv。两条路径都会拒绝空 token、
+控制字符和 shell 元字符，并以 argv 直接 spawn（不经过 shell）。未知 runtime 为兼容旧数据
+回退到 `mock`。新增 runtime 只需定义并 `register()` 一个 adapter，无需修改 supervisor、Server
+或 Web。
 
 ### 3.2 `pty_session.py` — 跨平台伪终端
 **为什么必须用 PTY**：Claude Code/Copilot/Codex 是**交互式 TUI**，会检测"是不是真终端"

@@ -50,6 +50,29 @@ REDACTED_PLACEHOLDER = ""
 
 
 @dataclass
+class ErasureResult:
+    """Outcome of an owner-invoked :meth:`RecordingStore.secure_erase`.
+
+    ``frame_count`` is the total number of durable frame rows that remain for
+    the session (the ledger is *preserved*, never deleted). ``newly_redacted``
+    counts frames whose payload this call actually blanked; ``already_redacted``
+    counts frames a prior erasure/retention pass had already redacted, so a
+    repeated call is idempotent (``newly_redacted == 0`` the second time).
+    ``checkpoints_deleted`` is the number of full-screen snapshots removed.
+    """
+    session_id: str
+    frame_count: int
+    newly_redacted: int
+    already_redacted: int
+    checkpoints_deleted: int
+
+    @property
+    def redacted_count(self) -> int:
+        """Total frames now carrying a redacted (empty) payload."""
+        return self.newly_redacted + self.already_redacted
+
+
+@dataclass
 class PersistResult:
     outcome: str
     expected_seq: int | None = None   # populated for GAP
@@ -415,7 +438,58 @@ class RecordingStore:
         db.commit()
         return n
 
-    # -- metadata --------------------------------------------------------
+    # -- secure erasure --------------------------------------------------
+    @staticmethod
+    def secure_erase(db, session_id: str, *,
+                     now: dt.datetime | None = None) -> ErasureResult:
+        """Owner-callable secure erasure of a session's durable recording.
+
+        Redacts the payload of *every* durable frame for ``session_id`` while
+        preserving the ledger identity each frame needs for Protocol v3
+        duplicate-ACK semantics: the frame row, its ``seq``, ``pty_instance_id``
+        and ``payload_hash`` all survive. Only the human-readable ``data`` is
+        blanked and ``redacted_at`` is stamped (once — an already-redacted frame
+        keeps its original timestamp). All checkpoints are deleted outright,
+        because a snapshot may embed now-erased plaintext.
+
+        The whole operation runs in a single transaction, so it is atomic: a
+        partial erasure never commits. It is also idempotent — calling it again
+        redacts nothing new (``newly_redacted == 0``) and simply reports the
+        already-erased ledger. Returns an :class:`ErasureResult` with counts.
+        """
+        now = now or models.now()
+        # Roll back any prior aborted state so our reads and the erasure share
+        # one clean, consistent transaction.
+        db.rollback()
+
+        frames = db.scalars(
+            select(models.RecordingFrame)
+            .where(models.RecordingFrame.session_id == session_id)
+        ).all()
+        newly_redacted = 0
+        already_redacted = 0
+        for f in frames:
+            if f.redacted_at is not None:
+                already_redacted += 1
+                continue
+            # Preserve seq / pty_instance_id / payload_hash: only the payload
+            # is discarded and the redaction stamped.
+            f.data = REDACTED_PLACEHOLDER
+            f.redacted_at = now
+            newly_redacted += 1
+
+        checkpoints_deleted = db.query(models.RecordingCheckpoint).filter(
+            models.RecordingCheckpoint.session_id == session_id).delete()
+
+        db.commit()
+        return ErasureResult(
+            session_id=session_id,
+            frame_count=len(frames),
+            newly_redacted=newly_redacted,
+            already_redacted=already_redacted,
+            checkpoints_deleted=checkpoints_deleted,
+        )
+
     @staticmethod
     def metadata(db, session_id: str) -> dict:
         """Summarize durable storage for a session (counts, cursors, times)."""

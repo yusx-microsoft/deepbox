@@ -11,3 +11,4 @@ websockets>=12.0
 httpx>=0.27
 pyte>=0.8.2
 python-dotenv>=1.0
+argon2-cffi==23.1.0

@@ -7,6 +7,7 @@ import uuid
 from server.app import models
 from server.app.recording import (
     RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID,
+    ErasureResult,
 )
 from server.app.live import LiveRegistry
 
@@ -431,6 +432,126 @@ class RetentionTests(RecordingBaseCase):
         r = self.store.persist_output(self.db, devbox_id=self.dbxA,
                                       frame=_frame(self.sid, self.pty, 1, "dup"))
         self.assertEqual(r.outcome, DUPLICATE)
+
+
+class SecureEraseTests(RecordingBaseCase):
+    def _seed(self, n=4):
+        rows = []
+        for i in range(1, n + 1):
+            r = self.store.persist_output(
+                self.db, devbox_id=self.dbxA,
+                frame=_frame(self.sid, self.pty, i, f"secret{i}",
+                             elapsed=float(i)))
+            rows.append(r.frame)
+        return rows
+
+    def test_redacts_all_payloads_preserving_ledger(self):
+        rows = self._seed(3)
+        seqs_before = [r.seq for r in rows]
+        hashes_before = [r.payload_hash for r in rows]
+        ptys_before = [r.pty_instance_id for r in rows]
+        ids_before = [r.id for r in rows]
+
+        res = self.store.secure_erase(self.db, self.sid)
+        self.assertIsInstance(res, ErasureResult)
+        self.assertEqual(res.frame_count, 3)
+        self.assertEqual(res.newly_redacted, 3)
+        self.assertEqual(res.already_redacted, 0)
+
+        got = self.db.query(models.RecordingFrame).order_by(
+            models.RecordingFrame.seq).all()
+        # Rows preserved (not deleted).
+        self.assertEqual(self._count(), 3)
+        self.assertEqual([r.id for r in got], ids_before)
+        # Ledger identity preserved: seq, pty_instance_id and payload_hash.
+        self.assertEqual([r.seq for r in got], seqs_before)
+        self.assertEqual([r.payload_hash for r in got], hashes_before)
+        self.assertEqual([r.pty_instance_id for r in got], ptys_before)
+        # Payload discarded, redaction stamped.
+        for r in got:
+            self.assertEqual(r.data, "")
+            self.assertIsNotNone(r.redacted_at)
+
+    def test_deletes_all_checkpoints_and_none_remain(self):
+        rows = self._seed(4)
+        self.store.checkpoint(self.db, self.sid, frame_id=rows[1].id,
+                              screen="SCREEN-A", event_index=2)
+        self.store.checkpoint(self.db, self.sid, frame_id=rows[3].id,
+                              screen="SCREEN-B", event_index=4)
+        self.assertEqual(len(self.store.checkpoints(self.db, self.sid)), 2)
+
+        res = self.store.secure_erase(self.db, self.sid)
+        self.assertEqual(res.checkpoints_deleted, 2)
+        # No checkpoint screen remains for the session.
+        self.assertEqual(self.store.checkpoints(self.db, self.sid), [])
+        self.assertIsNone(self.store.latest_checkpoint(self.db, self.sid))
+        self.assertEqual(
+            self.db.query(models.RecordingCheckpoint).filter_by(
+                session_id=self.sid).count(), 0)
+
+    def test_idempotent_second_call_redacts_nothing_new(self):
+        self._seed(3)
+        first = self.store.secure_erase(self.db, self.sid)
+        self.assertEqual(first.newly_redacted, 3)
+        stamps = [r.redacted_at for r in self.db.query(
+            models.RecordingFrame).order_by(models.RecordingFrame.seq).all()]
+
+        second = self.store.secure_erase(self.db, self.sid)
+        self.assertEqual(second.frame_count, 3)
+        self.assertEqual(second.newly_redacted, 0)
+        self.assertEqual(second.already_redacted, 3)
+        self.assertEqual(second.redacted_count, 3)
+        self.assertEqual(second.checkpoints_deleted, 0)
+        # Existing redaction timestamps are untouched by the repeat call.
+        stamps_after = [r.redacted_at for r in self.db.query(
+            models.RecordingFrame).order_by(models.RecordingFrame.seq).all()]
+        self.assertEqual(stamps_after, stamps)
+
+    def test_dedup_identity_preserved_duplicate_still_acks(self):
+        # After erasure, re-sending an identical frame must map to DUPLICATE
+        # (identity row preserved), never CONFLICT or NEW.
+        frame = _frame(self.sid, self.pty, 1, "dup-payload")
+        self.assertEqual(self.store.persist_output(
+            self.db, devbox_id=self.dbxA, frame=frame).outcome, NEW)
+        self.store.secure_erase(self.db, self.sid)
+        r = self.store.persist_output(self.db, devbox_id=self.dbxA, frame=frame)
+        self.assertEqual(r.outcome, DUPLICATE)
+        self.assertTrue(r.committed)
+        self.assertEqual(self._count(), 1)
+
+    def test_erased_payload_excluded_from_reads(self):
+        self._seed(2)
+        self.store.secure_erase(self.db, self.sid)
+        self.assertEqual(RecordingStore.durable_events(self.db, self.sid), [])
+        self.assertEqual(self.store.read_range(self.db, self.sid), [])
+        meta = self.store.metadata(self.db, self.sid)
+        self.assertEqual(meta["frame_count"], 2)
+        self.assertEqual(meta["redacted_count"], 2)
+        self.assertEqual(meta["checkpoint_frame_ids"], [])
+
+    def test_empty_session_is_noop(self):
+        res = self.store.secure_erase(self.db, self.sid)
+        self.assertEqual(res.frame_count, 0)
+        self.assertEqual(res.newly_redacted, 0)
+        self.assertEqual(res.already_redacted, 0)
+        self.assertEqual(res.checkpoints_deleted, 0)
+
+    def test_only_target_session_affected(self):
+        # A second session on the same devbox must be left untouched.
+        other = "s-" + uuid.uuid4().hex
+        self.db.add(models.Session(id=other, user_id=self.uid,
+                                   agent_id=self.agA, title="Other"))
+        self.db.commit()
+        self._seed(2)
+        self.store.persist_output(
+            self.db, devbox_id=self.dbxA,
+            frame=_frame(other, self.pty, 1, "keepme"))
+        self.store.secure_erase(self.db, self.sid)
+        kept = self.db.query(models.RecordingFrame).filter_by(
+            session_id=other).all()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].data, "keepme")
+        self.assertIsNone(kept[0].redacted_at)
 
 
 if __name__ == "__main__":

@@ -444,7 +444,11 @@ deepbox disconnect
 
 ---
 
-## Cut 6 — Security Baseline
+## Cut 6 — Security Baseline ✅ 已实现
+
+已落地：Argon2id（兼容旧 salted-SHA256 并在成功登录时透明升级）、生产 Origin
+allowlist、固定窗口分层 rate limit、安全 headers/HSTS、结构化脱敏审计、token 吊销后即时
+断连，以及 owner-only recording secure erase（保留序列/hash 账本、删除 checkpoint）。
 
 ### 必做
 
@@ -483,7 +487,11 @@ deepbox disconnect
 
 ---
 
-## Cut 7 — Runtime Adapter Registry 与真实多 Runtime
+## Cut 7 — Runtime Adapter Registry 与真实多 Runtime ✅ 已实现
+
+实现位于 connector-only `connector/runtimes.py`；共享 builder 生成并验证 argv，Server/Web
+继续把 capability 当作 opaque JSON。真实三 Runtime 的物理机器 E2E 仍属于部署验证，不改变
+本 cut 的注册表边界。
 
 ### 目标
 

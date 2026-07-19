@@ -137,6 +137,10 @@ server ↔ connector：
 - **durable recording**：SQLite rows 随时长线性增长，且位于 ACK 路径以提供 delivery 语义；
   默认 30d retention，也可选 none/7d/permanent。清理 payload 不删除 dedup identity row。
 - checkpoint interval 有界 seek 重放量；checkpoint 含完整屏幕，因此 retention 清理同步删除相关 checkpoint。
+- Owner 可调用 `DELETE /api/sessions/{id}/recording` 执行 secure erase：每个 durable frame
+  保留 `(session_id, pty_instance_id, seq)`、kind、原 `payload_hash` 与时间戳以维持 Protocol v3
+  dedup/hash 账本，但 `data` 被固定 redaction marker 替换并写入 `redacted_at`；所有 checkpoint
+  被物理删除。操作幂等，非 owner/跨租户目标返回 opaque 404。
 
 ---
 
