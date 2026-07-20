@@ -118,6 +118,72 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sup.pending), 1)
         self.assertEqual(sup.pending[0]["data"], "keep-me")
 
+    async def test_control_arriving_during_output_does_not_block_exact_ack(self):
+        sup = SessionSupervisor()
+        sup.emit({"type": "output", "session_id": "s",
+                  "pty_instance_id": "p", "data": "durable"})
+        sup_end, tx_end = LoopbackChannel.pair()
+        sup.attach(sup_end)
+        drain = asyncio.create_task(sup.drain_to(sup_end))
+        try:
+            output = await tx_end.recv()
+            self.assertEqual(output["frame"]["type"], "output")
+
+            # A browser input ACK can be emitted while this output waits for its
+            # server durable ACK. The later control must not invalidate the
+            # already selected in-flight delivery.
+            sup.emit({"type": "input_ack", "session_id": "s",
+                      "client_input_id": "11111111-1111-4111-8111-111111111111",
+                      "status": "delivered"})
+            await sup.handle_control({
+                "type": "ipc_delivery_ack",
+                "delivery_id": output["delivery_id"],
+            })
+
+            control = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+            self.assertEqual(control["frame"]["type"], "input_ack")
+            self.assertEqual(len(sup._spool.pending_records()), 0)
+            await sup.handle_control({
+                "type": "ipc_delivery_ack",
+                "delivery_id": control["delivery_id"],
+            })
+        finally:
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+    async def test_fence_control_purges_forked_instance_and_unblocks(self):
+        sup = SessionSupervisor()
+        # Two output frames for a forked pty_instance sit in the spool.
+        sup.emit({"type": "output", "session_id": "s",
+                  "pty_instance_id": "old", "data": "poison-1"})
+        sup.emit({"type": "output", "session_id": "s",
+                  "pty_instance_id": "old", "data": "poison-2"})
+        # A newer instance has fresh output that must be able to drain.
+        sup.emit({"type": "output", "session_id": "s",
+                  "pty_instance_id": "new", "data": "fresh"})
+        sup_end, tx_end = LoopbackChannel.pair()
+        sup.attach(sup_end)
+        drain = asyncio.create_task(sup.drain_to(sup_end))
+        try:
+            first = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+            self.assertEqual(first["frame"]["pty_instance_id"], "old")
+
+            # Server fences the forked instance instead of erroring.
+            await sup.handle_control({
+                "type": "fence", "session_id": "s", "pty_instance_id": "old",
+            })
+
+            # After the fence the poison tail is gone and the newer instance's
+            # output becomes the next frame delivered.
+            nxt = await asyncio.wait_for(tx_end.recv(), timeout=1.0)
+            self.assertEqual(nxt["frame"]["pty_instance_id"], "new")
+            self.assertEqual(nxt["frame"]["data"], "fresh")
+            pending = sup._spool.records()
+            self.assertTrue(all(r.pty_instance_id != "old" for r in pending))
+        finally:
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
     async def test_close_control_kills_only_that_pty(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
         await sup.handle_control({"type": "open", "agent_id": "a", "session_id": "s1"})

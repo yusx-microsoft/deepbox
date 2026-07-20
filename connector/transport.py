@@ -67,7 +67,7 @@ class TransportSession:
             if frame_type == "heartbeat_ack":
                 self.last_heartbeat_ack = frame.get("ts")
                 continue
-            if frame_type in {"ack", "resend", "error"}:
+            if frame_type in {"ack", "resend", "error", "fence"}:
                 await self._server_events.put(frame)
                 continue
             await self.channel.send(frame)
@@ -112,6 +112,27 @@ class TransportSession:
                         f"expected {expected}, in-flight {identity[2]}")
                 if event_type == "error":
                     raise ProtocolError(str(event.get("detail") or "server rejected output"))
+                if event_type == "fence":
+                    # The server has ruled this pty_instance's durable stream
+                    # forked (CONFLICT / stale-tail). Raising here would wedge the
+                    # single-inflight send loop: reconnect -> resend the same
+                    # poison frame -> fence -> ... forever, and no newer output
+                    # (which fills the resumed terminal) could ever be sent.
+                    # Instead instruct the supervisor to purge this instance's
+                    # spool tail, then return so the delivery loop advances.
+                    same_stream = (
+                        str(event.get("session_id", "")) == identity[0]
+                        and str(event.get("pty_instance_id", "")) == identity[1]
+                    )
+                    if same_stream:
+                        await self.channel.send({
+                            "type": "fence",
+                            "session_id": identity[0],
+                            "pty_instance_id": identity[1],
+                        })
+                        return
+                    # A fence for some other stream cannot release this row.
+                    continue
         finally:
             self._inflight_identity = None
 

@@ -242,6 +242,16 @@ class SpoolBase:
     def record_input_once(self, client_input_id: str) -> bool:  # pragma: no cover
         raise NotImplementedError
 
+    def fence(self, session_id: str, pty_instance_id: str) -> int:  # pragma: no cover
+        """Drop every pending output row for a forked pty_instance.
+
+        The server issues a ``fence`` when a pty_instance's durable stream has
+        diverged (e.g. a restarted PTY re-sending its old spool tail). Purging
+        those rows unblocks the single-inflight send loop so newer instances can
+        drain. Returns the number of rows removed.
+        """
+        raise NotImplementedError
+
     def close(self) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
 
@@ -364,6 +374,14 @@ class InMemorySpool(SpoolBase):
             return False
         self._inputs[cid] = time.time()
         return True
+
+    def fence(self, session_id: str, pty_instance_id: str) -> int:
+        key = (str(session_id), str(pty_instance_id))
+        keep = [r for r in self._rows if (r["sid"], r["pid"]) != key]
+        removed = len(self._rows) - len(keep)
+        self._rows = keep
+        self._last_acked.pop(key, None)
+        return removed
 
     def prune_input_receipts(self, max_age: float | None = None,
                              max_entries: int | None = None) -> int:
@@ -649,6 +667,26 @@ class DiskSpool(SpoolBase):
             conn.execute("ROLLBACK")
             raise
         return True
+
+    def fence(self, session_id: str, pty_instance_id: str) -> int:
+        sid, pid = str(session_id), str(pty_instance_id)
+        conn = self._require()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "DELETE FROM outbox WHERE session_id=? AND pty_instance_id=?",
+                (sid, pid),
+            )
+            removed = cur.rowcount
+            conn.execute(
+                "DELETE FROM ack_state WHERE session_id=? AND pty_instance_id=?",
+                (sid, pid),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return removed
 
     def prune_input_receipts(self, max_age: float | None = None,
                              max_entries: int | None = None) -> int:

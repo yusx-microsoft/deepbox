@@ -85,6 +85,41 @@ class PersistResult:
         return self.outcome in (NEW, DUPLICATE)
 
 
+def output_ack_response(result: "PersistResult", *, session_id, pty_instance_id,
+                        seq) -> dict:
+    """Map a :class:`PersistResult` to the wire frame the server sends back to
+    the connector on the durable-output channel.
+
+    This is the single source of truth for the connector-facing reply and is
+    pure (no I/O) so it can be unit-tested exhaustively:
+
+    - NEW / DUPLICATE -> ``ack`` (the durable-commit boundary).
+    - GAP             -> ``resend`` at the expected seq.
+    - CONFLICT        -> ``fence``: the pty_instance's durable stream has forked
+      (connector restarted its PTY but kept re-sending the old spool tail). A
+      terminal error here wedges the connector's single-inflight send loop
+      forever (reconnect -> resend poison frame -> CONFLICT -> ...), so we emit
+      a recoverable fence telling it to abandon this pty_instance's spool tail.
+    - INVALID with "below persisted frontier" -> ``fence`` (stale superseded
+      tail for a forked pty_instance); any other INVALID stays a terminal
+      ``error`` (genuinely malformed / not owned).
+    """
+    base = {"session_id": session_id, "pty_instance_id": pty_instance_id}
+    if result.outcome in (NEW, DUPLICATE):
+        return {"type": "ack", **base, "seq": seq}
+    if result.outcome == GAP:
+        return {"type": "resend", **base, "expected_seq": result.expected_seq}
+    if result.outcome == CONFLICT:
+        return {"type": "fence", **base, "seq": seq,
+                "message": "pty_instance stream forked; abandon this spool tail"}
+    reason = result.reason or "invalid output frame"
+    if "below persisted frontier" in reason:
+        return {"type": "fence", **base, "seq": seq,
+                "message": "stale spool tail below frontier; "
+                           "abandon this pty_instance"}
+    return {"type": "error", "session_id": session_id, "message": reason}
+
+
 def _payload_hash(kind: str, data: str) -> str:
     h = hashlib.sha256()
     h.update((kind or "o").encode("utf-8"))

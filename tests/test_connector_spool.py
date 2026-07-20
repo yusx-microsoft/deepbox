@@ -206,6 +206,34 @@ class AckSemanticsTests(unittest.TestCase):
         self.assertEqual(s2.last_acked("A", "p1"), 1)
         s2.close()
 
+    def test_fence_purges_only_target_instance(self):
+        for s in self._both():
+            s.enqueue_output(_frame("A", "old"))
+            s.enqueue_output(_frame("A", "old"))
+            s.enqueue_output(_frame("A", "new"))
+            s.enqueue_output(_frame("B", "old"))  # same pty id, different session
+            removed = s.fence("A", "old")
+            self.assertEqual(removed, 2)
+            remaining = [(r.session_id, r.pty_instance_id) for r in s.records()]
+            self.assertNotIn(("A", "old"), remaining)
+            self.assertIn(("A", "new"), remaining)
+            self.assertIn(("B", "old"), remaining)
+            # After fencing, the target instance's ack cursor resets so a fresh
+            # instance can re-use seq numbering without a stale-frontier reject.
+            self.assertEqual(s.last_acked("A", "old"), 0)
+            s.close()
+            if isinstance(s, DiskSpool):
+                os.remove(self.path)
+
+    def test_fence_of_absent_instance_is_noop(self):
+        for s in self._both():
+            s.enqueue_output(_frame("A", "p1"))
+            self.assertEqual(s.fence("A", "nope"), 0)
+            self.assertEqual(len(s.records()), 1)
+            s.close()
+            if isinstance(s, DiskSpool):
+                os.remove(self.path)
+
 
 class StatusTests(unittest.TestCase):
     def setUp(self):

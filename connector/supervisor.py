@@ -162,6 +162,21 @@ class SessionSupervisor:
         if t == "ipc_delivery_ack":
             self._apply_ack(frame.get("delivery_id"))
             return
+        if t == "fence":
+            # The server ruled this pty_instance's durable output stream forked.
+            # Purge its spool tail so the single-inflight delivery loop stops
+            # retrying poison rows, and release any inflight delivery that was
+            # waiting on one of the purged rows so newer output can drain.
+            sid_f = frame.get("session_id")
+            pid_f = frame.get("pty_instance_id")
+            if sid_f and pid_f:
+                self._spool.fence(sid_f, pid_f)
+                # The fence only arrives while this instance's output is the
+                # inflight row, so releasing the delivery gate is safe.
+                self._inflight_delivery_id = None
+                self._delivery_ack.set()
+                self.pending_event.set()
+            return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
         if t == "open":
@@ -207,8 +222,8 @@ class SessionSupervisor:
             self._controls.popleft()
             self._delivery_ack.set()
             return
-        if self._controls:
-            return
+        # Controls may arrive while a durable output is already in flight. They
+        # are next-in-line, not a reason to reject the exact output ACK.
         oldest = self._spool.oldest_seq()
         if oldest is None or delivery_id != oldest:
             return

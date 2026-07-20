@@ -7,7 +7,7 @@ import uuid
 from server.app import models
 from server.app.recording import (
     RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID,
-    ErasureResult,
+    ErasureResult, PersistResult, output_ack_response,
 )
 from server.app.live import LiveRegistry
 
@@ -552,6 +552,46 @@ class SecureEraseTests(RecordingBaseCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0].data, "keepme")
         self.assertIsNone(kept[0].redacted_at)
+
+
+class OutputAckResponseTests(unittest.TestCase):
+    def _r(self, outcome, **kw):
+        return output_ack_response(
+            PersistResult(outcome=outcome, **kw),
+            session_id="s", pty_instance_id="p", seq=42)
+
+    def test_new_and_duplicate_ack(self):
+        for oc in (NEW, DUPLICATE):
+            r = self._r(oc)
+            self.assertEqual(r["type"], "ack")
+            self.assertEqual(r["seq"], 42)
+            self.assertEqual(r["pty_instance_id"], "p")
+
+    def test_gap_resend_carries_expected(self):
+        r = self._r(GAP, expected_seq=7)
+        self.assertEqual(r["type"], "resend")
+        self.assertEqual(r["expected_seq"], 7)
+
+    def test_conflict_becomes_recoverable_fence(self):
+        r = self._r(CONFLICT, reason="payload mismatch")
+        self.assertEqual(r["type"], "fence")
+        self.assertEqual(r["session_id"], "s")
+        self.assertEqual(r["pty_instance_id"], "p")
+        self.assertEqual(r["seq"], 42)
+
+    def test_invalid_below_frontier_is_fence(self):
+        r = self._r(INVALID, reason="seq 5 below persisted frontier 40")
+        self.assertEqual(r["type"], "fence")
+
+    def test_invalid_other_stays_terminal_error(self):
+        r = self._r(INVALID, reason="not owned by this devbox")
+        self.assertEqual(r["type"], "error")
+        self.assertEqual(r["message"], "not owned by this devbox")
+
+    def test_invalid_no_reason_defaults(self):
+        r = self._r(INVALID)
+        self.assertEqual(r["type"], "error")
+        self.assertEqual(r["message"], "invalid output frame")
 
 
 if __name__ == "__main__":

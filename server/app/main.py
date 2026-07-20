@@ -33,7 +33,7 @@ from .util import (
 from .hub import hub, DevboxConn, HumanConn
 from .config import settings
 from .live import live_registry
-from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID
+from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID, output_ack_response
 from .logging import configure_logging, log_event
 from .capacity import collect_capacity, transition_event
 from .audit import audit_event
@@ -1152,27 +1152,33 @@ async def ws_devbox(ws: WebSocket):
                     elif result.outcome == DUPLICATE:
                         # Already durable and identical: re-ACK, do NOT re-feed
                         # or re-broadcast.
-                        await ws.send_json({
-                            "type": "ack", "session_id": sid,
-                            "pty_instance_id": frame.get("pty_instance_id"),
-                            "seq": frame.get("seq")})
+                        await ws.send_json(output_ack_response(
+                            result, session_id=sid,
+                            pty_instance_id=frame.get("pty_instance_id"),
+                            seq=frame.get("seq")))
                     elif result.outcome == GAP:
-                        await ws.send_json({
-                            "type": "resend", "session_id": sid,
-                            "pty_instance_id": frame.get("pty_instance_id"),
-                            "expected_seq": result.expected_seq})
+                        await ws.send_json(output_ack_response(
+                            result, session_id=sid,
+                            pty_instance_id=frame.get("pty_instance_id"),
+                            seq=frame.get("seq")))
                     elif result.outcome == CONFLICT:
+                        # Forked pty_instance stream: recover via fence rather
+                        # than wedging the connector's single-inflight loop.
                         log_event(logger, "recording.conflict", devbox_id=d.id,
                                   session_id=sid, seq=frame.get("seq"))
-                        await ws.send_json({
-                            "type": "error", "session_id": sid,
-                            "message": "conflicting duplicate frame"})
+                        await ws.send_json(output_ack_response(
+                            result, session_id=sid,
+                            pty_instance_id=frame.get("pty_instance_id"),
+                            seq=frame.get("seq")))
                     else:  # INVALID / ownership
                         log_event(logger, "recording.invalid", devbox_id=d.id,
                                   session_id=sid, reason=result.reason)
-                        await ws.send_json({
-                            "type": "error", "session_id": sid,
-                            "message": result.reason or "invalid output frame"})
+                        # "seq below persisted frontier" -> recoverable fence;
+                        # any other INVALID stays a terminal error.
+                        await ws.send_json(output_ack_response(
+                            result, session_id=sid,
+                            pty_instance_id=frame.get("pty_instance_id"),
+                            seq=frame.get("seq")))
                 elif sid:
                     # Legacy (< v3) blind output path.
                     data = frame.get("data", "")

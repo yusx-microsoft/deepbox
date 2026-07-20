@@ -92,6 +92,38 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    async def test_fence_for_same_stream_purges_tail_and_releases(self):
+        supervisor, transport, _, task = await self._start_delivery()
+        await transport._server_events.put({
+            "type": "fence", "session_id": "s1",
+            "pty_instance_id": "p1", "seq": 1,
+        })
+        # The transport instructs the supervisor to purge the forked tail and
+        # releases the delivery loop WITHOUT raising a ProtocolError (which would
+        # wedge the single-inflight sender into a poison-frame reconnect loop).
+        msg = await asyncio.wait_for(supervisor.recv(), timeout=0.2)
+        self.assertEqual(msg, {
+            "type": "fence", "session_id": "s1", "pty_instance_id": "p1",
+        })
+        # The delivery loop was released (no ProtocolError) and is now idle
+        # waiting for the next envelope rather than dead.
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def test_fence_for_other_stream_does_not_release(self):
+        supervisor, transport, _, task = await self._start_delivery()
+        await transport._server_events.put({
+            "type": "fence", "session_id": "s1",
+            "pty_instance_id": "other", "seq": 1,
+        })
+        # A fence targeting a different pty_instance cannot release this row.
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(supervisor.recv(), timeout=0.02)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
     async def test_resume_mismatch_fails_closed_without_local_ack(self):
         supervisor, transport, _, task = await self._start_delivery()
         await transport._server_events.put({
