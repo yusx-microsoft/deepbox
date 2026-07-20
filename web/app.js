@@ -19,6 +19,7 @@ let nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock;
 let deriveCollaborationState, canSendInput;
 let collabState = null;  // normalized collaboration view model for curSession
 let keyboardRequester = null;
+let termInputBatcher = null;
 let ui = null;           // DeepboxUI pure helpers (dynamically loaded)
 
 // Cached dynamic-module loaders (same pattern as replay/collaboration).
@@ -485,9 +486,9 @@ function setupTerm(){
   term.open(host);
   fit.fit();
   window.onresize = ()=>{ try{fit.fit(); sendResize();}catch(e){} };
-  term.onData(d => { if(!replayMode && termWS && termWS.readyState===1 && curSession
+  term.onData(d => { if(!replayMode && termInputBatcher && curSession
     && canSendInput && canSendInput(collabState))
-    termWS.send(JSON.stringify({type:'input',session_id:curSession,data:d})); });
+    termInputBatcher.push(d); });
 }
 
 function resetTerminal(){
@@ -517,7 +518,8 @@ async function openAgent(agentId, name){
   const replaybar = document.getElementById('replaybar');
   if(replaybar) replaybar.remove();
   if(wasReplayOrHistory || !term || !document.getElementById('term')) resetTerminal();
-  // leaving previous session? detach it (do NOT kill its PTY)
+  // leaving previous session? flush input, then detach it (do NOT kill its PTY)
+  if(termInputBatcher) termInputBatcher.flush();
   if(termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'detach',session_id:curSession}));
   document.getElementById('termhead').innerHTML =
@@ -548,9 +550,16 @@ function setStat(txt, state){
 }
 
 function connectTermWS(){
+  if(termInputBatcher){ termInputBatcher.discard(); termInputBatcher = null; }
   if(termWS){ try{ wantOpen && (termWS.onclose=null); termWS.close(); }catch(e){} }
   const proto = location.protocol==='https:'?'wss':'ws';
   termWS = new WebSocket(`${proto}://${location.host}/ws/term`);
+  const inputWS = termWS;
+  const inputSession = curSession;
+  termInputBatcher = ui.createTerminalInputBatcher(data => {
+    if(inputWS.readyState===1 && inputSession===curSession)
+      inputWS.send(JSON.stringify({type:'input',session_id:inputSession,data:data}));
+  });
   termWS.onopen = ()=>{
     reconnectDelay = 500;
     setStat('live', 'online');
@@ -580,7 +589,10 @@ function connectTermWS(){
         term.write(`\r\n[error] ${f.message}\r\n`); break;
       case 'collaboration':
         collabState = deriveCollaborationState(f, me ? {id: me.id, username: me.username} : null);
-        if(!collabState.isHolder) keyboardRequester = null;
+        if(!collabState.isHolder){
+          keyboardRequester = null;
+          if(termInputBatcher) termInputBatcher.discard();
+        }
         renderCollab();
         break;
       case 'keyboard_request':
@@ -592,6 +604,7 @@ function connectTermWS(){
     }
   };
   termWS.onclose = ()=>{
+    if(termInputBatcher){ termInputBatcher.discard(); termInputBatcher = null; }
     if(!wantOpen) return;
     setStat('reconnecting\u2026','busy');
     reconnectTimer = setTimeout(connectTermWS, reconnectDelay);
@@ -605,6 +618,7 @@ function requestKeyboard(){
     termWS.send(JSON.stringify({type:'keyboard_acquire',session_id:curSession}));
 }
 function releaseKeyboard(){
+  if(termInputBatcher) termInputBatcher.flush();
   if(termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'keyboard_release',session_id:curSession}));
 }

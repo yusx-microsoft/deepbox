@@ -46,6 +46,44 @@
     ].join('\n');
   }
 
+  // ---- terminal input ----------------------------------------------------
+
+  // Coalesce xterm's per-keystroke onData events before crossing the WAN. The
+  // idle timer keeps taps responsive; the max timer bounds latency while a user
+  // is typing continuously. Timers are injectable so the transport policy is
+  // testable without a browser.
+  function createTerminalInputBatcher(send, options){
+    const opts = options || {};
+    const idleMs = opts.idleMs == null ? 24 : opts.idleMs;
+    const maxMs = opts.maxMs == null ? 80 : opts.maxMs;
+    const schedule = opts.setTimeout || setTimeout;
+    const cancelTimer = opts.clearTimeout || clearTimeout;
+    let buffer = '', idleTimer = null, maxTimer = null;
+
+    function clearTimers(){
+      if(idleTimer !== null) cancelTimer(idleTimer);
+      if(maxTimer !== null) cancelTimer(maxTimer);
+      idleTimer = null; maxTimer = null;
+    }
+    function flush(){
+      if(!buffer){ clearTimers(); return; }
+      const payload = buffer;
+      buffer = '';
+      clearTimers();
+      send(payload);
+    }
+    function push(data){
+      const chunk = String(data == null ? '' : data);
+      if(!chunk) return;
+      buffer += chunk;
+      if(idleTimer !== null) cancelTimer(idleTimer);
+      idleTimer = schedule(flush, idleMs);
+      if(maxTimer === null) maxTimer = schedule(flush, maxMs);
+    }
+    function discard(){ buffer = ''; clearTimers(); }
+    return {push: push, flush: flush, discard: discard};
+  }
+
   // ---- status helpers ----------------------------------------------------
 
   // Devbox connection state -> {state, label}. Text is never colour-only.
@@ -221,6 +259,7 @@
     initials: initials,
     runtimeLabel: runtimeLabel,
     windowsConnectorCommand: windowsConnectorCommand,
+    createTerminalInputBatcher: createTerminalInputBatcher,
     devboxStatus: devboxStatus,
     agentStatus: agentStatus,
     fleetSummary: fleetSummary,

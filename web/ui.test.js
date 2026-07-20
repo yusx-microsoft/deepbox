@@ -110,3 +110,45 @@ test('moveSelection wraps in both directions', () => {
   assert.equal(ui.moveSelection(0, -1, 3), 2);
   assert.equal(ui.moveSelection(0, 1, 0), 0);
 });
+
+
+test('terminal input batcher coalesces chunks on idle timeout', () => {
+  let nextId = 1;
+  const timers = new Map();
+  const sent = [];
+  const batcher = ui.createTerminalInputBatcher(sent.push.bind(sent), {
+    idleMs: 24,
+    maxMs: 80,
+    setTimeout(fn, ms){ const id = nextId++; timers.set(id, {fn, ms}); return id; },
+    clearTimeout(id){ timers.delete(id); },
+  });
+
+  batcher.push('hel');
+  batcher.push('lo');
+  assert.deepEqual(sent, []);
+  const idle = [...timers.values()].find(timer => timer.ms === 24);
+  idle.fn();
+  assert.deepEqual(sent, ['hello']);
+  assert.equal(timers.size, 0);
+});
+
+test('terminal input batcher bounds continuous typing and can discard', () => {
+  let nextId = 1;
+  const timers = new Map();
+  const sent = [];
+  const batcher = ui.createTerminalInputBatcher(sent.push.bind(sent), {
+    setTimeout(fn, ms){ const id = nextId++; timers.set(id, {fn, ms}); return id; },
+    clearTimeout(id){ timers.delete(id); },
+  });
+
+  batcher.push('a');
+  batcher.push('b');
+  const maximum = [...timers.values()].find(timer => timer.ms === 80);
+  maximum.fn();
+  assert.deepEqual(sent, ['ab']);
+
+  batcher.push('secret');
+  batcher.discard();
+  assert.deepEqual(sent, ['ab']);
+  assert.equal(timers.size, 0);
+});

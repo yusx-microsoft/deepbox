@@ -125,3 +125,35 @@ def test_only_owner_can_promote_an_owner_and_last_owner_cannot_leave():
     assert admin.patch(f"/api/workspaces/{workspace_id}/members/{user_id}", json={
         "role": "viewer"}).status_code == 409
     assert admin.delete(f"/api/workspaces/{workspace_id}/members/{user_id}").status_code == 409
+
+
+def test_terminal_input_does_not_renew_keyboard_lease_per_frame():
+    client, main = build_app()
+    register(client, "owner")
+    devbox_id = client.post("/api/devboxes", json={"name": "shared"}).json()["devbox"]["id"]
+    agent_id = client.post(f"/api/devboxes/{devbox_id}/agents", json={
+        "handle": "shell", "display_name": "Shell", "runtime": "mock"}).json()["id"]
+    session_id = client.post(f"/api/agents/{agent_id}/sessions").json()["id"]
+
+    with patch.object(main, "renew_keyboard_lease", wraps=main.renew_keyboard_lease) as renew:
+        with client.websocket_connect("/ws/term", headers={"origin": "http://testserver"}) as ws:
+            ws.send_json({"type": "attach", "session_id": session_id, "cols": 80, "rows": 24})
+            attached = [ws.receive_json() for _ in range(3)]
+            assert any(frame["type"] == "collaboration" for frame in attached)
+            assert renew.call_count == 0
+
+            # Invalid IDs fail after lease authorization, giving the test a
+            # synchronous response without requiring an online connector.
+            ws.send_json({
+                "type": "input", "session_id": session_id, "data": "x",
+                "client_input_id": "not-a-uuid",
+            })
+            rejected = None
+            for _ in range(3):
+                frame = ws.receive_json()
+                if frame["type"] == "error":
+                    rejected = frame
+                    break
+            assert rejected is not None
+            assert rejected["message"] == "invalid client_input_id"
+            assert renew.call_count == 0

@@ -346,6 +346,9 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
 - 单进程内存 Hub/LiveRegistry 不支持多实例横向扩展。
 - Cut 8 已支持 Workspace、四级角色、多 Viewer 与单 holder keyboard lease；当前 Hub/lease 仍是单 Server
   实例语义，跨实例路由与共享 lease backend 属于 Cut 9。
+- 浏览器把 xterm 输入按 24 ms 空闲窗口、80 ms 最大等待合并后再发往 WSS；Server 每帧仍会读取并校验
+  60 秒 lease，但不再在输入热路径续租和提交 SQLite。持有者由独立的 20 秒 heartbeat 续租，失效或他人
+  持有的 lease 仍会在任何输入转发前 fail closed。
 - 应用本身不终止 TLS；Private Alpha 由 Tailscale Serve 提供 Tailnet 内 HTTPS/WSS，不能使用
   Funnel 或直接暴露 Uvicorn 到公网。
 

@@ -1396,8 +1396,9 @@ async def ws_term(ws: WebSocket):
                         if sess:
                             await _broadcast_collaboration(s, sess)
                         continue
-                    renew_keyboard_lease(s, sid, uid)
-                    s.commit()
+                    # Avoid a SQLite write/commit for every keystroke. The browser
+                    # renews independently every 20 seconds; the read above still
+                    # rejects expired or foreign leases before forwarding input.
                     raw_input_id = frame.get("client_input_id") or str(uuid4())
                     try:
                         client_input_id = str(UUID(str(raw_input_id)))
