@@ -312,8 +312,7 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
   因 `can't compare offset-naive and offset-aware datetimes` 异常断开并持续 reconnect。
   只有有效 holder 可发送 `input`/`resize`/`terminate`；每次输入自动续租，浏览器持有期间每 20 秒续租，
   holder 断开最后一个该用户连接时释放。Viewer 的控制 frame 返回 `read_only`。
-- `web/collaboration.js` 是可独立测试的权限/租约 UI 状态 helper；`styles.css` 由 `app.js` 动态加载，
-  无需更改 `index.html`。权限边界、共享资源、WebSocket 只读拒绝、租约竞争/移交和迁移均有回归测试。
+- `web/collaboration.js` 是可独立测试的权限/租约 UI 状态 helper：`deriveCollaborationState()` 归一化 keyboard state，`canSendInput()` 只让当前 holder 发送输入，`collabHeaderView(state, requester?)` 是纯视图模型——**`state` 为 null（attach 尚未完成/collaboration frame 未到）时返回显式 `connecting…` pending 徽标而非空徽标**，因此终端不会出现「聚焦却神秘不可输入」的黑屏；`app.js::renderCollab()` 据此在 attach 时先渲染 pending 态。`styles.css` 由 `app.js` 动态加载，无需更改 `index.html`。权限边界、共享资源、WebSocket 只读拒绝、租约竞争/移交、pending 态和迁移均有回归测试。
 
 ---
 

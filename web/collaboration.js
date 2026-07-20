@@ -68,5 +68,35 @@
     return !!(state && state.isHolder === true);
   }
 
-  return {deriveCollaborationState, canSendInput, OPERATOR_ROLES};
+  // collabHeaderView(state, requester?)
+  //   Pure view model for the terminal header keyboard badge. A null/absent
+  //   state means the collaboration frame has not arrived yet (attach in
+  //   flight) — we surface an explicit 'pending' label instead of a blank badge
+  //   with silently disabled stdin, so the terminal is never mysteriously
+  //   untypable. requester is the optional {username} currently asking for the
+  //   keyboard when the local user holds it.
+  function collabHeaderView(state, requester){
+    if(!state) return {cls: 'collab-pending', label: 'connecting\u2026',
+                       button: null, canType: false};
+    if(state.isViewer) return {cls: 'collab-viewer', label: 'read-only',
+                               button: null, canType: false};
+    if(state.isHolder){
+      return requester
+        ? {cls: 'collab-holder',
+           label: requester.username + ' requests the keyboard',
+           button: 'handoff', canType: true}
+        : {cls: 'collab-holder', label: 'you have the keyboard',
+           button: 'release', canType: true};
+    }
+    if(state.heldByOther){
+      return {cls: 'collab-busy',
+              label: (state.holderUsername || 'someone') + ' is typing',
+              button: state.canRequest ? 'request' : null, canType: false};
+    }
+    return {cls: 'collab-free', label: 'keyboard free',
+            button: state.canRequest ? 'request' : null, canType: false};
+  }
+
+  return {deriveCollaborationState, canSendInput, collabHeaderView,
+          OPERATOR_ROLES};
 });

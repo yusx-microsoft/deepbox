@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {deriveCollaborationState, canSendInput} = require('./collaboration.js');
+const {deriveCollaborationState, canSendInput, collabHeaderView} = require('./collaboration.js');
 
 function frame(role, keyboard, sessionId){
   return {type:'collaboration', session_id: sessionId || 's1', role, keyboard: keyboard || {}};
@@ -85,4 +85,41 @@ test('empty / missing frame degrades to safe read-only defaults', () => {
   assert.equal(state.canRequest, false);
   assert.equal(canSendInput(state), false);
   assert.equal(canSendInput(null), false);
+});
+
+test('collabHeaderView(null) shows explicit pending state, not a blank untypable badge', () => {
+  const v = collabHeaderView(null);
+  assert.equal(v.cls, 'collab-pending');
+  assert.equal(v.label, 'connecting\u2026');
+  assert.equal(v.canType, false);
+  assert.equal(v.button, null);
+});
+
+test('collabHeaderView holder shows release, or handoff when a requester waits', () => {
+  const held = deriveCollaborationState(
+    frame('operator', {holder_user_id: 9, holder_username: 'me', is_holder: true}),
+    {id: 9, username: 'me'});
+  assert.deepEqual(collabHeaderView(held),
+    {cls: 'collab-holder', label: 'you have the keyboard', button: 'release', canType: true});
+  assert.equal(collabHeaderView(held, {username: 'ann'}).button, 'handoff');
+  assert.match(collabHeaderView(held, {username: 'ann'}).label, /ann requests/);
+});
+
+test('collabHeaderView reflects busy/free/viewer and never lets non-holders type', () => {
+  const busy = deriveCollaborationState(
+    frame('operator', {holder_user_id: 5, holder_username: 'ann', is_holder: false, can_request: true}),
+    {id: 9, username: 'me'});
+  assert.equal(collabHeaderView(busy).cls, 'collab-busy');
+  assert.equal(collabHeaderView(busy).button, 'request');
+  assert.equal(collabHeaderView(busy).canType, false);
+
+  const free = deriveCollaborationState(
+    frame('operator', {can_request: true}), {id: 9, username: 'me'});
+  assert.equal(collabHeaderView(free).cls, 'collab-free');
+  assert.equal(collabHeaderView(free).canType, false);
+
+  const viewer = deriveCollaborationState(frame('viewer', {}), {id: 9, username: 'me'});
+  assert.equal(collabHeaderView(viewer).cls, 'collab-viewer');
+  assert.equal(collabHeaderView(viewer).button, null);
+  assert.equal(collabHeaderView(viewer).canType, false);
 });

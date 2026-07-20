@@ -668,7 +668,16 @@ function renderCollab(){
   if(!el) return;
   const s = collabState;
   if(term) term.options.disableStdin = !(s && s.isHolder);
-  if(!s){ el.innerHTML = ''; return; }
+  // No collaboration frame yet (attach in flight, or the connector hasn't
+  // reported keyboard ownership). Never leave a blank label with silently
+  // disabled stdin — show an explicit pending state so the terminal is never
+  // mysteriously untypable.
+  if(!s){
+    el.className = 'collab collab-pending';
+    el.innerHTML = '<span class="collab-dot"></span>' +
+      '<span class="collab-label">connecting\u2026</span>';
+    return;
+  }
   let label, cls, btn = '';
   if(s.isViewer){
     label = 'read-only'; cls = 'collab-viewer';
