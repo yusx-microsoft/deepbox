@@ -121,8 +121,24 @@ class PtySession:
             code = 0
         await self.on_exit(code)
 
-    def write(self, data: str):
+    def is_alive(self) -> bool:
+        """Return whether the child behind this PTY is still running."""
         if not self._alive:
+            return False
+        try:
+            if IS_WIN:
+                alive = bool(self._pty.isalive())
+            else:
+                os.kill(self._pid, 0)
+                alive = True
+        except (OSError, ProcessLookupError):
+            alive = False
+        if not alive:
+            self._alive = False
+        return alive
+
+    def write(self, data: str):
+        if not self.is_alive():
             return
         if IS_WIN:
             self._pty.write(data)

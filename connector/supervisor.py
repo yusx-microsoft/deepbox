@@ -228,11 +228,17 @@ class SessionSupervisor:
     async def open_pty(self, agent_id: str, session_id: str,
                        cols: int = 120, rows: int = 30) -> None:
         key = (agent_id, session_id)
-        if key in self.ptys:
+        existing = self.ptys.get(key)
+        if existing and existing.is_alive():
             self.emit({"type": "ready", "agent_id": agent_id,
                        "session_id": session_id,
                        "pty_instance_id": self.pty_instances[key]})
             return
+        if existing:
+            # A child can be killed outside the supervisor while the platform PTY
+            # reader is still blocked. Do not advertise that stale handle as ready.
+            self.ptys.pop(key, None)
+            self.pty_instances.pop(key, None)
         pty_instance_id = str(uuid4())
         info = self.agents.get(agent_id, {})
         cmd = resolve_cmd(info.get("runtime", "mock"), info.get("launch_cmd"))
@@ -244,6 +250,10 @@ class SessionSupervisor:
                        "data": data})
 
         async def on_exit(code: int):
+            # A stale reader may finish after open_pty has replaced its dead PTY.
+            # Only the currently registered instance may close the server session.
+            if self.ptys.get(key) is not p:
+                return
             self.ptys.pop(key, None)
             self.emit({"type": "exit", "agent_id": agent_id,
                        "session_id": session_id,

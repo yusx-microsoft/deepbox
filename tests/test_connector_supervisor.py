@@ -25,6 +25,7 @@ class FakePty:
         self.on_output = on_output
         self.on_exit = on_exit
         self.killed = False
+        self.alive = True
         self.written = []
         FakePty.instances.append(self)
 
@@ -37,8 +38,12 @@ class FakePty:
     def resize(self, cols, rows):
         self.size = (cols, rows)
 
+    def is_alive(self):
+        return self.alive
+
     def kill(self):
         self.killed = True
+        self.alive = False
 
 
 class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
@@ -160,6 +165,30 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         outputs = [f for f in sup.pending if f.get("type") == "output"]
         self.assertEqual([f["seq"] for f in outputs], [1, 2])
         self.assertTrue(all(f["pty_instance_id"] == instance_id for f in outputs))
+
+    async def test_open_replaces_dead_pty_and_ignores_late_stale_exit(self):
+        sup = SessionSupervisor({"a": {"runtime": "mock"}})
+        open_frame = {"type": "open", "agent_id": "a", "session_id": "s"}
+        await sup.handle_control(open_frame)
+        stale = FakePty.instances[0]
+        stale_instance_id = sup.pty_instances[("a", "s")]
+        stale.alive = False
+
+        await sup.handle_control(open_frame)
+        current = FakePty.instances[1]
+        current_instance_id = sup.pty_instances[("a", "s")]
+        self.assertIs(sup.ptys[("a", "s")], current)
+        self.assertNotEqual(current_instance_id, stale_instance_id)
+
+        await stale.on_exit(9)
+        self.assertIs(sup.ptys[("a", "s")], current)
+        self.assertEqual(sup.pty_instances[("a", "s")], current_instance_id)
+        stale_exits = [
+            f for f in sup.pending
+            if f.get("type") == "exit"
+            and f.get("pty_instance_id") == stale_instance_id
+        ]
+        self.assertEqual(stale_exits, [])
 
     async def test_status_reports_sessions_and_pending(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
