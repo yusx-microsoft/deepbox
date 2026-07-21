@@ -13,6 +13,7 @@ deepbox.db
 snapshot.txt
 data/
 *.log
+pip/
 
 # OS / editor
 .DS_Store
