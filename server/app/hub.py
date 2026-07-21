@@ -183,6 +183,32 @@ class Hub:
         await conn.ws.send_json(frame)
         return True
 
+    async def sync_agents(
+        self, devbox_id: str, agent_ids: set[str], directory: list[dict]
+    ) -> bool:
+        """Live-update an online devbox's agent set and push the new directory.
+
+        Lets agents added/removed in the cloud take effect on an already-
+        connected connector without a reconnect. Rewrites the ``agent_id ->
+        devbox_id`` routing map for this devbox and sends an ``agents`` control
+        frame the supervisor consumes to refresh its runtime lookup. Returns
+        False when the devbox is not currently connected (nothing to push;
+        the connector will pick up the directory on its next ``fetch_me``).
+        """
+        async with self._lock:
+            conn = self.devboxes.get(devbox_id)
+            if conn is None:
+                return False
+            # Drop stale routes for this devbox, then install the new set.
+            for aid in list(conn.agent_ids):
+                if self.agent_to_devbox.get(aid) == devbox_id:
+                    self.agent_to_devbox.pop(aid, None)
+            conn.agent_ids = set(agent_ids)
+            for aid in conn.agent_ids:
+                self.agent_to_devbox[aid] = devbox_id
+        await conn.ws.send_json({"type": "agents", "agents": directory})
+        return True
+
     async def to_session_humans(self, session_id: str, frame: dict):
         """Enqueue ordered fan-out without waiting on browser network I/O."""
         for conn in list(self.session_watchers.get(session_id, set())):

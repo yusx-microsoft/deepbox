@@ -251,6 +251,14 @@ class SessionSupervisor:
                 self._reconcile_inflight_after_fence()
                 self.pending_event.set()
             return
+        if t == "agents":
+            # Cloud-side agent directory changed (agent added/removed) while we
+            # stay connected. Refresh the runtime lookup so a freshly created
+            # agent can be opened immediately -- no connector restart needed.
+            directory = frame.get("agents")
+            if isinstance(directory, list):
+                self.agents = {a["id"]: a for a in directory if a.get("id")}
+            return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
         if t == "open":

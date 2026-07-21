@@ -89,6 +89,7 @@ session_watchers: session_id -> {HumanConn}   # 谁在看这个会话
 
 **(b) REST 运行时面**（connector,Bearer token 认证）
 `GET /api/me`：connector 启动时拉取"我这台 devbox 要跑哪些 agent"。
+`POST /api/devboxes/{id}/agents` / `DELETE /api/agents/{id}`：云端增删 agent 后调用 `_push_agent_directory()` → `Hub.sync_agents()`：若该 devbox **在线**，就地更新 `DevboxConn.agent_ids` + `agent_to_devbox` 路由并下推 `agents` 帧（**热注册**，无需重连即上线；离线则下次 `/api/me` 兜底）。
 `POST /api/devboxes/{id}/runtimes`：connector 上报本机探测到的可用 CLI。
 用 `devbox_from_bearer()` 校验：查 token 的 sha256 → 定位 Devbox。
 

@@ -158,6 +158,7 @@ Server → Devbox：
 - `input` `{agent_id, session_id, data}` —— 用户键入（转发到 PTY stdin）
 - `resize` `{agent_id, session_id, cols, rows}` —— 终端尺寸变化
 - `terminate` `{agent_id, session_id}` —— 用户显式结束会话时才杀 PTY
+- `agents` `{agents:[{id,handle,runtime,cwd,launch_cmd}]}` —— 云端新增/删除 agent 后**热推**最新目录；connector 刷新 `supervisor.agents`，无需重连即可 open 新 agent
 
 Devbox → Server：
 - `sessions` `{sessions:[{agent_id,session_id}]}` —— 重连时上报仍存活的 PTY

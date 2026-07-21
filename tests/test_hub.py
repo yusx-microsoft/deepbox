@@ -128,5 +128,63 @@ class HubUserDisconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stalled_ws.close_codes, [1011])
 
 
+class RecorderWebSocket:
+    def __init__(self):
+        self.sent = []
+        self.close_codes = []
+
+    async def send_json(self, frame):
+        self.sent.append(frame)
+
+    async def close(self, code=1000):
+        self.close_codes.append(code)
+
+
+class HubSyncAgentsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sync_agents_updates_routes_and_pushes_directory(self):
+        hub = Hub()
+        ws = RecorderWebSocket()
+        await hub.add_devbox(DevboxConn(
+            ws=ws, devbox_id="box", agent_ids={"a1"}
+        ))
+
+        directory = [
+            {"id": "a1", "handle": "one", "runtime": "mock",
+             "cwd": ".", "launch_cmd": None},
+            {"id": "a2", "handle": "two", "runtime": "claude-code",
+             "cwd": ".", "launch_cmd": None},
+        ]
+        pushed = await hub.sync_agents("box", {"a1", "a2"}, directory)
+
+        self.assertTrue(pushed)
+        self.assertTrue(hub.is_agent_online("a2"))
+        self.assertEqual(hub.agent_to_devbox["a2"], "box")
+        self.assertEqual(hub.devboxes["box"].agent_ids, {"a1", "a2"})
+        self.assertEqual(ws.sent, [{"type": "agents", "agents": directory}])
+
+    async def test_sync_agents_drops_removed_agent_routes(self):
+        hub = Hub()
+        ws = RecorderWebSocket()
+        await hub.add_devbox(DevboxConn(
+            ws=ws, devbox_id="box", agent_ids={"a1", "a2"}
+        ))
+
+        pushed = await hub.sync_agents(
+            "box", {"a1"},
+            [{"id": "a1", "handle": "one", "runtime": "mock",
+              "cwd": ".", "launch_cmd": None}],
+        )
+
+        self.assertTrue(pushed)
+        self.assertNotIn("a2", hub.agent_to_devbox)
+        self.assertFalse(hub.is_agent_online("a2"))
+        self.assertEqual(hub.devboxes["box"].agent_ids, {"a1"})
+
+    async def test_sync_agents_noop_when_devbox_offline(self):
+        hub = Hub()
+        pushed = await hub.sync_agents("ghost", {"a1"}, [])
+        self.assertFalse(pushed)
+
+
 if __name__ == "__main__":
     unittest.main()

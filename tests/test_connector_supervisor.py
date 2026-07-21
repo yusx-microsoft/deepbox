@@ -68,6 +68,25 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(durable_types, ["output"])
 
+    async def test_agents_frame_refreshes_directory_for_hot_added_agent(self):
+        # Agent 'b' does not exist at startup; a pushed 'agents' frame should
+        # make it resolvable so a subsequent open uses its runtime.
+        sup = SessionSupervisor({"a": {"runtime": "mock"}})
+        self.assertNotIn("b", sup.agents)
+        await sup.handle_control({"type": "agents", "agents": [
+            {"id": "a", "runtime": "mock"},
+            {"id": "b", "runtime": "mock", "launch_cmd": None},
+        ]})
+        self.assertIn("b", sup.agents)
+        self.assertEqual(sup.agents["b"]["runtime"], "mock")
+        await sup.handle_control({"type": "open", "agent_id": "b", "session_id": "s"})
+        self.assertIn(("b", "s"), sup.ptys)
+
+    async def test_agents_frame_ignores_malformed_payload(self):
+        sup = SessionSupervisor({"a": {"runtime": "mock"}})
+        await sup.handle_control({"type": "agents", "agents": "nonsense"})
+        self.assertEqual(set(sup.agents), {"a"})
+
     async def test_transport_restart_does_not_kill_pty(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
         sup_end, tx_end = LoopbackChannel.pair()

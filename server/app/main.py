@@ -665,6 +665,32 @@ def _agent_json(a: Agent) -> dict:
             "presence": "online" if hub.is_agent_online(a.id) else a.presence}
 
 
+def _connector_agent_dir(d: Devbox) -> list[dict]:
+    """Agent directory in the shape the connector's supervisor consumes.
+
+    Mirrors the ``/api/me`` payload (id/handle/runtime/cwd/launch_cmd) so a
+    live-pushed ``agents`` frame and a fresh ``fetch_me`` produce an identical
+    runtime lookup on the connector.
+    """
+    return [{"id": a.id, "handle": a.handle, "runtime": a.runtime,
+             "cwd": a.cwd, "launch_cmd": a.launch_cmd}
+            for a in d.agents]
+
+
+async def _push_agent_directory(s: OrmSession, devbox_id: str) -> None:
+    """Push the current agent set to an online connector (no-op if offline).
+
+    Called after an agent is created or deleted so the change takes effect
+    without the user restarting the connector. Reloads the devbox so
+    ``d.agents`` reflects the just-committed mutation.
+    """
+    d = s.get(Devbox, devbox_id)
+    if d is None:
+        return
+    directory = _connector_agent_dir(d)
+    await hub.sync_agents(devbox_id, {a.id for a in d.agents}, directory)
+
+
 def _ensure_personal_workspace(s: OrmSession, u: User) -> Workspace:
     membership = s.scalar(select(Membership).where(Membership.user_id == u.id)
                           .order_by(Membership.created_at))
@@ -845,6 +871,7 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
     )
     s.add(a)
     s.commit()
+    await _push_agent_directory(s, d.id)
     return _agent_json(a)
 
 
@@ -855,8 +882,10 @@ async def delete_agent(agent_id: str, request: Request, s: OrmSession = Depends(
     if not a:
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, a.devbox, WS_ROLE_ADMIN)
+    devbox_id = a.devbox_id
     s.delete(a)
     s.commit()
+    await _push_agent_directory(s, devbox_id)
     return {"ok": True}
 
 
