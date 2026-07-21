@@ -1121,34 +1121,53 @@ async def ws_devbox(ws: WebSocket):
             elif t == "output":
                 sid = frame.get("session_id")
                 if frame.get("seq") is not None or frame.get("pty_instance_id"):
-                    # Protocol v3 durable output: persist first, ACK only after
-                    # the row is committed. Never blindly accept output.
-                    result = recording_store.persist_output(s, devbox_id=d.id,
-                                                             frame=frame)
+                    # Protocol v3 durable output. Two-phase so the browser sees
+                    # keystroke echo without waiting on the network-disk commit:
+                    #   classify (in-memory) -> live feed + browser fan-out
+                    #   -> durable commit -> ACK (the durability boundary).
+                    result = recording_store.classify_output(s, devbox_id=d.id,
+                                                              frame=frame)
                     if result.outcome == NEW:
-                        # The ACK boundary is the durable commit above. Browser
-                        # fan-out is best-effort and must never hold the connector
-                        # spool hostage to a stale resumed terminal socket.
-                        await ws.send_json({
-                            "type": "ack", "session_id": sid,
-                            "pty_instance_id": frame.get("pty_instance_id"),
-                            "seq": frame.get("seq")})
-                        # Feed the live screen exactly once (no .cast dual-write)
-                        # and broadcast to any attached viewers.
+                        pending_row = result.frame
+                        # Fan out to the browser FIRST: echo latency must not
+                        # include the fsync. Feeding the live screen and
+                        # broadcasting are pure in-memory / socket work.
                         ls = live_registry.get_or_create(sid)
                         ls.feed_live_output(frame.get("data", ""))
                         await hub.to_session_humans(sid, frame)
-                        # Auto-checkpoint the live screen after durable NEW
-                        # output so the replay UI can seek without full replay.
-                        try:
-                            from .live import serialize_screen
-                            recording_store.maybe_checkpoint(
-                                s, sid, frame=result.frame,
-                                screen_fn=lambda ls=ls: serialize_screen(ls.screen),
-                                cols=getattr(ls, "cols", 80),
-                                rows=getattr(ls, "rows", 24))
-                        except Exception:
-                            logger.debug("checkpoint failed", exc_info=True)
+                        # Now make it durable OFF the event loop: a synchronous
+                        # SQLite commit (network disk) would otherwise stall the
+                        # loop and delay the very fan-out we just enqueued. The
+                        # connection processes its frames serially, so `s` is not
+                        # used concurrently while this thread runs.
+                        commit = await asyncio.to_thread(
+                            recording_store.commit_new, s, pending_row)
+                        if commit.outcome == NEW:
+                            await ws.send_json({
+                                "type": "ack", "session_id": sid,
+                                "pty_instance_id": frame.get("pty_instance_id"),
+                                "seq": frame.get("seq")})
+                            # Auto-checkpoint the live screen after durable NEW
+                            # output so the replay UI can seek without full
+                            # replay. Also off the loop (DB writes).
+                            try:
+                                from .live import serialize_screen
+                                await asyncio.to_thread(
+                                    recording_store.maybe_checkpoint,
+                                    s, sid, frame=commit.frame,
+                                    screen_fn=lambda ls=ls: serialize_screen(ls.screen),
+                                    cols=getattr(ls, "cols", 80),
+                                    rows=getattr(ls, "rows", 24))
+                            except Exception:
+                                logger.debug("checkpoint failed", exc_info=True)
+                        else:
+                            # Lost a durable race (DUPLICATE/CONFLICT/GAP). The
+                            # frame was already shown; respond so the connector
+                            # can reconcile (re-ACK / fence / resend).
+                            await ws.send_json(output_ack_response(
+                                commit, session_id=sid,
+                                pty_instance_id=frame.get("pty_instance_id"),
+                                seq=frame.get("seq")))
                     elif result.outcome == DUPLICATE:
                         # Already durable and identical: re-ACK, do NOT re-feed
                         # or re-broadcast.

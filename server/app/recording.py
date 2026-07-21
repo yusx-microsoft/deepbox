@@ -211,12 +211,30 @@ class RecordingStore:
     # -- persistence -----------------------------------------------------
     def persist_output(self, db, *, devbox_id: str, frame: dict,
                        session_id: str | None = None) -> PersistResult:
-        """Validate and durably persist one output frame.
+        """Validate and durably persist one output frame in one step.
 
-        ``devbox_id`` is the authenticated connector. ``session_id`` is an
-        optional expectation; when provided the frame's session must match.
-        Returns a :class:`PersistResult`; the caller must only ACK / feed the
-        live screen based on that outcome.
+        Equivalent to :meth:`classify_output` immediately followed by
+        :meth:`commit_new` for a NEW outcome. Kept for callers (replay/append,
+        tests) that do not need to interleave live fan-out with the commit.
+        The interactive server hot path uses the two-phase API instead so it
+        can broadcast to the browser *before* paying the durable-commit cost.
+        """
+        result = self.classify_output(
+            db, devbox_id=devbox_id, frame=frame, session_id=session_id)
+        if result.outcome == NEW:
+            return self.commit_new(db, result.frame)
+        return result
+
+    def classify_output(self, db, *, devbox_id: str, frame: dict,
+                        session_id: str | None = None) -> PersistResult:
+        """Validate and classify one output frame *without touching disk*.
+
+        Returns a :class:`PersistResult`. For a NEW outcome ``frame`` holds an
+        **uncommitted** :class:`models.RecordingFrame` (not yet added to the
+        session) that the caller must hand back to :meth:`commit_new` to make
+        durable. This lets the hot path feed the live screen and fan out to
+        the browser before the (network-disk) commit, so keystroke echo is not
+        gated on an fsync. DUPLICATE/GAP/CONFLICT/INVALID need no commit.
         """
         sess, reason = self._validate_ownership(
             db, devbox_id=devbox_id,
@@ -235,12 +253,12 @@ class RecordingStore:
 
         # "none" stores only the hash/sequence ledger required to safely
         # re-ACK an identical duplicate; plaintext never reaches a commit.
-        return self._persist_locked(
+        return self._classify_locked(
             db, sid, pty, seq, data, kind, phash, frame,
             redact_payload=sess.retention == models.RETENTION_NONE)
 
-    def _persist_locked(self, db, sid, pty, seq, data, kind, phash, frame,
-                        redact_payload=False, _retried=False) -> PersistResult:
+    def _classify_locked(self, db, sid, pty, seq, data, kind, phash, frame,
+                         redact_payload=False) -> PersistResult:
         # Roll back any prior aborted state so our reads are consistent.
         db.rollback()
 
@@ -265,6 +283,7 @@ class RecordingStore:
             return PersistResult(
                 INVALID, reason="seq below persisted frontier and not found")
 
+        # Construct but do NOT add/commit; commit_new() owns durability.
         row = models.RecordingFrame(
             session_id=sid,
             pty_instance_id=pty,
@@ -276,30 +295,38 @@ class RecordingStore:
             elapsed=frame.get("elapsed"),
             timestamp=_parse_timestamp(frame.get("timestamp")),
         )
+        # Stash the contiguous frontier so a lost commit race can report GAP
+        # without re-reading the ledger.
+        row._expected_seq = expected  # type: ignore[attr-defined]
+        return PersistResult(NEW, frame=row)
+
+    def commit_new(self, db, row, _retried=False) -> PersistResult:
+        """Durably commit a NEW row produced by :meth:`classify_output`.
+
+        This is the ACK boundary: the caller must only ACK the frame after
+        this returns NEW. On a lost unique-key race the row is reclassified as
+        DUPLICATE / CONFLICT / GAP so the caller can recover.
+        """
+        expected = getattr(row, "_expected_seq", None)
         db.add(row)
         try:
             db.commit()
         except IntegrityError:
             # A concurrent connection won the unique (session,pty,seq) race.
             db.rollback()
-            if _retried:
-                # Requery once more definitively.
-                other = db.scalar(
-                    select(models.RecordingFrame).where(
-                        models.RecordingFrame.session_id == sid,
-                        models.RecordingFrame.pty_instance_id == pty,
-                        models.RecordingFrame.seq == seq,
-                    )
+            other = db.scalar(
+                select(models.RecordingFrame).where(
+                    models.RecordingFrame.session_id == row.session_id,
+                    models.RecordingFrame.pty_instance_id == row.pty_instance_id,
+                    models.RecordingFrame.seq == row.seq,
                 )
-                if other is not None and other.payload_hash == phash:
-                    return PersistResult(DUPLICATE, frame=other)
-                if other is not None:
-                    return PersistResult(
-                        CONFLICT, reason="lost race with conflicting payload")
-                return PersistResult(GAP, expected_seq=expected)
-            return self._persist_locked(
-                db, sid, pty, seq, data, kind, phash, frame,
-                redact_payload=redact_payload, _retried=True)
+            )
+            if other is not None and other.payload_hash == row.payload_hash:
+                return PersistResult(DUPLICATE, frame=other)
+            if other is not None:
+                return PersistResult(
+                    CONFLICT, reason="lost race with conflicting payload")
+            return PersistResult(GAP, expected_seq=expected)
 
         # Committed: the row is now durable. Fire the test seam *before* the
         # caller learns of the outcome, proving commit precedes ACK.

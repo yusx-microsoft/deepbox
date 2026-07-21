@@ -5,6 +5,7 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
 import time
 from unittest.mock import patch
 
@@ -175,16 +176,19 @@ def test_rotation_revokes_every_prior_token_and_exposes_no_hash():
     assert all(row.hash not in listing for row in rows)
 
 
-def test_durable_output_ack_precedes_stalled_browser_fanout():
+def test_classify_output_defers_durable_commit_until_commit_new():
+    """Two-phase output: classify is a pure in-memory decision; the row only
+    becomes durable in commit_new. The hot path relies on this to fan out to
+    the browser before paying the (network-disk) commit cost.
+    """
     main, client = build_app()
     bootstrap(client)
     created = client.post("/api/devboxes", json={"name": "box"}).json()
     devbox_id = created["devbox"]["id"]
-    token = created["token"]
     agent = client.post(f"/api/devboxes/{devbox_id}/agents", json={
         "handle": "shell", "display_name": "Shell", "runtime": "mock",
     }).json()
-    session_id = "ack-before-fanout"
+    session_id = "twophase-session"
     with main.models.SessionLocal() as session:
         user = session.query(main.User).filter_by(username="owner").one()
         session.add(main.Session(
@@ -192,29 +196,35 @@ def test_durable_output_ack_precedes_stalled_browser_fanout():
         ))
         session.commit()
 
-    original_fanout = main.hub.to_session_humans
+    store = main.recording_store
+    import server.app.recording as recmod
+    frame = {
+        "session_id": session_id, "pty_instance_id": "pty-1", "seq": 1,
+        "kind": "o", "data": "hello", "elapsed": 0.01,
+    }
+    with main.models.SessionLocal() as s:
+        result = store.classify_output(s, devbox_id=devbox_id, frame=frame)
+        assert result.outcome == recmod.NEW
+        # classify must NOT have persisted anything yet.
+        with main.models.SessionLocal() as probe:
+            assert probe.query(main.models.RecordingFrame).filter_by(
+                session_id=session_id).count() == 0
+        # commit_new is the durability boundary.
+        commit = store.commit_new(s, result.frame)
+        assert commit.outcome == recmod.NEW
+    with main.models.SessionLocal() as probe:
+        rows = probe.query(main.models.RecordingFrame).filter_by(
+            session_id=session_id).all()
+        assert len(rows) == 1 and rows[0].seq == 1
 
-    async def stalled_fanout(_session_id, _frame):
-        await asyncio.sleep(0.25)
 
-    main.hub.to_session_humans = stalled_fanout
-    try:
-        with client.websocket_connect(
-            "/ws/devbox", headers={"authorization": f"Bearer {token}"},
-        ) as ws:
-            assert ws.receive_json()["type"] == "hello"
-            started = time.monotonic()
-            ws.send_json({
-                "type": "output", "session_id": session_id,
-                "pty_instance_id": "pty-1", "seq": 1,
-                "kind": "o", "data": "hello", "elapsed": 0.01,
-            })
-            ack = ws.receive_json()
-            elapsed = time.monotonic() - started
-        assert ack == {
-            "type": "ack", "session_id": session_id,
-            "pty_instance_id": "pty-1", "seq": 1,
-        }
-        assert elapsed < 0.15
-    finally:
-        main.hub.to_session_humans = original_fanout
+def test_hot_path_commits_off_the_event_loop():
+    """The durable commit and checkpoint run via asyncio.to_thread so a slow
+    network-disk fsync cannot stall the loop that fans keystroke echo out to
+    the browser."""
+    import inspect
+    import server.app.main as main
+    src = inspect.getsource(main.ws_devbox)
+    norm = " ".join(src.split())
+    assert "asyncio.to_thread( recording_store.commit_new" in norm
+    assert "asyncio.to_thread( recording_store.maybe_checkpoint" in norm
