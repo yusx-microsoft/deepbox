@@ -110,17 +110,58 @@ async function renderLogin() {
   if (status.available) return renderBootstrap();
 
   const inviteFromUrl = pendingInvite;
-  app.innerHTML = `<div class="auth"><div class="auth-card stack">
-    <div class="auth-brand"><span class="glyph">_</span><b>deepbox</b></div>
-    <div class="auth-sub">Your devbox agent switchboard. Sign in to reach the fleet.</div>
-    <input id="u" placeholder="username" autocomplete="username"/>
-    <input id="p" type="password" placeholder="password" autocomplete="current-password"/>
-    <div class="row"><button id="login" style="flex:1">Sign in</button></div>
-    <div class="auth-divider">or use an invite</div>
-    <input id="inv" placeholder="invite code" value="${escapeHtml(inviteFromUrl)}"/>
-    <input id="rd" placeholder="display name (optional)"/>
-    <div class="row"><button class="ghost" id="reg" style="flex:1">Register with invite</button></div>
-    <div id="err" class="auth-err"></div></div></div>`;
+  const psCmd = 'irm https://deeporca.blob.core.windows.net/deepbox/install.ps1 | iex';
+  const shCmd = 'curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash';
+  app.innerHTML = `<div class="auth auth-split">
+    <section class="auth-hero">
+      <div class="auth-brand"><span class="glyph">_</span><b>deepbox</b></div>
+      <h1 class="hero-title">Your agent switchboard.</h1>
+      <p class="hero-lede">deepbox connects the AI coding agents already running on your
+        own machines &mdash; Claude Code, GitHub Copilot CLI, Codex &mdash; to one browser
+        control plane. Drive them, watch structured output live, and hand off between
+        machines. The server never runs a model or holds a key: your agents stay on your
+        hardware, we just route the wires.</p>
+      <ul class="hero-points">
+        <li><b>Bring your own agents.</b> Terminal (PTY) or structured chat mode, per agent.</li>
+        <li><b>Nothing to trust us with.</b> No model keys, no code leaves your box unasked.</li>
+        <li><b>One-line onboarding.</b> No git clone, no dependency wrangling.</li>
+      </ul>
+      <div class="hero-install">
+        <div class="hero-install-h">Connect a machine in one line</div>
+        <div class="install-block">
+          <div class="install-os">Windows &middot; PowerShell</div>
+          <div class="install-cmd"><code id="cmd-ps">${escapeHtml(psCmd)}</code><button class="ghost compact" id="copy-ps">Copy</button></div>
+        </div>
+        <div class="install-block">
+          <div class="install-os">macOS / Linux</div>
+          <div class="install-cmd"><code id="cmd-sh">${escapeHtml(shCmd)}</code><button class="ghost compact" id="copy-sh">Copy</button></div>
+        </div>
+        <p class="install-note">The installer sets up an isolated environment under
+          <code>~/.deepbox</code>, then asks for your server URL and a devbox token
+          (mint one after you sign in). Your token is passed to the connector via an
+          environment variable only &mdash; never written to disk.</p>
+      </div>
+    </section>
+    <div class="auth-card stack">
+      <div class="auth-sub">Sign in to reach the fleet.</div>
+      <input id="u" placeholder="username" autocomplete="username"/>
+      <input id="p" type="password" placeholder="password" autocomplete="current-password"/>
+      <div class="row"><button id="login" style="flex:1">Sign in</button></div>
+      <div class="auth-divider">or use an invite</div>
+      <input id="inv" placeholder="invite code" value="${escapeHtml(inviteFromUrl)}"/>
+      <input id="rd" placeholder="display name (optional)"/>
+      <div class="row"><button class="ghost" id="reg" style="flex:1">Register with invite</button></div>
+      <div id="err" class="auth-err"></div>
+    </div></div>`;
+  const copyBtn = (btnId, text) => {
+    const b = document.getElementById(btnId);
+    if (!b) return;
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(text); const o=b.textContent; b.textContent='Copied'; setTimeout(()=>{b.textContent=o;},1200); } catch {}
+    };
+  };
+  copyBtn('copy-ps', psCmd);
+  copyBtn('copy-sh', shCmd);
   login.onclick = async () => {
     try {
       me = await api('/api/auth/login', {method:'POST', body: JSON.stringify({
