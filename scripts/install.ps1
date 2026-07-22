@@ -34,6 +34,132 @@ function Write-Step($msg) { Write-Host "[deepbox] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "[deepbox] $msg" -ForegroundColor Green }
 function Write-Warn2($msg){ Write-Host "[deepbox] $msg" -ForegroundColor Yellow }
 
+# Match only connector processes launched by this installation's virtualenv.
+# Command lines are inspected but never printed because they may contain tokens.
+function Test-DeepboxConnectorProcess {
+    param(
+        [Parameter(Mandatory=$true)] $Process,
+        [Parameter(Mandatory=$true)] [string] $VenvPython
+    )
+
+    $commandLine = [string]$Process.CommandLine
+    if (-not $commandLine -or
+        $commandLine -notmatch '(?i)(?:^|\s)-m\s+connector(?:\s|$)') {
+        return $false
+    }
+
+    try { $target = [IO.Path]::GetFullPath($VenvPython) }
+    catch { return $false }
+
+    $exeMatches = $false
+    if ($Process.ExecutablePath) {
+        try {
+            $actual = [IO.Path]::GetFullPath([string]$Process.ExecutablePath)
+            $exeMatches = [string]::Equals(
+                $actual, $target, [StringComparison]::OrdinalIgnoreCase)
+        } catch {}
+    }
+
+    $targetPattern = [regex]::Escape($target)
+    $commandUsesTarget = $commandLine -match (
+        '(?i)^\s*"?' + $targetPattern + '"?(?:\s|$)')
+    return ($exeMatches -or $commandUsesTarget)
+}
+
+function Get-RunningDeepboxConnectors {
+    param([Parameter(Mandatory=$true)] [string] $VenvPython)
+
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    } catch {
+        return @()
+    }
+    return @($processes | Where-Object {
+        Test-DeepboxConnectorProcess -Process $_ -VenvPython $VenvPython
+    })
+}
+
+function Get-DeepboxProcessTreeIds {
+    param(
+        [Parameter(Mandatory=$true)] [object[]] $Processes,
+        [Parameter(Mandatory=$true)] [int[]] $RootProcessIds
+    )
+
+    $ids = @{}
+    foreach ($rootId in $RootProcessIds) { $ids[[int]$rootId] = $true }
+    do {
+        $added = $false
+        foreach ($item in $Processes) {
+            $parentId = [int]$item.ParentProcessId
+            $childId = [int]$item.ProcessId
+            if ($ids.ContainsKey($parentId) -and -not $ids.ContainsKey($childId)) {
+                $ids[$childId] = $true
+                $added = $true
+            }
+        }
+    } while ($added)
+    return @($ids.Keys | ForEach-Object { [int]$_ })
+}
+
+function Stop-RunningDeepboxConnectors {
+    param([Parameter(Mandatory=$true)] [string] $VenvPython)
+
+    if (-not (Test-Path -LiteralPath $VenvPython)) { return }
+    $running = @(Get-RunningDeepboxConnectors -VenvPython $VenvPython)
+    if ($running.Count -eq 0) { return }
+
+    try { $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+    catch { $snapshot = $running }
+    $rootIds = @($running | ForEach-Object { [int]$_.ProcessId })
+    $processIds = @(Get-DeepboxProcessTreeIds `
+        -Processes $snapshot -RootProcessIds $rootIds)
+
+    Write-Step "Stopping the existing connector and its child processes for upgrade ..."
+    foreach ($processId in $processIds) {
+        # A venv launcher and its base-Python child can both match. Stopping
+        # either may make the other disappear, so decide success only after
+        # checking that the complete snapshotted process tree has exited.
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    do {
+        $alive = @($processIds | Where-Object {
+            Get-Process -Id $_ -ErrorAction SilentlyContinue
+        })
+        if ($alive.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    if ($alive.Count -ne 0) {
+        throw "The existing deepbox connector did not stop. Stop it with Ctrl+C, then re-run the installer."
+    }
+    # Let its parent launcher unwind and release app as its working directory.
+    Start-Sleep -Milliseconds 500
+    Write-Ok "Existing connector stopped."
+}
+
+function Remove-DirectoryWithRetry {
+    param(
+        [Parameter(Mandatory=$true)] [string] $Path,
+        [int] $Attempts = 12,
+        [int] $DelayMilliseconds = 500
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq $Attempts) {
+                throw "Could not refresh '$Path' because another process is using it. Stop any connector or shell whose working directory is there, then re-run the installer."
+            }
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+}
+
 # --- Config ----------------------------------------------------------------
 # Public source of the connector code (anonymous download; no repo access
 # needed). Override with $env:DEEPBOX_SOURCE_ZIP to pin a fork/branch.
@@ -43,6 +169,7 @@ $Home2   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetF
 $Root    = Join-Path $Home2 '.deepbox'
 $Src     = Join-Path $Root 'app'          # extracted connector source
 $Venv    = Join-Path $Root 'venv'
+$VenvPy  = Join-Path $Venv 'Scripts\python.exe'
 $Launcher = Join-Path $Root 'deepbox-connect.cmd'
 
 Write-Step "Installing into $Root"
@@ -97,8 +224,11 @@ Remove-Item -Force $tmpZip
 $inner = Get-ChildItem -Path $tmpExtract -Directory | Select-Object -First 1
 if (-not $inner) { throw "Unexpected archive layout (no inner folder)." }
 
-# Refresh the app folder with only what the connector needs.
-if (Test-Path $Src) { Remove-Item -Recurse -Force $Src }
+# Refresh the app folder with only what the connector needs. A previous
+# connector keeps this directory as its cwd on Windows, so stop only processes
+# launched by this installation's virtualenv and retry while wrappers unwind.
+Stop-RunningDeepboxConnectors -VenvPython $VenvPy
+Remove-DirectoryWithRetry -Path $Src
 New-Item -ItemType Directory -Force -Path $Src | Out-Null
 Copy-Item -Recurse -Force (Join-Path $inner.FullName 'connector') (Join-Path $Src 'connector')
 foreach ($f in @('requirements-connector.txt', 'requirements.txt')) {
@@ -109,7 +239,6 @@ Remove-Item -Recurse -Force $tmpExtract
 Write-Ok "Connector source ready."
 
 # --- 3. Virtual environment + dependencies ---------------------------------
-$VenvPy = Join-Path $Venv 'Scripts\python.exe'
 if (-not (Test-Path $VenvPy)) {
     Write-Step "Creating virtual environment ..."
     & $PyExe @PyArgs -m venv $Venv

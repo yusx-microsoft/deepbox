@@ -18,14 +18,28 @@ curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash
 1. Finds a Python 3.10+ interpreter (and prints install guidance if missing).
 2. Downloads the connector source as a zip from the **public** mirror
    (`yusx-swapp/deepbox`) — anonymous, no GitHub access needed.
-3. Creates an isolated virtualenv under `~/.deepbox` and installs the
+3. On a Windows reinstall, finds a running `-m connector` process from this
+   installation's virtualenv and stops its connector-owned process tree before
+   replacing the source directory.
+4. Creates an isolated virtualenv under `~/.deepbox` and installs the
    connector dependencies (`httpx`, `websockets`, and `pywinpty` on Windows).
-4. Writes a reusable launcher (`~/.deepbox/deepbox-connect.cmd` / `.sh`).
-5. Connects immediately using the server URL + devbox token.
+5. Writes a reusable launcher (`~/.deepbox/deepbox-connect.cmd` / `.sh`).
+6. Connects immediately using the server URL + devbox token.
 
 Everything lives under `~/.deepbox`; uninstall by deleting that folder. The
 **token is never written to disk** — it is passed to the connector process via
 an environment variable only.
+
+### Reinstalling while a Windows connector is running
+
+Re-running `install.ps1` detects only connector processes launched as
+`~\.deepbox\venv\Scripts\python.exe -m connector`, snapshots and stops their
+connector-owned child process tree, waits for the launcher to release
+`~\.deepbox\app`, and retries the directory replacement. This intentionally
+ends that connector's active local sessions before the new copy connects. It
+does not stop unrelated Python processes and never logs their command lines. If
+a separate shell itself has `~\.deepbox\app` as its working directory, leave
+that directory or close the shell and run the installer again.
 
 ### Non-interactive use
 
