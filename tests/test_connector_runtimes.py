@@ -196,3 +196,35 @@ def test_capabilities_blob_has_no_secrets():
     # Sanity: nothing that looks like a token/secret key.
     text = repr(caps).lower()
     assert "token" not in text and "secret" not in text and "password" not in text
+
+
+class TestStructuredControls:
+    def test_capabilities_publish_generic_controls_without_local_path(self):
+        cap = runtimes.get("claude-code-structured").capabilities(
+            installed=True, version="1.2.3", path="C:/private/claude.exe")
+        assert "path" not in cap
+        controls = cap["features"]["controls"]
+        assert [c["key"] for c in controls] == [
+            "model", "reasoning_effort", "attachments"]
+        assert controls[0]["scope"] == "session"
+        assert controls[2]["kind"] == "file"
+
+    def test_sanitize_and_argv_ignore_undeclared_or_invalid_options(self):
+        clean = runtimes.sanitize_options("copilot-cli-structured", {
+            "model": "gpt-5",
+            "reasoning_effort": "high",
+            "evil": "--run-anything",
+            "attachments": [{"name": "a.txt", "data": "YQ=="}],
+        })
+        assert "evil" not in clean
+        assert runtimes.control_argv(
+            "copilot-cli-structured", clean, ("C:/tmp/a.txt",)) == [
+                "--reasoning-effort", "high", "--attachment", "C:/tmp/a.txt"]
+        assert runtimes.sanitize_options("copilot-cli-structured", {
+            "model": "not-a-model", "reasoning_effort": "ultra"}) == {}
+
+    def test_claude_file_control_uses_prompt_transport(self):
+        control = runtimes.attachment_control("claude-code-structured")
+        assert control is not None
+        assert control.flag is None
+        assert control.max_total_bytes == 1024 * 1024

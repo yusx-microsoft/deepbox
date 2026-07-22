@@ -60,3 +60,100 @@ test('tool.call after streaming deltas closes the open bubble', () => {
   assert.strictEqual(s._openAssistant, null);
   assert.strictEqual(s.items.length, 2);
 });
+
+
+test('user.echo reconciles a local turn and restores one without duplication', () => {
+  const state = C.initialChatState();
+  C.appendUserTurn(state, 'hello', [{name: 'a.txt', size: 1}]);
+  C.applyEvent(state, {ev: 'user.echo', text: 'hello', attachments: [{name: 'a.txt'}]});
+  assert.equal(state.items.length, 1);
+  assert.equal(state.items[0].local, false);
+
+  const restored = C.initialChatState();
+  C.applyEvent(restored, {ev: 'user.echo', text: 'hello', attachments: [{name: 'a.txt'}]});
+  assert.equal(restored.items.length, 1);
+  assert.equal(restored.items[0].attachments[0].name, 'a.txt');
+});
+
+test('session.config records only connector-confirmed scalar controls', () => {
+  const state = C.initialChatState();
+  C.applyEvent(state, {ev: 'session.config', options: {model: 'sonnet', reasoning_effort: 'high'}});
+  assert.equal(state.configured, true);
+  assert.deepEqual(state.config, {model: 'sonnet', reasoning_effort: 'high'});
+});
+
+test('normalizes generic adapter controls and builds declared turn options', () => {
+  const controls = C.controlsFromCapability({features: {controls: [
+    {key: 'model', label: 'Model', kind: 'select', scope: 'session', choices: ['a', 'b']},
+    {key: 'attachments', label: 'Files', kind: 'file', scope: 'turn', max_files: 99,
+      max_total_bytes: 999999999, accept: 'text/*'},
+    {key: '../bad', kind: 'select', choices: ['x']},
+  ]}});
+  assert.equal(controls.length, 2);
+  assert.equal(controls[1].max_files, 8);
+  assert.equal(controls[1].max_total_bytes, 8 * 1024 * 1024);
+  assert.deepEqual(C.buildTurnOptions(
+    controls, {model: 'b', evil: 'x'}, {attachments: [{name: 'a', data: 'YQ=='}]}), {
+      model: 'b', attachments: [{name: 'a', data: 'YQ=='}],
+    });
+  assert.deepEqual(C.buildTurnOptions(controls, {model: 'nope'}, {}), {});
+});
+
+
+test('parseEventPayload accepts JSONL restore tails and isolates bad rows', () => {
+  assert.deepEqual(C.parseEventPayload(
+    '{"ev":"user.echo","content":"one"}\nnot-json\n{"ev":"message.delta","text":"two"}'), [
+    {ev: 'user.echo', content: 'one'},
+    {ev: 'message.delta', text: 'two'},
+  ]);
+  assert.deepEqual(C.parseEventPayload(''), []);
+});
+
+
+test('reconciles displayed controls to connector-confirmed values', () => {
+  const controls = C.controlsFromCapability({features: {controls: [
+    {key: 'model', kind: 'select', scope: 'session', choices: ['a', 'b']},
+    {key: 'reasoning_effort', kind: 'select', scope: 'turn', choices: ['low', 'high']},
+  ]}});
+  assert.deepEqual(C.reconcileControlValues(
+    controls, {model: 'b', reasoning_effort: 'high', local: 'keep'},
+    {model: 'a'}), {model: 'a', local: 'keep'});
+});
+
+test('session.config replaces stale per-turn configuration', () => {
+  const state = C.initialChatState();
+  C.applyEvent(state, {ev: 'session.config', options: {model: 'a'}});
+  C.applyEvent(state, {ev: 'session.config', options: {reasoning_effort: 'low'}});
+  assert.deepEqual(state.config, {reasoning_effort: 'low'});
+});
+
+
+test('restore payload replaces live transcript instead of duplicating it', () => {
+  const live = C.initialChatState();
+  C.applyEvent(live, {ev: 'user.echo', text: 'hello'});
+  C.applyEvent(live, {ev: 'message.delta', text: 'world'});
+  const folded = C.foldEventPayload(live, [
+    '{"ev":"user.echo","text":"hello"}',
+    '{"ev":"message.delta","text":"world"}',
+  ].join('\n'), true);
+  assert.notStrictEqual(folded.state, live);
+  assert.deepEqual(folded.state.items.map(item => [item.kind, item.text]), [
+    ['user', 'hello'], ['assistant', 'world'],
+  ]);
+});
+
+test('single-flight gate coalesces a cold burst and resets after settlement', async () => {
+  const runOnce = C.createSingleFlight();
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  let calls = 0;
+  const first = runOnce(async () => { calls += 1; await blocked; return 'mounted'; });
+  const second = runOnce(async () => { calls += 1; return 'duplicate'; });
+  assert.strictEqual(first, second);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  release();
+  assert.equal(await second, 'mounted');
+  assert.equal(await runOnce(async () => { calls += 1; return 'next'; }), 'next');
+  assert.equal(calls, 2);
+});

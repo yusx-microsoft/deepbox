@@ -39,8 +39,12 @@ Security invariants preserved:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
+from pathlib import Path
 import sys
+import tempfile
 from typing import Awaitable, Callable
 
 IS_WIN = sys.platform == "win32"
@@ -54,6 +58,7 @@ EV_TOOL_RESULT = "tool.result"  # a tool returned
 EV_PERMISSION_ASK = "permission.ask"  # agent needs approval to use a tool
 EV_TURN_END = "turn.end"      # one assistant turn finished (usage/cost)
 EV_USER_ECHO = "user.echo"    # our own user message, replayed for ack
+EV_SESSION_CONFIG = "session.config"  # applied model/reasoning controls
 EV_ERROR = "error"
 
 
@@ -273,22 +278,43 @@ register_translator("claude-code-structured", translate_claude_event)
 register_translator("copilot-cli-structured", translate_copilot_event)
 
 
+_LOG = logging.getLogger(__name__)
+_TEMP_CLEANUP_DELAYS = (0.0, 0.05, 0.2, 0.5)
+
+
+async def _terminate_process(proc) -> None:
+    # Best-effort kill and reap for a process that the session no longer owns.
+    try:
+        if getattr(proc, "returncode", None) is None:
+            proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        await proc.wait()
+    except Exception:
+        pass
+
+
+async def _cleanup_tempdir(temp) -> bool:
+    # Retry transient Windows file-handle failures without faulting the turn task.
+    for delay in _TEMP_CLEANUP_DELAYS:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            temp.cleanup()
+            return True
+        except OSError:
+            continue
+    return False
+
+
 class StructuredAgentSession:
-    """Drive one agent in headless structured mode, PtySession-compatible.
+    """Drive one agent through a canonical structured-event stream.
 
-    ``spawn`` is injectable for tests: it must return an object exposing
-    ``stdin`` (with ``write``/``drain``/``close``), ``stdout`` (an async line
-    iterator via ``readline``), ``wait()`` and ``kill()`` — i.e. an
-    ``asyncio.subprocess.Process``. The default spawns the real agent.
-
-    Two drive modes cover the spread of headless agents:
-
-    * **persistent** (default; Claude Code): one long-lived process; ``write``
-      pushes a user turn onto its stdin via ``encode_user_message``.
-    * **per_turn** (Copilot CLI ``-p``): the agent runs one prompt then exits,
-      so each ``write(text)`` spawns a fresh process with the prompt appended
-      to argv, sharing a stable ``--session-id`` for context. Process exit
-      ends only that turn, not the server session.
+    Persistent agents normally start immediately for backwards compatibility.
+    The supervisor opts into ``lazy_start`` so session-scoped controls from the
+    first browser turn can be applied before any CLI process is spawned.
+    Per-turn agents always spawn once per prompt.
     """
 
     def __init__(self, cmd: list[str], cwd: str | None,
@@ -297,28 +323,45 @@ class StructuredAgentSession:
                  cols: int = 120, rows: int = 30,
                  spawn: Callable[..., Awaitable] | None = None,
                  translate=None, per_turn: bool = False,
-                 prompt_argv=None):
+                 prompt_argv=None, lazy_start: bool = False,
+                 command_builder=None, option_sanitizer=None,
+                 attachment_key: str | None = None,
+                 attachment_mode: str | None = None,
+                 attachment_max_files: int = 0,
+                 attachment_max_bytes: int = 0,
+                 session_option_keys: tuple[str, ...] = ()):
         self.cmd = cmd
         self.cwd = cwd or None
         self.on_output = on_output
         self.on_exit = on_exit
         self.cols = cols
         self.rows = rows
-        self._spawn = spawn or self._default_spawn
+        self._custom_spawn = spawn
         self._translate = translate or translate_claude_event
         self._per_turn = per_turn
-        # For per_turn: extra argv inserted before the prompt (e.g. the prompt
-        # flag). The prompt text is appended as the final argv element.
         self._prompt_argv = list(prompt_argv or [])
+        self._lazy_start = lazy_start
+        self._command_builder = command_builder
+        self._option_sanitizer = option_sanitizer or (
+            lambda value: value if isinstance(value, dict) else {})
+        self._attachment_key = attachment_key
+        self._attachment_mode = attachment_mode
+        self._attachment_max_files = max(0, int(attachment_max_files or 0))
+        self._attachment_max_bytes = max(0, int(attachment_max_bytes or 0))
+        self._session_option_keys = tuple(session_option_keys)
+        self._session_options: dict[str, object] | None = None
         self._proc = None
         self._alive = False
         self._stderr_tail: list[str] = []
+        self._spawn_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
+        self._turn_pending = False
 
-
-    async def _default_spawn(self, prompt: str | None = None):
-        argv = list(self.cmd)
-        if self._per_turn and prompt is not None:
-            argv = argv + self._prompt_argv + [prompt]
+    async def _spawn_process(self, argv: list[str], prompt: str | None = None):
+        if self._custom_spawn is not None:
+            if self._per_turn:
+                return await self._custom_spawn(prompt)
+            return await self._custom_spawn()
         return await asyncio.create_subprocess_exec(
             *argv, cwd=self.cwd,
             stdin=asyncio.subprocess.PIPE,
@@ -326,31 +369,155 @@ class StructuredAgentSession:
             stderr=asyncio.subprocess.PIPE,
         )
 
+    def _command(self, options: dict, paths: tuple[str, ...] = ()) -> list[str]:
+        if self._command_builder is None:
+            return list(self.cmd)
+        return list(self._command_builder(options, paths))
+
     async def start(self):
-        if self._per_turn:
-            # No process until the first user turn; the session is "alive" in
-            # the sense that the server session should stay open awaiting input.
+        if self._per_turn or self._lazy_start:
+            # Logically live while waiting for the first full user turn.
             self._alive = True
             self._proc = None
-            self._spawn_lock = asyncio.Lock()
             await self._emit(_event(EV_STATUS, subtype="ready"))
             return
-        self._proc = await self._spawn()
+        self._proc = await self._spawn_process(list(self.cmd))
         self._alive = True
-        asyncio.create_task(self._read_stdout())
-        if getattr(self._proc, "stderr", None) is not None:
-            asyncio.create_task(self._read_stderr())
+        self._start_readers(self._proc)
 
-    async def _run_one_turn(self, prompt: str):
-        """per_turn: spawn a fresh process for a single prompt and drain it."""
-        async with self._spawn_lock:
-            self._proc = await self._spawn(prompt)
-            if getattr(self._proc, "stderr", None) is not None:
-                asyncio.create_task(self._read_stderr())
-            await self._drain_turn()
+    def _start_readers(self, proc):
+        asyncio.create_task(self._read_stdout(proc))
+        if getattr(proc, "stderr", None) is not None:
+            asyncio.create_task(self._read_stderr(proc))
 
-    async def _drain_turn(self):
-        proc = self._proc
+    def _attachment_metadata(self, options: dict) -> list[dict]:
+        raw = options.get(self._attachment_key) if self._attachment_key else None
+        if not isinstance(raw, list):
+            return []
+        result = []
+        for item in raw[:self._attachment_max_files]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            size = item.get("size")
+            media_type = item.get("type")
+            if isinstance(name, str) and name:
+                result.append({
+                    "name": name[:255],
+                    "size": size if isinstance(size, int) and size >= 0 else None,
+                    "type": media_type[:100] if isinstance(media_type, str) else "",
+                })
+        return result
+
+    def _decode_attachments(self, options: dict) -> list[dict]:
+        if not self._attachment_key:
+            return []
+        raw = options.get(self._attachment_key)
+        if raw is None:
+            return []
+        if not isinstance(raw, list) or len(raw) > self._attachment_max_files:
+            raise ValueError("Too many attachments")
+        decoded = []
+        total = 0
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("Invalid attachment")
+            name = item.get("name")
+            payload = item.get("data")
+            if not isinstance(name, str) or not name or len(name) > 255:
+                raise ValueError("Invalid attachment name")
+            if not isinstance(payload, str):
+                raise ValueError(f"Attachment {name} has no data")
+            try:
+                data = base64.b64decode(payload, validate=True)
+            except Exception as exc:
+                raise ValueError(f"Attachment {name} is not valid base64") from exc
+            total += len(data)
+            if total > self._attachment_max_bytes:
+                raise ValueError("Attachments exceed this runtime's size limit")
+            decoded.append({
+                "name": name,
+                "type": item.get("type") if isinstance(item.get("type"), str) else "",
+                "data": data,
+            })
+        return decoded
+
+    @staticmethod
+    def _safe_filename(index: int, name: str) -> str:
+        base = name.replace("\\", "/").rsplit("/", 1)[-1]
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in base)
+        return f"{index:02d}-{safe or 'attachment'}"
+
+    def _materialize(self, attachments: list[dict]):
+        temp = tempfile.TemporaryDirectory(prefix="deepbox-attachments-")
+        paths = []
+        for index, item in enumerate(attachments, 1):
+            path = Path(temp.name) / self._safe_filename(index, item["name"])
+            path.write_bytes(item["data"])
+            paths.append(str(path))
+        return tuple(paths), temp
+
+    @staticmethod
+    def _embed_text_attachments(prompt: str, attachments: list[dict]) -> str:
+        if not attachments:
+            return prompt
+        blocks = []
+        for item in attachments:
+            try:
+                text = item["data"].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"Attachment {item['name']} must be a UTF-8 text file") from exc
+            blocks.append(
+                f"<file name={json.dumps(item['name'], ensure_ascii=False)}>\n"
+                f"{text}\n</file>")
+        return (prompt + "\n\n<deepbox_attachments>\n" +
+                "\n".join(blocks) + "\n</deepbox_attachments>")
+
+    async def _run_one_turn(self, prompt: str, options: dict,
+                            attachments: list[dict]):
+        # Spawn a fresh process for one prompt and clean temporary files.
+        temp = None
+        proc = None
+        stderr_task = None
+        paths: tuple[str, ...] = ()
+        try:
+            if not self._alive:
+                return
+            if attachments and self._attachment_mode == "flag":
+                paths, temp = self._materialize(attachments)
+            elif attachments:
+                prompt = self._embed_text_attachments(prompt, attachments)
+            argv = self._command(options, paths) + self._prompt_argv + [prompt]
+            async with self._spawn_lock:
+                if not self._alive:
+                    return
+                proc = await self._spawn_process(argv, prompt)
+                # kill() can run while process creation is awaiting. Never publish a
+                # late process into session state: terminate and reap it here.
+                if not self._alive:
+                    await _terminate_process(proc)
+                    return
+                self._proc = proc
+                if getattr(proc, "stderr", None) is not None:
+                    stderr_task = asyncio.create_task(self._read_stderr(proc))
+                try:
+                    await self._drain_turn(proc)
+                finally:
+                    # If output handling failed, stop the child before waiting for
+                    # stderr; otherwise a full pipe can keep cleanup and exit stuck.
+                    if getattr(proc, "returncode", None) is None:
+                        await _terminate_process(proc)
+                    if stderr_task is not None:
+                        await asyncio.gather(stderr_task, return_exceptions=True)
+        finally:
+            if self._proc is proc:
+                self._proc = None
+            if temp is not None and not await _cleanup_tempdir(temp):
+                _LOG.warning("temporary attachment cleanup failed after retries")
+
+
+    async def _drain_turn(self, proc):
         stream = proc.stdout
         while True:
             try:
@@ -366,25 +533,22 @@ class StructuredAgentSession:
             await proc.wait()
         except Exception:
             pass
-        # Turn finished; ensure the UI closes the turn even if the agent didn't
-        # emit an explicit terminal event.
         await self._emit(_event(EV_TURN_END, subtype="process_exit"))
-        self._proc = None
 
-    async def _read_stdout(self):
-        proc = self._proc
+    async def _read_stdout(self, proc):
         stream = proc.stdout
-        while self._alive:
+        while self._alive and self._proc is proc:
             try:
                 line = await stream.readline()
             except (asyncio.LimitOverrunError, ValueError):
-                # Overlong line: skip to next; never crash the reader.
                 continue
             except Exception:
                 break
             if not line:
                 break
             await self._handle_line(line)
+        if self._proc is not proc:
+            return
         self._alive = False
         code = 0
         try:
@@ -393,8 +557,8 @@ class StructuredAgentSession:
             pass
         await self.on_exit(int(code or 0))
 
-    async def _read_stderr(self):
-        stream = self._proc.stderr
+    async def _read_stderr(self, proc):
+        stream = proc.stderr
         while True:
             try:
                 line = await stream.readline()
@@ -402,7 +566,6 @@ class StructuredAgentSession:
                 break
             if not line:
                 break
-            # Keep only a short tail for diagnostics; never emit as content.
             try:
                 self._stderr_tail.append(line.decode(errors="replace"))
                 del self._stderr_tail[:-20]
@@ -416,8 +579,6 @@ class StructuredAgentSession:
         try:
             obj = json.loads(text)
         except json.JSONDecodeError:
-            # Non-JSON noise on stdout (banner etc.): forward as a status note
-            # rather than dropping, but never as assistant content.
             await self._emit(_event(EV_STATUS, note=text[:500]))
             return
         for ev in self._translate(obj):
@@ -426,11 +587,51 @@ class StructuredAgentSession:
     async def _emit(self, ev: dict):
         await self.on_output(json.dumps(ev))
 
+    async def _dispatch_turn(self, data: str, raw_options: object):
+        options = self._option_sanitizer(raw_options)
+        if not self._per_turn and self._session_option_keys:
+            if self._session_options is None:
+                self._session_options = {
+                    key: options.get(key) for key in self._session_option_keys}
+            else:
+                for key, value in self._session_options.items():
+                    if value is None:
+                        options.pop(key, None)
+                    else:
+                        options[key] = value
+        public_options = {
+            key: value for key, value in options.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        await self._emit(_event(EV_SESSION_CONFIG, options=public_options))
+        await self._emit(_event(
+            EV_USER_ECHO, text=data,
+            attachments=self._attachment_metadata(options)))
+        try:
+            attachments = self._decode_attachments(options)
+            if self._per_turn:
+                await self._run_one_turn(data, options, attachments)
+                return
+            async with self._write_lock:
+                prompt = self._embed_text_attachments(data, attachments)
+                if self._proc is None:
+                    self._proc = await self._spawn_process(self._command(options))
+                    self._start_readers(self._proc)
+                stdin = self._proc.stdin
+                if stdin is None:
+                    raise ValueError("Agent stdin is unavailable")
+                stdin.write(encode_user_message(prompt).encode())
+                drain = getattr(stdin, "drain", None)
+                if drain is not None:
+                    await drain()
+        except ValueError as exc:
+            await self._emit(_event(EV_ERROR, message=str(exc)))
+            await self._emit(_event(EV_TURN_END, subtype="input_error"))
+
     def is_alive(self) -> bool:
         if not self._alive:
             return False
-        if self._per_turn:
-            # Between turns there is no process, but the session stays open.
+        if self._per_turn or (self._lazy_start and self._proc is None):
             return True
         if self._proc is None:
             return False
@@ -440,29 +641,39 @@ class StructuredAgentSession:
             return False
         return True
 
-    def write(self, data: str):
-        """Send one user turn. ``data`` is plain text (not terminal bytes)."""
-        if not self.is_alive():
+    def write_turn(self, data: str, options: object = None):
+        """Send one complete user turn plus declarative runtime options."""
+        if not self.is_alive() or not isinstance(data, str):
             return
         if self._per_turn:
-            # One process per prompt (Copilot -p). Ignore overlapping turns
-            # while one is still running (the lock also guards this).
-            if self._proc is not None:
+            if self._turn_pending or self._proc is not None:
                 return
-            asyncio.create_task(self._run_one_turn(data))
+            self._turn_pending = True
+
+            async def run():
+                try:
+                    await self._dispatch_turn(data, options)
+                finally:
+                    self._turn_pending = False
+
+            asyncio.create_task(run())
             return
-        if self._proc is None:
+        asyncio.create_task(self._dispatch_turn(data, options))
+
+    def write(self, data: str):
+        # Keep the historical synchronous compatibility surface for direct
+        # callers/tests. The supervisor uses write_turn so browser turns still
+        # receive canonical user/config events and attachment handling.
+        if (self.is_alive() and not self._per_turn and self._proc is not None
+                and self._proc.stdin is not None):
+            try:
+                self._proc.stdin.write(encode_user_message(data).encode())
+            except Exception:
+                pass
             return
-        stdin = self._proc.stdin
-        if stdin is None:
-            return
-        try:
-            stdin.write(encode_user_message(data).encode())
-        except Exception:
-            pass
+        self.write_turn(data, {})
 
     def respond_permission(self, request_id: str, allow: bool):
-        """Answer a pending ``permission.ask`` via the control channel."""
         if not self.is_alive() or self._proc is None:
             return
         stdin = self._proc.stdin
@@ -474,7 +685,6 @@ class StructuredAgentSession:
             pass
 
     def resize(self, cols: int, rows: int):
-        # Structured sessions have no terminal geometry; record for parity.
         self.cols = cols
         self.rows = rows
 

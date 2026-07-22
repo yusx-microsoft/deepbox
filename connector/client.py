@@ -73,8 +73,20 @@ __all__ = [
     "SupervisorService",
     "run_supervisor",
     "run_transport",
+    "websocket_connect_options",
     "main",
 ]
+
+
+def websocket_connect_options() -> dict:
+    """Keep both connector transports on the same conservative WS policy."""
+    return {
+        "open_timeout": 30,
+        "ping_interval": 20,
+        "ping_timeout": 60,
+        "close_timeout": 5,
+        "max_size": 16 * 1024 * 1024,
+    }
 
 
 class Connector:
@@ -169,23 +181,23 @@ class Connector:
         print(f"[connector] devbox={data['name']} agents={[a['handle'] for a in data['agents']]}")
         return data
 
-    def probe_runtimes(self) -> list[str]:
-        """Detect which registered runtimes are installed on this box.
+    def probe_runtimes(self) -> list[dict]:
+        """Detect installed runtimes and return presentation-safe capabilities.
 
-        Iterates the runtime adapter registry (Cut 7) rather than a hard-coded
-        table, so adding a runtime is localized to a single adapter definition.
+        Iterates the runtime adapter registry rather than a hard-coded table, so
+        adding a runtime and its generic UI controls stays localized to one
+        adapter definition.
         """
         caps = []
         for adapter in runtimes.all_adapters():
-            if adapter.probe_hint is not None:
-                if adapter.probe_hint():
-                    caps.append(adapter.id)
-                continue
-            if shutil.which(adapter.executable):
-                caps.append(adapter.id)
+            installed = (bool(adapter.probe_hint())
+                         if adapter.probe_hint is not None
+                         else bool(shutil.which(adapter.executable)))
+            if installed:
+                caps.append(adapter.capabilities(installed=True))
         return caps
 
-    async def report_runtimes(self, devbox_id: str, caps: list[str]):
+    async def report_runtimes(self, devbox_id: str, caps: list[dict]):
         async with httpx.AsyncClient() as c:
             await c.post(f"{self.server_url}/api/devboxes/{devbox_id}/runtimes",
                          headers={"Authorization": f"Bearer {self.token}"},
@@ -210,7 +222,8 @@ class Connector:
         try:
             async with websockets.connect(
                     ws_url(self.server_url),
-                    additional_headers={"Authorization": f"Bearer {self.token}"}) as ws:
+                    additional_headers={"Authorization": f"Bearer {self.token}"},
+                    **websocket_connect_options()) as ws:
                 self.ws = ws
                 self.connect_count += 1
                 hello = await ws.recv()
@@ -311,7 +324,8 @@ async def run_supervisor(server_url: str, token: str,
     me = await bootstrap.fetch_me()
     caps = bootstrap.probe_runtimes()
     await bootstrap.report_runtimes(me["devbox_id"], caps)
-    print(f"[sessiond] runtimes available: {caps}")
+    print("[sessiond] runtimes available: " + ", ".join(
+        str(cap.get("runtime", "unknown")) for cap in caps))
 
     address = endpoint or default_endpoint()
     if endpoint_exists(address):
@@ -349,7 +363,8 @@ async def run_transport(server_url: str, token: str,
             print(f"[transport] attached to sessiond at {address}")
             async with websockets.connect(
                     ws_url(server_url),
-                    additional_headers={"Authorization": f"Bearer {token}"}) as ws:
+                    additional_headers={"Authorization": f"Bearer {token}"},
+                    **websocket_connect_options()) as ws:
                 connect_count += 1
                 hello = await ws.recv()
                 print(f"[transport] connected (attempt #{connect_count}): {hello}")

@@ -1,4 +1,5 @@
 """Server-side Protocol v3 durable output / ACK tests."""
+import json
 import os
 import tempfile
 import unittest
@@ -192,6 +193,39 @@ class MergedRecordingTests(RecordingBaseCase):
         datas = [m[2] for m in merged]
         self.assertEqual(datas.count("a"), 1)
         self.assertEqual(datas.count("b"), 1)
+
+    def test_event_restore_returns_only_valid_canonical_jsonl(self):
+        rows = [
+            (0.1, "output", "terminal bytes"),
+            (0.2, "event", json.dumps({"ev": "status", "note": "ready"})),
+            (0.3, "event", "not-json"),
+            (0.4, "event", json.dumps({"ev": "message", "text": "hi"})),
+        ]
+        reg = LiveRegistry(durable_loader=lambda _sid: rows)
+        restored = [json.loads(line) for line in reg.event_restore(self.sid).splitlines()]
+        self.assertEqual([row["ev"] for row in restored], ["status", "message"])
+
+    def test_event_restore_is_bounded_to_complete_tail_rows(self):
+        rows = [
+            (0.1, "event", json.dumps({"ev": "message", "text": "first"})),
+            (0.2, "event", json.dumps({"ev": "message", "text": "last"})),
+        ]
+        reg = LiveRegistry(durable_loader=lambda _sid: rows)
+        last_size = len(json.dumps({"ev": "message", "text": "last"},
+                                   separators=(",", ":")).encode()) + 1
+        restored = reg.event_restore(self.sid, max_bytes=last_size)
+        self.assertEqual(json.loads(restored)["text"], "last")
+
+    def test_event_restore_keeps_a_contiguous_newest_tail(self):
+        old = {"ev": "message", "text": "old"}
+        oversized_newest = {"ev": "message", "text": "x" * 1000}
+        rows = [
+            (0.1, "event", json.dumps(old)),
+            (0.2, "event", json.dumps(oversized_newest)),
+        ]
+        reg = LiveRegistry(durable_loader=lambda _sid: rows)
+        budget = len(json.dumps(old, separators=(",", ":")).encode()) + 1
+        self.assertEqual(reg.event_restore(self.sid, max_bytes=budget), "")
 
     def test_restore_after_registry_recreation(self):
         for seq, data in [(1, "hello "), (2, "world")]:

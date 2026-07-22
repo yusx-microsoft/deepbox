@@ -62,11 +62,28 @@ let chatHelpersPromise = null;
 let Chat = null;               // DeepboxChat module once loaded
 let chatState = null;          // current structured session view model
 let structuredMode = false;    // is the open session a structured (chat) agent?
+let chatControls = [];         // normalized adapter-owned control descriptors
+let chatControlValues = {};    // select values, keyed by generic control key
+let chatAttachments = {};      // in-memory file payloads; never persisted by browser
+let chatSending = false;
+let chatModeEpoch = 0;          // invalidates lazy mounts from a previous agent/view
+let chatEntryGate = null;       // single-flight gate, created by the chat helper
 async function loadChatHelpers(){
   chatHelpersPromise = chatHelpersPromise ||
     loadScriptOnce('/static/chat.js', 'DeepboxChat', 'failed to load chat helpers');
   Chat = await chatHelpersPromise;
   return Chat;
+}
+
+function resetStructuredChat(){
+  chatModeEpoch += 1;
+  chatEntryGate = null;
+  structuredMode = false;
+  chatState = null;
+  chatControls = [];
+  chatControlValues = {};
+  chatAttachments = {};
+  chatSending = false;
 }
 
 
@@ -626,52 +643,233 @@ function sendResize(){
 }
 
 // --- Structured chat surface (Cut 10) -------------------------------------
+function currentAgentCapability(){
+  for(const devbox of devboxes){
+    const agent = (devbox.agents || []).find(item => item.id === curAgentId);
+    if(!agent) continue;
+    const capabilities = Array.isArray(devbox.capabilities) ? devbox.capabilities : [];
+    return capabilities.find(capability => capability &&
+      typeof capability === 'object' && capability.runtime === agent.runtime) || null;
+  }
+  return null;
+}
+
+function formatFileSize(bytes){
+  if(bytes < 1024) return `${bytes} B`;
+  if(bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function filePayload(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = ()=>reject(new Error(`Could not read ${file.name}`));
+    reader.onload = ()=>{
+      const result = String(reader.result || '');
+      const comma = result.indexOf(',');
+      if(comma < 0) return reject(new Error(`Could not encode ${file.name}`));
+      resolve({name:file.name, type:file.type || '', size:file.size,
+        data:result.slice(comma + 1)});
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function setChatComposerError(message){
+  const error = document.getElementById('chat-composer-error');
+  if(error) error.textContent = message || '';
+}
+
+function syncChatControls(){
+  if(!chatState) return;
+  const sessionLocked = chatState.configured || chatState.items.length > 0;
+  for(const control of chatControls){
+    if(control.kind !== 'select') continue;
+    const select = document.querySelector(`[data-chat-control="${control.key}"]`);
+    if(!select) continue;
+    const selected = chatControlValues[control.key];
+    select.value = typeof selected === 'string' && control.choices.includes(selected)
+      ? selected : '';
+    select.disabled = control.scope === 'session' && sessionLocked;
+    select.title = select.disabled ? 'Fixed for this live session' : '';
+  }
+}
+
+function renderAttachmentTray(){
+  const tray = document.getElementById('chat-file-tray');
+  if(!tray) return;
+  tray.textContent = '';
+  for(const control of chatControls.filter(item => item.kind === 'file')){
+    for(const [index, file] of (chatAttachments[control.key] || []).entries()){
+      const chip = document.createElement('span');
+      chip.className = 'chat-file-chip';
+      const name = document.createElement('span');
+      name.className = 'chat-file-name';
+      name.textContent = file.name;
+      const size = document.createElement('span');
+      size.className = 'chat-file-size';
+      size.textContent = formatFileSize(file.size);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'chat-file-remove';
+      remove.setAttribute('aria-label', `Remove ${file.name}`);
+      remove.textContent = '\u00d7';
+      remove.onclick = ()=>{
+        chatAttachments[control.key].splice(index, 1);
+        renderAttachmentTray();
+        setChatComposerError('');
+      };
+      chip.append(name, size, remove);
+      tray.appendChild(chip);
+    }
+  }
+  tray.hidden = !tray.childElementCount;
+}
+
+async function addChatFiles(control, fileList){
+  setChatComposerError('');
+  const current = chatAttachments[control.key] || [];
+  const incoming = Array.from(fileList || []);
+  if(current.length + incoming.length > control.max_files){
+    setChatComposerError(`Up to ${control.max_files} files can be attached.`);
+    return;
+  }
+  const total = current.reduce((sum, file)=>sum + file.size, 0) +
+    incoming.reduce((sum, file)=>sum + file.size, 0);
+  if(total > control.max_total_bytes){
+    setChatComposerError(`Attachments can total up to ${formatFileSize(control.max_total_bytes)}.`);
+    return;
+  }
+  try{
+    const payloads = await Promise.all(incoming.map(filePayload));
+    chatAttachments[control.key] = current.concat(payloads);
+    renderAttachmentTray();
+  }catch(error){ setChatComposerError(error.message || 'Could not read that file.'); }
+}
+
+function setupChatControls(){
+  chatControls = Chat.controlsFromCapability(currentAgentCapability());
+  chatControlValues = {};
+  chatAttachments = {};
+  const toolbar = document.getElementById('chat-controls');
+  if(!toolbar) return;
+  toolbar.textContent = '';
+  for(const control of chatControls){
+    if(control.kind === 'select'){
+      const label = document.createElement('label');
+      label.className = 'chat-control';
+      const caption = document.createElement('span');
+      caption.textContent = control.label;
+      const select = document.createElement('select');
+      select.setAttribute('data-chat-control', control.key);
+      const fallback = document.createElement('option');
+      fallback.value = '';
+      fallback.textContent = 'Default';
+      select.appendChild(fallback);
+      for(const choice of control.choices){
+        const option = document.createElement('option');
+        option.value = choice;
+        option.textContent = choice;
+        select.appendChild(option);
+      }
+      select.onchange = ()=>{ chatControlValues[control.key] = select.value; };
+      label.append(caption, select);
+      toolbar.appendChild(label);
+    }else{
+      chatAttachments[control.key] = [];
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.multiple = control.max_files > 1;
+      input.accept = control.accept;
+      input.hidden = true;
+      input.onchange = async ()=>{
+        await addChatFiles(control, input.files);
+        input.value = '';
+      };
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'chat-attach';
+      button.textContent = control.label;
+      button.onclick = ()=>input.click();
+      toolbar.append(button, input);
+    }
+  }
+  toolbar.hidden = !chatControls.length;
+  syncChatControls();
+  renderAttachmentTray();
+}
+
 async function enterChatMode(){
   if(structuredMode && document.getElementById('chat-surface')) return;
-  await loadChatHelpers();
+  const epoch = chatModeEpoch;
   structuredMode = true;
-  chatState = Chat.initialChatState();
-  const body = document.getElementById('stagebody');
-  if(!body) return;
-  body.innerHTML =
-    `<div id="chat-surface" class="chat-surface">
+  await loadChatHelpers();
+  if(epoch !== chatModeEpoch || !structuredMode) return;
+  chatEntryGate = chatEntryGate || Chat.createSingleFlight();
+  return chatEntryGate(()=>{
+    if(epoch !== chatModeEpoch || !structuredMode ||
+       document.getElementById('chat-surface')) return;
+    const body = document.getElementById('stagebody');
+    if(!body) return;
+    chatState = Chat.initialChatState();
+    body.innerHTML =
+      `<div id="chat-surface" class="chat-surface">
        <div id="chat-scroll" class="chat-scroll"></div>
-       <form id="chat-form" class="chat-form">
-         <textarea id="chat-input" class="chat-input" rows="2"
-           placeholder="Message the agent\u2026  (Enter to send, Shift+Enter for newline)"></textarea>
-         <button type="submit" class="chat-send">Send</button>
-       </form>
+       <div class="chat-composer">
+         <div id="chat-controls" class="chat-controls" hidden></div>
+         <div id="chat-file-tray" class="chat-file-tray" hidden></div>
+         <form id="chat-form" class="chat-form">
+           <textarea id="chat-input" class="chat-input" rows="2"
+             placeholder="Message the agent\u2026  (Enter to send, Shift+Enter for newline)"></textarea>
+           <button type="submit" class="chat-send">Send</button>
+         </form>
+         <div id="chat-composer-error" class="chat-composer-error" role="status"></div>
+       </div>
      </div>`;
-  const form = document.getElementById('chat-form');
-  const input = document.getElementById('chat-input');
-  form.onsubmit = (e)=>{ e.preventDefault(); sendChatMessage(); };
-  input.addEventListener('keydown', (e)=>{
-    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendChatMessage(); }
+    setupChatControls();
+    const form = document.getElementById('chat-form');
+    const input = document.getElementById('chat-input');
+    form.onsubmit = (e)=>{ e.preventDefault(); void sendChatMessage(); };
+    input.addEventListener('keydown', (e)=>{
+      if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); void sendChatMessage(); }
+    });
+    input.focus();
+    renderChatSurface();
   });
-  input.focus();
-  renderChatSurface();
 }
 
 function renderChatSurface(){
   const scroll = document.getElementById('chat-scroll');
   if(scroll && Chat && chatState)
     Chat.renderChat(scroll, chatState, {onPermission: sendPermission});
+  syncChatControls();
 }
 
-function sendChatMessage(){
+async function sendChatMessage(){
   const input = document.getElementById('chat-input');
-  if(!input) return;
+  if(!input || chatSending) return;
   const text = input.value;
   if(!text.trim()) return;
   if(!(canSendInput && canSendInput(collabState))) return;
-  // 0-RTT local echo, then send the whole turn as one input frame. The
-  // connector's structured session encodes it as a user message for the agent.
-  Chat.appendUserTurn(chatState, text);
-  renderChatSurface();
-  if(termWS && termWS.readyState===1 && curSession)
-    termWS.send(JSON.stringify({type:'input',session_id:curSession,data:text}));
-  input.value = '';
-  input.focus();
+  const options = Chat.buildTurnOptions(
+    chatControls, chatControlValues, chatAttachments);
+  const attachmentMetadata = Object.values(chatAttachments).flat().map(file => ({
+    name:file.name, type:file.type, size:file.size,
+  }));
+  chatSending = true;
+  try{
+    if(!termInputSender || !termInputSender.push(text, options)){
+      setChatComposerError('The session is reconnecting. Try again in a moment.');
+      return;
+    }
+    Chat.appendUserTurn(chatState, text, attachmentMetadata);
+    for(const key of Object.keys(chatAttachments)) chatAttachments[key] = [];
+    renderAttachmentTray();
+    setChatComposerError('');
+    input.value = '';
+    renderChatSurface();
+    input.focus();
+  }finally{ chatSending = false; }
 }
 
 function sendPermission(requestId, allow){
@@ -684,11 +882,17 @@ function sendPermission(requestId, allow){
 
 function handleChatFrame(f){
   // Lazily switch into chat mode on the first structured event, then fold it.
+  const frameEpoch = chatModeEpoch;
+  const frameSession = curSession;
   const apply = ()=>{
-    if(!chatState) return;
-    let ev;
-    try{ ev = JSON.parse(f.data); }catch(_){ return; }
-    Chat.applyEvent(chatState, ev);
+    if(frameEpoch !== chatModeEpoch || frameSession !== curSession || !chatState) return;
+    const folded = Chat.foldEventPayload(chatState, f.data, f.type === 'restore');
+    chatState = folded.state;
+    const events = folded.events;
+    if(events.some((event) => event.ev === 'session.config')){
+      chatControlValues = Chat.reconcileControlValues(
+        chatControls, chatControlValues, chatState.config);
+    }
     renderChatSurface();
   };
   if(structuredMode && chatState){ apply(); }
@@ -703,10 +907,12 @@ async function openAgent(agentId, name){
   collabState = null;
   keyboardRequester = null;
   curAgentId = agentId;
-  // Leaving any previous structured chat surface: fall back to terminal until
-  // the new session proves structured (first kind:'event' frame).
-  structuredMode = false;
-  chatState = null;
+  const structuredCapability = currentAgentCapability();
+  const expectsStructured = ui.supportsStructuredChat(structuredCapability);
+  // Leaving any previous structured chat surface: reset it before opening the
+  // next agent. Reported generic capabilities can opt the next surface into chat
+  // immediately; a canonical event remains the backward-compatible fallback.
+  resetStructuredChat();
   renderFleet();
   const wasReplayOrHistory = replayMode || !!document.getElementById('replaybar') ||
     !!document.querySelector('#term [data-replay]') ||
@@ -721,7 +927,7 @@ async function openAgent(agentId, name){
     termWS.send(JSON.stringify({type:'detach',session_id:curSession}));
   document.getElementById('termhead').innerHTML =
     `<span class="title">@<span class="handle">${esc(name)}</span></span>
-     <span class="sep">\u2014</span><span class="muted" id="livetag">live terminal</span>
+     <span class="sep">\u2014</span><span class="muted" id="livetag">${expectsStructured ? 'live chat' : 'live terminal'}</span>
      <span class="spacer"></span>
      <span id="collab" class="collab"></span>
      <span id="stat" class="status"></span>`;
@@ -735,8 +941,9 @@ async function openAgent(agentId, name){
   const resumed = !!sess;
   if(!sess) sess = await api(`/api/agents/${agentId}/sessions`,{method:'POST'});
   curSession = sess.id;
+  if(expectsStructured) await enterChatMode();
   if(resumed){ const lt = document.getElementById('livetag');
-    if(lt) lt.textContent = 'resumed live session'; }
+    if(lt) lt.textContent = expectsStructured ? 'resumed live chat' : 'resumed live session'; }
   wantOpen = true;
   connectTermWS();
 }
@@ -754,9 +961,12 @@ function connectTermWS(){
   termWS = new WebSocket(`${proto}://${location.host}/ws/term`);
   const inputWS = termWS;
   const inputSession = curSession;
-  termInputSender = ui.createTerminalInputSender(data => {
-    if(inputWS.readyState===1 && inputSession===curSession)
-      inputWS.send(JSON.stringify({type:'input',session_id:inputSession,data:data}));
+  termInputSender = ui.createTerminalInputSender((data, options) => {
+    if(inputWS.readyState!==1 || inputSession!==curSession) return false;
+    inputWS.send(JSON.stringify({
+      type:'input', session_id:inputSession, data:data, options:options,
+    }));
+    return true;
   });
   termWS.onopen = ()=>{
     reconnectDelay = 500;
@@ -917,8 +1127,7 @@ function clearAgentView(){
   curAgentId = null;
   curSession = null;
   collabState = null;
-  structuredMode = false;
-  chatState = null;
+  resetStructuredChat();
   replay = null;
   replayAgentId = null;
   replayAgentName = '';

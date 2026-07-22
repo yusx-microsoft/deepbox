@@ -159,3 +159,32 @@ test('terminal input sender survives lease transitions but closes with its socke
   sender.push('stale socket');
   assert.deepEqual(sent, ['before', 'after reacquire']);
 });
+
+
+test('runtimeOptions accepts detailed capability objects', () => {
+  assert.deepEqual(ui.runtimeOptions([
+    'claude-code',
+    {runtime: 'copilot-cli-structured', installed: true, features: {}},
+    {runtime: 'missing', installed: false},
+    null,
+  ]), ['claude-code', 'copilot-cli-structured']);
+});
+
+
+test('terminal input sender forwards optional structured turn options', () => {
+  const sent = [];
+  const sender = ui.createTerminalInputSender((data, options) => {
+    sent.push({data, options});
+    return true;
+  });
+  assert.equal(sender.push('hello', {model: 'sonnet'}), true);
+  assert.deepEqual(sent, [{data: 'hello', options: {model: 'sonnet'}}]);
+});
+
+
+test('recognizes structured chat only from reported capability facts', () => {
+  assert.equal(ui.supportsStructuredChat({features:{structured:true}}), true);
+  assert.equal(ui.supportsStructuredChat({structured:true}), false);
+  assert.equal(ui.supportsStructuredChat({features:{structured:false}}), false);
+  assert.equal(ui.supportsStructuredChat(null), false);
+});

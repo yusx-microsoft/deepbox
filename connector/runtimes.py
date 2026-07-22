@@ -127,6 +127,44 @@ def validate_argv(argv: list[str]) -> list[str]:
 
 
 @dataclass(frozen=True)
+class RuntimeControl:
+    """Declarative structured-chat control owned by a runtime adapter.
+
+    ``kind`` is either ``select`` or ``file``.  The browser sees only the
+    public presentation fields; connector-only ``flag`` decides how a valid
+    value is translated to argv.  A file control without a flag is embedded
+    into the prompt as UTF-8 text.
+    """
+
+    key: str
+    label: str
+    kind: str
+    scope: str = "turn"
+    choices: tuple[str, ...] = ()
+    flag: str | None = None
+    accept: str = ""
+    max_files: int = 4
+    max_total_bytes: int = 1024 * 1024
+
+    def public(self) -> dict:
+        value = {
+            "key": self.key,
+            "label": self.label,
+            "kind": self.kind,
+            "scope": self.scope,
+        }
+        if self.choices:
+            value["choices"] = list(self.choices)
+        if self.kind == "file":
+            value.update({
+                "accept": self.accept,
+                "max_files": self.max_files,
+                "max_total_bytes": self.max_total_bytes,
+            })
+        return value
+
+
+@dataclass(frozen=True)
 class RuntimeAdapter:
     """Metadata + command construction rules for a single runtime.
 
@@ -164,6 +202,11 @@ class RuntimeAdapter:
     # ``prompt_argv`` + the prompt text to argv for each turn.
     per_turn: bool = False
     prompt_argv: tuple[str, ...] = ()
+    # Controls are rendered generically by the browser and validated again by
+    # the connector. Model remains a first-class adapter field because it is
+    # shared by terminal and structured runtimes.
+    model_scope: str = "session"
+    controls: tuple[RuntimeControl, ...] = ()
 
     @property
     def executable(self) -> str:
@@ -172,16 +215,28 @@ class RuntimeAdapter:
     def capabilities(self, *, installed: bool, version: str | None = None,
                      path: str | None = None) -> dict:
         """Return an opaque JSON-serialisable capability blob for the server."""
+        controls = []
+        if self.structured and self.models:
+            controls.append({
+                "key": "model",
+                "label": "Model",
+                "kind": "select",
+                "scope": self.model_scope,
+                "choices": list(self.models),
+            })
+        controls.extend(control.public() for control in self.controls)
         return {
             "runtime": self.id,
             "installed": installed,
             "version": version,
-            "path": path,
+            # Deliberately omit the connector-local executable path. The
+            # server/browser need capabilities, not workstation filesystem data.
             "features": {
                 "models": list(self.models),
                 "permission_modes": sorted(self.permission_modes),
                 "structured": self.structured,
                 "per_turn": self.per_turn,
+                "controls": controls,
             },
         }
 
@@ -212,6 +267,19 @@ def register(adapter: RuntimeAdapter, *, replace: bool = False) -> RuntimeAdapte
             if not isinstance(tok, str) or tok == "":
                 raise InvalidCommandError(
                     f"permission mode {mode!r} has invalid token {tok!r}")
+    seen_controls = set()
+    for control in adapter.controls:
+        if control.kind not in {"select", "file"}:
+            raise InvalidCommandError(
+                f"control {control.key!r} has unsupported kind {control.kind!r}")
+        if control.scope not in {"session", "turn"}:
+            raise InvalidCommandError(
+                f"control {control.key!r} has unsupported scope {control.scope!r}")
+        if not control.key or control.key in seen_controls or control.key == "model":
+            raise InvalidCommandError(f"invalid or duplicate control key {control.key!r}")
+        seen_controls.add(control.key)
+        if control.flag:
+            validate_argv([adapter.executable, control.flag])
     _REGISTRY[adapter.id] = adapter
     return adapter
 
@@ -277,6 +345,49 @@ def build_command(runtime_id: str, *, model: str | None = None,
         argv += list(adapter.permission_modes[mode_key])
 
     return validate_argv(argv)
+
+
+def sanitize_options(runtime_id: str, raw: object) -> dict:
+    """Return only adapter-declared, type-safe structured turn options."""
+    adapter = get(runtime_id)
+    if not isinstance(raw, dict):
+        return {}
+    clean = {}
+    model = raw.get("model")
+    if isinstance(model, str) and model in adapter.models:
+        clean["model"] = model
+    for control in adapter.controls:
+        value = raw.get(control.key)
+        if control.kind == "select":
+            if isinstance(value, str) and value in control.choices:
+                clean[control.key] = value
+        elif control.kind == "file" and isinstance(value, list):
+            # Payload shape/size/base64 are validated by StructuredAgentSession.
+            # Preserve the full list so an over-limit request is rejected rather
+            # than silently truncating the user's files.
+            clean[control.key] = value
+    return clean
+
+
+def control_argv(runtime_id: str, options: dict,
+                 attachment_paths: tuple[str, ...] = ()) -> list[str]:
+    """Translate sanitized adapter controls (other than model) to argv."""
+    adapter = get(runtime_id)
+    argv = []
+    for control in adapter.controls:
+        if control.kind == "select" and control.flag:
+            value = options.get(control.key)
+            if value in control.choices:
+                argv.extend((control.flag, value))
+        elif control.kind == "file" and control.flag:
+            for path in attachment_paths:
+                argv.extend((control.flag, path))
+    return argv
+
+
+def attachment_control(runtime_id: str) -> RuntimeControl | None:
+    """Return the adapter's single file control, if declared."""
+    return next((c for c in get(runtime_id).controls if c.kind == "file"), None)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +475,17 @@ register(RuntimeAdapter(
     model_flag="--model",
     models=("sonnet", "opus", "haiku"),
     structured=True,
+    model_scope="session",
+    controls=(
+        RuntimeControl(
+            key="reasoning_effort", label="Reasoning", kind="select",
+            scope="session", choices=("low", "medium", "high", "xhigh", "max"),
+            flag="--effort"),
+        RuntimeControl(
+            key="attachments", label="Files", kind="file", scope="turn",
+            accept="text/*,.md,.json,.yaml,.yml,.py,.js,.ts,.tsx,.css,.html",
+            max_files=4, max_total_bytes=1024 * 1024),
+    ),
     permission_modes={
         # Default trusts this session (auto-accept edits) per product decision.
         "": ("--permission-mode", "acceptEdits"),
@@ -392,6 +514,18 @@ register(RuntimeAdapter(
     structured=True,
     per_turn=True,
     prompt_argv=("-p",),
+    model_scope="turn",
+    controls=(
+        RuntimeControl(
+            key="reasoning_effort", label="Reasoning", kind="select",
+            scope="turn",
+            choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+            flag="--reasoning-effort"),
+        RuntimeControl(
+            key="attachments", label="Files", kind="file", scope="turn",
+            flag="--attachment", max_files=4,
+            max_total_bytes=4 * 1024 * 1024),
+    ),
     permission_modes={
         # Non-interactive turns require tool auto-approval; make it the default.
         "": ("--allow-all-tools",),

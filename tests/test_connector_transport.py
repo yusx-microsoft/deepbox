@@ -3,6 +3,7 @@ import asyncio
 import json
 import unittest
 
+from connector.client import websocket_connect_options
 from connector.ipc import LoopbackChannel
 from connector.transport import ProtocolError, TransportSession
 
@@ -268,3 +269,17 @@ class TransportLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebSocketPolicyTests(unittest.TestCase):
+    def test_connector_policy_tolerates_slow_pongs_and_bounds_frames(self):
+        options = websocket_connect_options()
+        self.assertEqual(20, options["ping_interval"])
+        self.assertGreater(options["ping_timeout"], options["ping_interval"])
+        self.assertEqual(5, options["close_timeout"])
+        self.assertGreaterEqual(options["max_size"], 16 * 1024 * 1024)
+
+    def test_each_call_gets_an_isolated_options_mapping(self):
+        first = websocket_connect_options()
+        first["ping_timeout"] = 1
+        self.assertEqual(60, websocket_connect_options()["ping_timeout"])

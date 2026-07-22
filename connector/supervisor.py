@@ -317,7 +317,11 @@ class SessionSupervisor:
             if p:
                 first_delivery = self._spool.record_input_once(client_input_id)
                 if first_delivery:
-                    p.write(frame.get("data", ""))
+                    writer = getattr(p, "write_turn", None)
+                    if callable(writer):
+                        writer(frame.get("data", ""), frame.get("options"))
+                    else:
+                        p.write(frame.get("data", ""))
                 self.emit({
                     "type": "input_ack",
                     "agent_id": aid,
@@ -428,12 +432,38 @@ class SessionSupervisor:
 
         if structured:
             adapter = runtimes.get(runtime_id)
+            attachment = runtimes.attachment_control(runtime_id)
+
+            def sanitize_options(value):
+                return runtimes.sanitize_options(runtime_id, value)
+
+            def build_turn_command(options, attachment_paths):
+                model = options.get("model") or info.get("model")
+                base = resolve_cmd(
+                    runtime_id, info.get("launch_cmd"), model=model,
+                    permission_mode=info.get("permission_mode"))
+                return base + runtimes.control_argv(
+                    runtime_id, options, attachment_paths)
+
             from .agent_session import TRANSLATORS
             p = StructuredAgentSession(
                 cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows,
                 translate=TRANSLATORS.get(runtime_id),
-                per_turn=getattr(adapter, "per_turn", False),
-                prompt_argv=list(getattr(adapter, "prompt_argv", ())))
+                per_turn=adapter.per_turn,
+                prompt_argv=list(adapter.prompt_argv),
+                lazy_start=True,
+                command_builder=build_turn_command,
+                option_sanitizer=sanitize_options,
+                attachment_key=attachment.key if attachment else None,
+                attachment_mode=("flag" if attachment and attachment.flag
+                                 else "prompt" if attachment else None),
+                attachment_max_files=attachment.max_files if attachment else 0,
+                attachment_max_bytes=(attachment.max_total_bytes
+                                      if attachment else 0),
+                session_option_keys=tuple(
+                    (["model"] if adapter.model_scope == "session" else []) +
+                    [control.key for control in adapter.controls
+                     if control.scope == "session"]))
         else:
             p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
                            cols=cols, rows=rows)

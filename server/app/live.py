@@ -289,6 +289,40 @@ class LiveRegistry:
             merged.append([round(base + float(t), 6), ev[1], ev[2]])
         return merged
 
+    def event_restore(self, session_id: str, max_bytes: int = 4 * 1024 * 1024):
+        """Return a bounded JSONL restore payload for structured chat events.
+
+        Terminal restore is a pyte screen snapshot, which cannot reconstruct a
+        structured chat timeline.  Canonical events already live in the same
+        durable recording stream under ``kind == "event"``; replay their tail
+        verbatim so the browser can fold it through the normal chat reducer.
+        Invalid rows are ignored rather than poisoning a WebSocket attach.
+        """
+        if self.durable_loader is None or max_bytes <= 0:
+            return ""
+        rows = self._load_durable(session_id)
+        kept = []
+        size = 0
+        for _elapsed, kind, data in reversed(rows):
+            if kind != "event" or not isinstance(data, str):
+                continue
+            try:
+                parsed = json.loads(data)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            encoded = json.dumps(parsed, separators=(",", ":"), ensure_ascii=False)
+            row_size = len(encoded.encode("utf-8")) + 1
+            if size + row_size > max_bytes:
+                # The replay is a contiguous suffix. Once a valid row no
+                # longer fits, older rows must not leapfrog it into the tail.
+                break
+            kept.append(encoded)
+            size += row_size
+        kept.reverse()
+        return "\n".join(kept)
+
     def drop(self, session_id: str):
         ls = self._sessions.pop(session_id, None)
         if ls:

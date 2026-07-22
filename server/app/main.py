@@ -1396,9 +1396,14 @@ async def ws_term(ws: WebSocket):
                 ls.subscribers.add(conn)
                 hub.watch(conn, sess.id, sess.agent_id)
                 await _broadcast_collaboration(s, sess)
-                # 1) instantly restore the current screen for this viewer
-                await ws.send_json({"type": "restore", "session_id": sess.id,
-                                    "data": ls.restore_bytes()})
+                # 1) Restore terminal pixels or the structured event timeline.
+                event_data = live_registry.event_restore(sess.id)
+                if event_data:
+                    await ws.send_json({"type": "restore", "session_id": sess.id,
+                                        "kind": "event", "data": event_data})
+                else:
+                    await ws.send_json({"type": "restore", "session_id": sess.id,
+                                        "data": ls.restore_bytes()})
                 if ls.ended:
                     await ws.send_json({"type": "status", "session_id": sess.id,
                                         "state": "ended", "code": ls.exit_code})

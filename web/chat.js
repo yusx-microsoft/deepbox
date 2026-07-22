@@ -12,11 +12,26 @@
 (function (global) {
   'use strict';
 
+  function parseEventPayload(data) {
+    const events = [];
+    for (const line of String(data || '').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event && typeof event === 'object' && !Array.isArray(event))
+          events.push(event);
+      } catch (_) { /* one bad durable row must not hide later valid rows */ }
+    }
+    return events;
+  }
+
   function initialChatState() {
     return {
       items: [],          // ordered: {kind, ...} render items
       pendingPermission: null, // {request_id, tool, input} or null
       status: null,       // last status note
+      config: {},          // connector-confirmed model/reasoning values
+      configured: false,   // true once a session.config event is observed
       _openAssistant: null, // index of the assistant bubble accreting deltas
     };
   }
@@ -94,9 +109,39 @@
           result: ev.result || null,
         });
         break;
-      case 'user.echo':
-        state.items.push({ kind: 'user', text: ev.text || '' });
+      case 'session.config':
+        // Each event is the connector-confirmed effective scalar set for this
+        // turn. Replace rather than merge so returning to a runtime default can
+        // clear a previously selected option.
+        state.config = ev.options && typeof ev.options === 'object'
+          ? Object.assign({}, ev.options) : {};
+        state.configured = true;
         break;
+      case 'user.echo': {
+        const text = ev.text || '';
+        // A live browser renders its own turn immediately. Reconcile the
+        // connector echo with that optimistic row; a restore has no local row
+        // and therefore appends the durable user event.
+        let local = null;
+        for (let i = state.items.length - 1; i >= 0; i--) {
+          const item = state.items[i];
+          if (item.kind === 'user' && item.local && item.text === text) {
+            local = item;
+            break;
+          }
+        }
+        if (local) {
+          local.local = false;
+          local.attachments = Array.isArray(ev.attachments) ? ev.attachments : local.attachments;
+        } else {
+          state.items.push({
+            kind: 'user', text,
+            attachments: Array.isArray(ev.attachments) ? ev.attachments : [],
+            local: false,
+          });
+        }
+        break;
+      }
       case 'error':
         state.items.push({ kind: 'error', text: ev.message || 'error' });
         break;
@@ -106,11 +151,102 @@
     return state;
   }
 
+  // A restore frame is an authoritative snapshot of the bounded durable event
+  // window. Rebuild from an empty state instead of appending it to live rows.
+  function foldEventPayload(state, payload, replace) {
+    const next = replace ? initialChatState() : (state || initialChatState());
+    const events = parseEventPayload(payload);
+    for (const event of events) applyEvent(next, event);
+    return { state: next, events };
+  }
+
+  // Coalesce concurrent lazy mounts (for example, a cold burst of event frames)
+  // without serializing later mounts after the current one has settled.
+  function createSingleFlight() {
+    let pending = null;
+    return function run(task) {
+      if (!pending) {
+        pending = Promise.resolve().then(task).finally(() => { pending = null; });
+      }
+      return pending;
+    };
+  }
+
   // Append a local user turn immediately (0-RTT echo) before the agent replies.
-  function appendUserTurn(state, text) {
+  function appendUserTurn(state, text, attachments) {
     state._openAssistant = null;
-    state.items.push({ kind: 'user', text: text });
+    state.items.push({
+      kind: 'user', text: text,
+      attachments: Array.isArray(attachments) ? attachments : [],
+      local: true,
+    });
     return state;
+  }
+
+  // Normalize the adapter-owned capability blob into a small generic control
+  // schema. Runtime IDs never appear here: a new adapter can add these widgets
+  // without a frontend code change.
+  function controlsFromCapability(capability) {
+    const features = capability && capability.features ? capability.features : capability;
+    if (!features || !Array.isArray(features.controls)) return [];
+    const seen = new Set();
+    const controls = [];
+    for (const raw of features.controls.slice(0, 16)) {
+      if (!raw || typeof raw !== 'object') continue;
+      const key = typeof raw.key === 'string' ? raw.key.trim() : '';
+      const kind = raw.kind;
+      if (!/^[a-z][a-z0-9_]{0,63}$/.test(key) || seen.has(key) ||
+          (kind !== 'select' && kind !== 'file')) continue;
+      const control = {
+        key,
+        kind,
+        label: typeof raw.label === 'string' && raw.label.trim()
+          ? raw.label.trim().slice(0, 80) : key,
+        scope: raw.scope === 'session' ? 'session' : 'turn',
+      };
+      if (kind === 'select') {
+        control.choices = Array.isArray(raw.choices)
+          ? raw.choices.filter((value) => typeof value === 'string' && value.length <= 100)
+            .slice(0, 64) : [];
+        if (!control.choices.length) continue;
+      } else {
+        control.accept = typeof raw.accept === 'string' ? raw.accept.slice(0, 500) : '';
+        control.max_files = Math.max(1, Math.min(8, Number(raw.max_files) || 1));
+        control.max_total_bytes = Math.max(1, Math.min(8 * 1024 * 1024,
+          Number(raw.max_total_bytes) || 1024 * 1024));
+      }
+      seen.add(key);
+      controls.push(control);
+    }
+    return controls;
+  }
+
+  function reconcileControlValues(controls, values, confirmed) {
+    const next = Object.assign({}, values && typeof values === 'object' ? values : {});
+    confirmed = confirmed && typeof confirmed === 'object' ? confirmed : {};
+    for (const control of controls || []) {
+      if (control.kind !== 'select') continue;
+      const value = confirmed[control.key];
+      if (control.choices.includes(value)) next[control.key] = value;
+      else delete next[control.key];
+    }
+    return next;
+  }
+
+  function buildTurnOptions(controls, values, attachments) {
+    const result = {};
+    values = values && typeof values === 'object' ? values : {};
+    attachments = attachments && typeof attachments === 'object' ? attachments : {};
+    for (const control of controls || []) {
+      if (control.kind === 'select') {
+        const value = values[control.key];
+        if (control.choices.includes(value)) result[control.key] = value;
+      } else if (control.kind === 'file') {
+        const files = attachments[control.key];
+        if (Array.isArray(files) && files.length) result[control.key] = files;
+      }
+    }
+    return result;
   }
 
   // --- DOM rendering (browser only) ---------------------------------------
@@ -129,7 +265,7 @@
     const log = el('div', 'chat-log');
     for (const it of state.items) {
       if (it.kind === 'user') {
-        log.appendChild(bubble('user', it.text));
+        log.appendChild(bubble('user', it.text, it.attachments));
       } else if (it.kind === 'assistant') {
         log.appendChild(bubble('assistant', it.text));
       } else if (it.kind === 'tool') {
@@ -149,10 +285,18 @@
     log.scrollTop = log.scrollHeight;
   }
 
-  function bubble(role, text) {
+  function bubble(role, text, attachments) {
     const b = el('div', 'chat-msg chat-' + role);
     b.appendChild(el('div', 'chat-role', role));
     b.appendChild(el('div', 'chat-text', text || ''));
+    if (Array.isArray(attachments) && attachments.length) {
+      const row = el('div', 'chat-message-files');
+      for (const file of attachments) {
+        if (!file || typeof file.name !== 'string') continue;
+        row.appendChild(el('span', 'chat-message-file', file.name));
+      }
+      b.appendChild(row);
+    }
     return b;
   }
 
@@ -198,7 +342,11 @@
     return m;
   }
 
-  const api = { initialChatState, applyEvent, appendUserTurn, renderChat };
+  const api = {
+    parseEventPayload, initialChatState, applyEvent, foldEventPayload,
+    createSingleFlight, appendUserTurn, renderChat,
+    controlsFromCapability, reconcileControlValues, buildTurnOptions,
+  };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.DeepboxChat = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

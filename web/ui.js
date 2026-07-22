@@ -36,7 +36,9 @@
     if(!Array.isArray(capabilities)) return [];
     const seen = new Set();
     const options = [];
-    for(const value of capabilities){
+    for(const capability of capabilities){
+      if(capability && typeof capability === 'object' && capability.installed === false) continue;
+      const value = typeof capability === 'string' ? capability : capability?.runtime;
       if(typeof value !== 'string') continue;
       const id = value.trim();
       if(!id || seen.has(id)) continue;
@@ -92,9 +94,11 @@
 
   function createTerminalInputSender(send){
     let active = true;
-    function push(data){
+    function push(data, options){
       const chunk = String(data == null ? '' : data);
-      if(active && chunk) send(chunk);
+      if(!active || !chunk) return false;
+      const result = options === undefined ? send(chunk) : send(chunk, options);
+      return result !== false;
     }
     // Kept for the lease transition API: there is no buffered input to drop.
     function discard(){}
@@ -103,6 +107,11 @@
   }
 
   // ---- status helpers ----------------------------------------------------
+
+  function supportsStructuredChat(capability){
+    return !!(capability && typeof capability === 'object' &&
+      capability.features && capability.features.structured === true);
+  }
 
   // Devbox connection state -> {state, label}. Text is never colour-only.
   function devboxStatus(devbox){
@@ -281,6 +290,7 @@
     windowsConnectorCommand: windowsConnectorCommand,
     unixConnectorCommand: unixConnectorCommand,
     shouldFocusTerminal: shouldFocusTerminal,
+    supportsStructuredChat: supportsStructuredChat,
     createTerminalInputSender: createTerminalInputSender,
     devboxStatus: devboxStatus,
     agentStatus: agentStatus,

@@ -35,62 +35,52 @@
 
 ---
 
-## 3. 三层架构：PTY / Recorder / Viewer 彻底解耦
+## 3. 三层架构：Local Agent / Recorder / Viewer 解耦
 
-```
-┌── devbox (connector) ──┐   ┌────────── server ──────────┐   ┌── 多个浏览器/设备 ──┐
-│                        │   │                            │   │                     │
-│  PtySession (claude)   │   │  LiveSession (每会话一个)  │   │  Viewer A (笔记本)  │
-│  ▲ 持久存活            │   │   ├ pyte 屏幕(权威当前态)  │◀─▶│  Viewer B (手机)    │
-│  │ 不随浏览器关闭      │──▶│   ├ SQLite durable frames  │   │  Viewer C (同事)    │
-│  │ 只随 connector 进程 │out│   └ subscribers 广播集合   │   │                     │
-│  └ 或 terminate 结束    │   │                            │   │  attach → restore   │
-└────────────────────────┘   └────────────────────────────┘   │        → live 流    │
-      源头(source of truth      平台价值层(持久化/记录/广播)      └─────────────────────┘
-      of the LIVE process)      (viewer 来去自由，会话不受影响)
-```
+本地 session 的活进程始终在 connector：它可以是 `PtySession`，也可以是
+`StructuredAgentSession`。Server 的 `LiveSession`/durable recording 负责可靠接收、持久化和广播；
+多个浏览器只负责渲染，可随时 attach/detach。
 
 **三条铁律：**
-1. **PTY 是活进程的唯一源头**，住在 devbox 的 connector 进程里，**只随 connector 进程存亡或显式
-   terminate 而结束**——浏览器开关、网络抖动都不影响它。
-2. **Server 是持久化与广播层**：把 PTY 输出喂进 pyte（维护当前屏幕）+ 落盘（DVR）+ 广播给
-   所有观看者。**这是平台相对本地的增值所在。**
-3. **Viewer 完全无状态、可随意来去**：attach 时先收到一帧 `restore`（当前屏幕），随后收 live 流。
+
+1. **本地 agent process 是 live execution 的唯一源头**：住在 connector，不随浏览器关闭；只在
+   connector/session supervisor 退出或用户显式 terminate 时结束。
+2. **Server 是 opaque 持久化与广播层**：`kind: output` 的 terminal bytes 进入 pyte screen；
+   `kind: event` 的 canonical JSON 保持 opaque。两者都先 durable commit 再 ACK/广播。
+3. **Viewer 可随意来去**：terminal attach 收 screen restore；structured attach 收 bounded event JSONL
+   restore。之后两者都继续接 live frame。
 
 ---
 
-## 4. 生命周期语义：detach ≠ terminate（关键修正）
+## 4. 生命周期语义：detach != terminate
 
-当前 P0 代码里"浏览器发 close → connector 杀 PTY"是**错的**，它让平台退化成本地终端。
-新语义：
-
-| 动作 | 触发 | 对 PTY 的影响 | 用途 |
+| 动作 | 触发 | 对本地 agent process 的影响 | 用途 |
 |---|---|---|---|
-| **attach** | 浏览器打开会话 | 确保 PTY 存在（幂等） | 开始观看 |
-| **detach** | 浏览器关闭/离开 | **无**——PTY 继续活 | 离开但不结束（换设备、临时关闭） |
-| **terminate** | 用户显式"结束会话" | 杀掉 CLI 进程 | 真的不要了 |
-| （connector 进程死） | devbox 重启等 | PTY 随之消失，会话标记 ended | 不可抗力；未来可用 tmux 兜底 |
+| **attach** | 浏览器打开会话 | 幂等确保 PTY/structured session 存在 | 开始观看 |
+| **detach** | 浏览器关闭/离开 | **无**，本地 process 继续活 | 换 tab/设备或暂时离开 |
+| **terminate** | 用户显式结束 | 结束 CLI process | 真正关闭会话 |
+| connector/supervisor 退出 | devbox 重启等 | 托管 process 消失，会话离线/结束 | 当前进程边界 |
 
-会话状态机：`starting → live →（detach 多次、attach 多次）→ ended`。
+会话状态仍是 `starting -> live -> (detach/attach 任意多次) -> ended`。
 
 ---
 
-## 5. Server 端：LiveSession 与 Recorder
+## 5. Server 端：LiveSession、Recorder 与两种 restore
 
-每个 `session_id` 对应一个内存 `LiveSession`（pyte 当前屏幕 + subscribers），持久事实源则是
-SQLite `RecordingFrame`。connector 的 output 先按 `(session_id, pty_instance_id, seq)` durable
-commit，server 才发送 ACK；随后同一字节更新 pyte 并广播给 live viewer。相同 seq + payload hash
-可安全 re-ACK，冲突 payload fail closed。
+每个 `session_id` 对应内存 `LiveSession`，持久事实源是 SQLite `RecordingFrame`。connector frame
+先按 `(session_id, pty_instance_id, seq)` durable commit，Server 才发送 ACK；相同 seq + payload hash
+可安全 re-ACK，不同 payload fail closed。
 
-**重连 restore**（attach 时）：`serialize_screen(screen)` 把 pyte 当前屏幕转成一段
-"清屏 + 逐行带 SGR 颜色重绘 + 定位光标"的字节，发一帧 `restore`。server 进程重启后，
-`LiveRegistry` 通过 `durable_events()` 重建 screen，再接收 connector 磁盘 spool 精确补发的缺失 seq。
-connector transport 重启不杀 PTY；supervisor/sessiond 重启目前仍会结束其托管的 PTY。
+- **Terminal restore**：`kind: output` 更新 pyte；attach 时 `serialize_screen()` 返回清屏、SGR 重绘和
+  光标定位 bytes。Server 重启后从 durable output 重建 screen。
+- **Structured restore**：`kind: event` 不进入 pyte。`LiveRegistry.event_restore()` 从 durable rows
+  反向选择最新的、最多 4 MiB 的完整 JSON-object event，恢复原顺序后组成 JSONL；浏览器把该有界 replay
+  window 当作权威快照，先 reset state 再逐行 fold 进 canonical reducer。坏 durable row 被隔离，不影响后续有效事件。
+- **可靠续传**：connector 本地 spool 精确补发 Server 尚未 ACK 的 seq；transport 重连不结束已托管
+  process。`pty_instance_id` 在 structured path 中是沿用的协议 identity，不表示存在真实 PTY。
 
-**DVR 回放**：`GET /api/sessions/{id}/recording` 从 durable rows 动态导出 asciicast v2；
-`GET /api/sessions/{id}/replay` 返回 events、checkpoint 和 metadata。web seek 先恢复目标时间之前最近的
-checkpoint，再应用 cursor 更大的 output event，因而相同时间戳的帧也不会漏放。Session retention
-支持 `none/7d/30d/permanent`：过期 payload 被清空且 checkpoint 删除，但 seq/hash ledger 保留。
+DVR API 继续从 durable rows 导出 recording/replay；terminal checkpoint/seek 只消费 `kind: output`。
+Retention/secure erase 对两种 frame payload 使用同一策略。
 
 ### 5.1 Cut 8 workspace 与协作状态
 
@@ -113,48 +103,46 @@ recording ledger 或 connector spool。SQLite 文件备份因此同时包含 wor
 
 ## 6. 帧协议（browser attach + connector protocol v3）
 
-浏览器 → server：
+浏览器 -> Server：
 - `attach {session_id}`（原 `open`）
-- `input {session_id, data}`
+- `input {session_id, data, options?, client_input_id}`；`options` 对 Server opaque
 - `resize {session_id, cols, rows}`
-- `detach {session_id}`（原 `close`，**不再杀 PTY**）
-- `terminate {session_id}`（显式结束；Cut 8 要求有效 keyboard holder）
-- `keyboard_acquire / keyboard_renew / keyboard_release {session_id}`
-- `keyboard_handoff {session_id, target_user_id}`（仅当前 holder）
+- `detach {session_id}`（原 `close`，不结束本地 process）
+- `terminate {session_id}`（显式结束；要求有效 keyboard holder）
+- `keyboard_acquire / keyboard_renew / keyboard_release / keyboard_handoff`
 
-server → 浏览器：
-- `collaboration {session_id, participants, keyboard}`（角色、在线参与者与 lease 快照）
-- `keyboard_request {session_id, requester_user_id, requester_username}`（忙时通知当前 holder）
-- `restore {session_id, data}`（attach 后立即，当前屏幕重绘字节）
-- `output {session_id, data}`（live 流）
-- `status {session_id, state}`（live/ended/offline）
-- `exit {session_id, code}`
+Server -> 浏览器：
+- `restore {session_id, data}`：terminal screen bytes
+- `restore {session_id, kind: "event", data}`：structured canonical-event JSONL tail
+- `output {session_id, kind, data}`：live `output` bytes 或一个 `event`
+- `status` / `exit` / `collaboration` / `keyboard_request`
 
-server ↔ connector：
-- `open`（幂等，确保 PTY 在）
-- `output {session_id, pty_instance_id, seq, kind, data}` → durable commit 后 `ack`
-- gap → `resend_from`；相同 seq/hash → duplicate re-ACK；不同 payload → fail closed
-- `input {client_input_id}` → connector 去重并返回 `input_ack`
-- `resize` / `terminate`；detach **不**下发任何东西给 connector
+Server <-> connector：
+- `open`：幂等确保本地 PTY/structured session 存在
+- `output {session_id, pty_instance_id, seq, kind, data}`：durable commit 后 `ack`
+- gap -> `resend {expected_seq}`；旧 `pty_instance_id` -> `fence`；相同 seq/hash -> duplicate re-ACK；
+  不同 payload -> fail closed
+- `input {client_input_id, data, options?}`：connector 去重并返回 `input_ack`
+- `resize` / `terminate`；detach 不下发给 connector
 
 ---
 
-## 7. 浏览器端：自动重连 + 无缝还原
+## 7. 浏览器端：自动重连与 surface-aware restore
 
-- WS 断开 → 指数退避自动重连 → 重连后自动 `attach` → 收 `restore` 重画 → 继续。
-- 点击 agent 时先查询其 session 列表；若 connector 上报了仍存活的 session，则打开最新的
-  `live` session，而不是每次点击都静默创建新 session。
-- restore 使用 `pyte.HistoryScreen`：先重建有限 scrollback，再精确重画当前 viewport 与光标。
-- 用户视角：**网络抖一下，画面顿一下就回来了，server 离线期间输出也会由 connector 补发**。
-- 换设备：登录 → 打开同一会话 → attach → restore，看到的就是另一台设备上的当前进度。
-- 会话已 ended：显示最终画面 + "回放历史"入口（DVR）。
+- WS 断开后指数退避重连并自动 attach。
+- Structured agent 在任何 output 到达前就根据 capability 进入 native chat，避免 tab 切回时停留在
+  terminal 的 “resumed live session”；event restore 与 live event 走同一个 reducer。
+- Terminal agent 继续使用 pyte screen restore、有限 scrollback 和 xterm live bytes。
+- 打开 agent 时优先复用 connector 仍存活的最新 live session，不静默新建重复 session。
+- Server 离线期间的两类 output 都由 connector spool 在重连后补发；ended session 仍可查看最终状态/DVR。
 
 ---
 
 ## 8. 有界性与成本
 
-- **restore 快照有界**：只和屏幕尺寸有关（~几十 KB），与会话时长无关。
-- **pyte 内存有界**：屏幕 + 有限 scrollback。
+- **terminal restore 有界**：只和屏幕尺寸有关（~几十 KB），与会话时长无关。
+- **structured restore 有界**：只返回最多 4 MiB 的完整 canonical-event JSONL tail。
+- **pyte 内存有界**：只用于 terminal 的屏幕 + 有限 scrollback。
 - **durable recording**：SQLite rows 随时长线性增长，且位于 ACK 路径以提供 delivery 语义；
   默认 30d retention，也可选 none/7d/permanent。清理 payload 不删除 dedup identity row。
 - checkpoint interval 有界 seek 重放量；checkpoint 含完整屏幕，因此 retention 清理同步删除相关 checkpoint。
@@ -167,9 +155,10 @@ server ↔ connector：
 
 ## 9. 验收标准（这一步做没做好，就看这几条）
 
-1. 打开 Claude,让它输出一屏 → **关掉浏览器标签** → 重新打开会话 → **立刻看到关闭前的
-   完整画面**,并能继续对话。（会话没死、无损重连）
-2. 拔网/刷新 → 自动重连 → 画面无缝恢复,输入不丢。
-3. 两个浏览器窗口同开一个会话 → 在 A 里打字,B 里**实时**看到。（多观看者）
-4. 结束会话后,能**回放**整个过程。（DVR）
-5. 全程 server 不理解内容、不持有 key —— 只是忠实的记录者与广播者。
+1. Structured agent 切到其他 tab 再回来 → 立即回到 native chat，durable timeline 恢复后继续 live，
+   不停在 “resumed live session”。
+2. Terminal agent 关闭 tab 再打开 → 立刻看到此前完整 screen，并可继续对话。
+3. 拔网/刷新或 connector abnormal close → 自动重连，已 ACK output 不重复、未 ACK output 从 spool 补发。
+4. 两个浏览器窗口同开一个会话 → 一个窗口输入，另一个实时看到；keyboard lease 仍只有一个 holder。
+5. 结束会话后仍可读最终 recording/DVR；retention 与 secure erase 同时适用于 output/event frame。
+6. 全程 Server 不运行模型、不持有 key、不解释 runtime options，只做规则、记录与广播。

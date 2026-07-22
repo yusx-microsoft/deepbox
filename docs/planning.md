@@ -1,5 +1,7 @@
 # deepbox 项目实施计划
 
+> 2026-07-22 架构更新：structured-first native chat 是当前主线；本文较早的 PTY-only 表述仅描述 terminal fallback。当前协议与 UI 事实见 `design.md` §5、`implementation.md` §9。
+
 > 状态：Draft v1.1（Remote Connectivity Cut 已实现）
 >
 > 本计划从当前 P0 出发，按依赖关系把 deepbox 推进到可日常使用、可内部 Beta、再到可公开部署。

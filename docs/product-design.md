@@ -1,6 +1,7 @@
 # deepbox 产品设计
 
-> 状态：Draft v2 — 已落地首个 UI foundation（Terminal-first Switchboard），
+> 状态：Draft v2（历史 UI foundation）。2026-07-22 起产品主线为 structured-first native chat，PTY/xterm 仅作 fallback；当前事实见 `design.md` §5 与 `implementation.md` §9。
+> 已落地首个 UI foundation（Terminal-first Switchboard），
 > 见 §7.5。
 >
 > deepbox 是一个面向 AI coding agent 的**持久会话控制平面**。用户把自己 Devbox 上的
