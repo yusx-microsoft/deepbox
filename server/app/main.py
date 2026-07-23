@@ -2,8 +2,10 @@
 WebSocket endpoints (human terminal + devbox connector)."""
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
+import mimetypes
 import os
 import secrets
 import asyncio
@@ -14,17 +16,18 @@ from fastapi import (
     FastAPI, Request, Response, HTTPException, Depends, WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from itsdangerous import URLSafeSerializer, BadSignature
-from sqlalchemy import func, select, text
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session as OrmSession
 
 from . import models
 from .models import (
     User, Devbox, DevboxProject, Token, Agent, Session, Message, BootstrapState,
-    Invitation, Organization, Workspace, Membership, SessionParticipant,
-    KeyboardLease,
+    Invitation, Organization, Workspace, Membership, WorkspaceInvitation,
+    SessionParticipant, KeyboardLease,
     PROTOCOL_VERSION, ROLE_OWNER, ROLE_MEMBER, now,
     WS_ROLE_OWNER, WS_ROLE_ADMIN, WS_ROLE_OPERATOR, WS_ROLE_VIEWER,
     VALID_WS_ROLES,
@@ -49,6 +52,10 @@ from .security import (
     SAFE_METHODS, RateLimiter, RateLimitRule, build_security_headers,
     is_origin_allowed,
 )
+from .identity import (
+    MicrosoftPrincipal, build_microsoft_principal, normalize_email,
+    normalize_tenant_id, normalize_username_hint,
+)
 from . import version as version_info
 
 import logging as _logging
@@ -60,6 +67,9 @@ _api_limiter = RateLimiter(RateLimitRule(settings.rate_limit_api_per_minute, 60)
 _login_limiter = RateLimiter(RateLimitRule(settings.rate_limit_login_per_minute, 60))
 _token_limiter = RateLimiter(RateLimitRule(settings.rate_limit_token_per_minute, 60))
 _RATE_EXEMPT = {"/api/health", "/api/ready", "/api/version", "/api/auth/bootstrap-status"}
+_LOGIN_RATE_PATHS = {
+    "/api/auth/login", "/api/auth/microsoft/start", "/api/auth/microsoft/callback",
+}
 
 
 def _durable_events_loader(session_id: str):
@@ -96,7 +106,7 @@ def observe_capacity(report, *, source: str) -> None:
     )
 
 
-signer = URLSafeSerializer(settings.secret, salt="deepbox-session")
+signer = URLSafeTimedSerializer(settings.secret, salt="deepbox-session")
 
 app = FastAPI(title="deepbox")
 
@@ -106,7 +116,7 @@ async def security_baseline(request: Request, call_next):
     path = request.url.path
     client = request.client.host if request.client else "unknown"
     if settings.rate_limit_enabled and path.startswith("/api/") and path not in _RATE_EXEMPT:
-        if path == "/api/auth/login":
+        if path in _LOGIN_RATE_PATHS:
             limiter, path_class = _login_limiter, "login"
         elif "/tokens" in path or path.endswith("/devboxes"):
             limiter, path_class = _token_limiter, "credentials"
@@ -214,7 +224,9 @@ def current_user(request: Request, s: OrmSession) -> User:
     if not cookie:
         raise HTTPException(401, "not logged in")
     try:
-        data = signer.loads(cookie)
+        data = signer.loads(cookie, max_age=settings.session_ttl_seconds)
+    except SignatureExpired:
+        raise HTTPException(401, "session expired")
     except BadSignature:
         raise HTTPException(401, "bad session")
     user = s.get(User, data.get("uid"))
@@ -260,6 +272,179 @@ def devbox_from_bearer(request: Request, s: OrmSession) -> Devbox:
 
 
 # ---------------------------------------------------------------- auth routes
+def _user_json(user: User) -> dict:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name,
+        "role": user.role,
+        "email": user.email,
+        "auth_provider": user.auth_provider,
+        "disabled": user.disabled_at is not None,
+        "disabled_at": (user.disabled_at.isoformat()
+                        if user.disabled_at else None),
+    }
+
+
+def _set_session_cookie(response: Response, user: User) -> None:
+    response.set_cookie(
+        "deepbox_session", signer.dumps({"uid": user.id}),
+        max_age=settings.session_ttl_seconds,
+        httponly=True, samesite=settings.cookie_samesite,
+        secure=settings.cookie_secure,
+    )
+
+
+def _microsoft_tenant_allowed(principal: MicrosoftPrincipal) -> bool:
+    # The App Service provider's app registration controls supported account
+    # types.  Easy Auth validates the token before these headers reach us.
+    return bool(normalize_tenant_id(principal.tenant_id))
+
+
+def _next_external_username(s: OrmSession, principal: MicrosoftPrincipal) -> str:
+    base = normalize_username_hint(principal.email or principal.display_name)
+    candidate = base
+    suffix = 1
+    while s.scalar(select(User.id).where(User.username == candidate)) is not None:
+        suffix += 1
+        candidate = f"{base[:42]}-{suffix}"
+    return candidate
+
+
+def _microsoft_user(s: OrmSession, principal: MicrosoftPrincipal) -> User:
+    is_owner = principal.email in settings.microsoft_owner_emails
+    user = s.scalar(select(User).where(
+        User.auth_provider == "microsoft",
+        User.external_tenant_id == principal.tenant_id,
+        User.external_subject == principal.subject,
+    ))
+    if user is None:
+        # An allow-listed Microsoft owner may claim a legacy local owner exactly
+        # once.  Prefer an explicit email match, then a sole unlinked owner for
+        # a safe migration from pre-identity deployments.
+        # Linking by email is deliberately limited to an allowlisted owner
+        # claiming an existing local owner account. Ordinary Microsoft users
+        # always get a new external identity and join through invitations.
+        if is_owner and principal.email:
+            user = s.scalar(select(User).where(
+                func.lower(User.email) == principal.email,
+                User.role == ROLE_OWNER,
+                User.external_subject.is_(None),
+            ))
+        if user is None and is_owner:
+            owners = list(s.scalars(select(User).where(
+                User.role == ROLE_OWNER, User.external_subject.is_(None))))
+            if len(owners) == 1:
+                user = owners[0]
+
+        if user is None:
+            user = User(
+                id=new_id(), username=_next_external_username(s, principal),
+                password_hash="!microsoft", display_name=principal.display_name,
+                role=ROLE_OWNER if is_owner else ROLE_MEMBER,
+            )
+            s.add(user)
+        elif is_owner:
+            user.role = ROLE_OWNER
+    elif is_owner:
+        # The deployment allowlist is authoritative even when an identity was
+        # first seen before it was selected as an owner.
+        user.role = ROLE_OWNER
+
+    if principal.email:
+        user.email = principal.email
+    user.auth_provider = "microsoft"
+    user.external_tenant_id = principal.tenant_id
+    user.external_subject = principal.subject
+
+    # Commit the identity first so personal-workspace provisioning can safely
+    # restart its transaction if another first-login request wins the race.
+    try:
+        s.flush()
+        s.commit()
+    except IntegrityError:
+        s.rollback()
+        winner = s.scalar(select(User).where(
+            User.auth_provider == "microsoft",
+            User.external_tenant_id == principal.tenant_id,
+            User.external_subject == principal.subject,
+        ))
+        if winner is None:
+            raise HTTPException(409, "identity conflict")
+        user = winner
+
+    # BootstrapState has its own singleton key and can race for an allow-listed
+    # owner. Retry once after rolling back so the winner can be observed.
+    for attempt in range(2):
+        try:
+            _ensure_personal_workspace(s, user)
+            if user.role == ROLE_OWNER and s.get(BootstrapState, 1) is None:
+                s.add(BootstrapState(id=1, owner_user_id=user.id))
+            s.commit()
+            break
+        except (IntegrityError, OperationalError):
+            s.rollback()
+            if attempt == 1:
+                raise
+            reloaded = s.get(User, user.id)
+            if reloaded is None:
+                raise HTTPException(409, "identity conflict")
+            user = reloaded
+    return user
+
+
+@app.get("/api/auth/config")
+async def auth_config():
+    return {
+        "mode": settings.auth_mode,
+        "password_enabled": settings.password_auth_enabled,
+        "microsoft_enabled": settings.microsoft_auth_enabled,
+        "microsoft_login_url": "/api/auth/microsoft/start",
+        "microsoft_logout_url": "/api/auth/microsoft/logout",
+    }
+
+
+@app.get("/api/auth/microsoft/start")
+async def microsoft_start():
+    if not settings.microsoft_auth_enabled:
+        raise HTTPException(404, "not found")
+    callback = f"{(settings.public_url or '').rstrip('/')}/api/auth/microsoft/callback"
+    from urllib.parse import quote
+    return RedirectResponse(
+        f"/.auth/login/aad?post_login_redirect_uri={quote(callback, safe='')}",
+        status_code=302,
+    )
+
+
+@app.get("/api/auth/microsoft/callback")
+async def microsoft_callback(request: Request, s: OrmSession = Depends(db)):
+    if not settings.microsoft_auth_enabled:
+        raise HTTPException(404, "not found")
+    principal = build_microsoft_principal(request.headers)
+    if principal is None or not _microsoft_tenant_allowed(principal):
+        raise HTTPException(401, "Microsoft sign-in required")
+    user = _microsoft_user(s, principal)
+    if user.disabled_at is not None:
+        raise HTTPException(403, "account disabled")
+    audit_event("auth.microsoft_login", outcome="success",
+                actor_user_id=user.id, request=request)
+    response = RedirectResponse("/", status_code=302)
+    _set_session_cookie(response, user)
+    return response
+
+
+@app.get("/api/auth/microsoft/logout")
+async def microsoft_logout():
+    if not settings.microsoft_auth_enabled:
+        raise HTTPException(404, "not found")
+    from urllib.parse import quote
+    target = quote(f"{(settings.public_url or '').rstrip('/')}/", safe="")
+    response = RedirectResponse(
+        f"/.auth/logout?post_logout_redirect_uri={target}", status_code=302)
+    response.delete_cookie("deepbox_session")
+    return response
+
+
 @app.post("/api/auth/register")
 async def register(request: Request, s: OrmSession = Depends(db)):
     """Development-only self-registration.
@@ -268,6 +453,8 @@ async def register(request: Request, s: OrmSession = Depends(db)):
     onboarding mechanism there. When an invite code is supplied it is redeemed
     atomically and the created user is a member.
     """
+    if not settings.password_auth_enabled:
+        raise HTTPException(403, "password authentication disabled")
     body = await request.json()
     invite_code = (body.get("invite_code") or "").strip()
     username = body["username"].strip()
@@ -330,6 +517,8 @@ def _redeem_invitation(s: OrmSession, invite_code: str, username: str,
 
 @app.post("/api/auth/login")
 async def login(request: Request, s: OrmSession = Depends(db)):
+    if not settings.password_auth_enabled:
+        raise HTTPException(403, "password authentication disabled")
     body = await request.json()
     username = body["username"].strip()
     user = s.scalar(select(User).where(User.username == username))
@@ -346,12 +535,9 @@ async def login(request: Request, s: OrmSession = Depends(db)):
 
 
 def _login_response(user: User) -> JSONResponse:
-    resp = JSONResponse({"id": user.id, "username": user.username,
-                         "display_name": user.display_name, "role": user.role})
-    resp.set_cookie("deepbox_session", signer.dumps({"uid": user.id}),
-                    httponly=True, samesite=settings.cookie_samesite,
-                    secure=settings.cookie_secure)
-    return resp
+    response = JSONResponse(_user_json(user))
+    _set_session_cookie(response, user)
+    return response
 
 
 @app.post("/api/auth/logout")
@@ -364,15 +550,13 @@ async def logout():
 @app.get("/api/me/user")
 async def me_user(request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
-    return {"id": u.id, "username": u.username, "display_name": u.display_name,
-            "role": u.role}
+    return _user_json(u)
 
 
 # ---------------------------------------------------------------- bootstrap
 def _bootstrap_available(s: OrmSession) -> bool:
-    """True only if a bootstrap token is configured, no bootstrap has occurred,
-    and no user exists yet."""
-    if not settings.bootstrap_token_hash:
+    """True only if local bootstrap is enabled, configured, and unused."""
+    if not settings.password_auth_enabled or not settings.bootstrap_token_hash:
         return False
     if s.get(BootstrapState, 1) is not None:
         return False
@@ -391,6 +575,8 @@ async def bootstrap_status(s: OrmSession = Depends(db)):
 async def bootstrap(request: Request, s: OrmSession = Depends(db)):
     """Create the first owner exactly once. Token compared by hash; response
     is a generic 404 for any invalid/unavailable case (no token echo/log)."""
+    if not settings.password_auth_enabled:
+        raise HTTPException(404, "not found")
     if not settings.bootstrap_token_hash:
         raise HTTPException(404, "not found")
     body = await request.json()
@@ -486,12 +672,6 @@ async def revoke_invitation(invitation_id: str, request: Request,
 
 
 # ---------------------------------------------------------------- user mgmt
-def _user_json(u: User) -> dict:
-    return {"id": u.id, "username": u.username, "display_name": u.display_name,
-            "role": u.role, "disabled": u.disabled_at is not None,
-            "disabled_at": u.disabled_at.isoformat() if u.disabled_at else None}
-
-
 def _enabled_owner_count(s: OrmSession, exclude_id: str | None = None) -> int:
     q = select(User).where(User.role == ROLE_OWNER, User.disabled_at.is_(None))
     return sum(1 for u in s.scalars(q).all() if u.id != exclude_id)
@@ -543,10 +723,12 @@ async def enable_user(user_id: str, request: Request, s: OrmSession = Depends(db
 @app.get("/api/workspaces")
 async def list_workspaces(request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
+    # A shared invitation may be a user's first membership.  Personal workspace
+    # creation is therefore keyed by the personal organization, not by whether
+    # the user has any membership at all.
+    _ensure_personal_workspace(s, u)
+    s.commit()
     rows = list_user_workspaces(s, u.id)
-    if not rows:
-        rows = [_ensure_personal_workspace(s, u)]
-        s.commit()
     return [{"id": w.id, "name": w.name, "org_id": w.org_id,
              "role": get_role(s, w.id, u.id), "is_personal": bool(w.is_personal)}
             for w in rows]
@@ -556,7 +738,9 @@ async def list_workspaces(request: Request, s: OrmSession = Depends(db)):
 async def create_workspace(request: Request, s: OrmSession = Depends(db)):
     u = current_user(request, s)
     body = await request.json()
-    name = str(body.get("name") or "Workspace").strip()[:120]
+    name = str(body.get("name") or "").strip()[:120]
+    if not name:
+        raise HTTPException(422, "workspace name required")
     org = Organization(id=new_id(), name=name, owner_user_id=u.id)
     workspace = Workspace(id=new_id(), org_id=org.id, name=name)
     s.add_all([org, workspace, Membership(id=new_id(), workspace_id=workspace.id,
@@ -660,6 +844,250 @@ async def remove_workspace_member(workspace_id: str, user_id: str, request: Requ
     return {"ok": True}
 
 
+def _workspace_invitation_json(invite: WorkspaceInvitation) -> dict:
+    return {
+        "id": invite.id,
+        "workspace_id": invite.workspace_id,
+        "email": invite.email,
+        "role": invite.role,
+        "token_preview": invite.token_preview,
+        "created_at": invite.created_at.isoformat(),
+        "expires_at": invite.expires_at.isoformat(),
+        "accepted_at": invite.accepted_at.isoformat() if invite.accepted_at else None,
+        "revoked_at": invite.revoked_at.isoformat() if invite.revoked_at else None,
+    }
+
+
+def _active_workspace_invitation(s: OrmSession, token: str) -> WorkspaceInvitation:
+    token = str(token or "").strip()
+    if not token:
+        raise HTTPException(404, "invitation not found")
+    invite = s.scalar(select(WorkspaceInvitation).where(
+        WorkspaceInvitation.token_hash == hash_token(token)))
+    if (invite is None or invite.revoked_at is not None or
+            invite.accepted_at is not None or _as_utc(invite.expires_at) <= now()):
+        raise HTTPException(404, "invitation not found")
+    return invite
+
+
+@app.get("/api/workspaces/{workspace_id}/invitations")
+async def list_workspace_invitations(workspace_id: str, request: Request,
+                                     s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    _require_workspace(s, actor.id, workspace_id, WS_ROLE_ADMIN)
+    rows = s.scalars(select(WorkspaceInvitation).where(
+        WorkspaceInvitation.workspace_id == workspace_id)
+        .order_by(WorkspaceInvitation.created_at.desc())).all()
+    return [_workspace_invitation_json(item) for item in rows]
+
+
+@app.post("/api/workspaces/{workspace_id}/invitations")
+async def create_workspace_invitation(workspace_id: str, request: Request,
+                                      s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    actor_role = _require_workspace(s, actor.id, workspace_id, WS_ROLE_ADMIN)
+    workspace = s.get(Workspace, workspace_id)
+    if workspace is None:
+        raise HTTPException(404, "not found")
+    body = await request.json()
+    email = normalize_email(body.get("email"))
+    role = str(body.get("role") or WS_ROLE_VIEWER)
+    if email is None:
+        raise HTTPException(422, "valid email required")
+    if role not in (WS_ROLE_VIEWER, WS_ROLE_OPERATOR, WS_ROLE_ADMIN):
+        raise HTTPException(422, "invalid role")
+    if role == WS_ROLE_ADMIN and actor_role != WS_ROLE_OWNER:
+        raise HTTPException(403, "owner role required")
+
+    # Reissuing an invite invalidates earlier unclaimed links for this account.
+    # Retry from a fresh transaction if another reissue changed our WAL snapshot.
+    for attempt in range(3):
+        issued_at = now()
+        full, token_hash, preview = new_token()
+        invite = WorkspaceInvitation(
+            id=new_id(), workspace_id=workspace_id, email=email, role=role,
+            token_hash=token_hash, token_preview=preview,
+            created_by_user_id=actor.id, created_at=issued_at,
+            expires_at=issued_at + dt.timedelta(
+                days=settings.workspace_invitation_ttl_days),
+        )
+        try:
+            # This is the first write. Concurrent reissues serialize here, and
+            # the partial unique index is the final invariant backstop.
+            s.execute(update(WorkspaceInvitation).where(
+                WorkspaceInvitation.workspace_id == workspace_id,
+                WorkspaceInvitation.email == email,
+                WorkspaceInvitation.accepted_at.is_(None),
+                WorkspaceInvitation.revoked_at.is_(None),
+            ).values(revoked_at=issued_at))
+            s.add(invite)
+            s.commit()
+            break
+        except (IntegrityError, OperationalError):
+            s.rollback()
+            if attempt == 2:
+                raise
+            actor_role = _require_workspace(
+                s, actor.id, workspace_id, WS_ROLE_ADMIN)
+            if role == WS_ROLE_ADMIN and actor_role != WS_ROLE_OWNER:
+                raise HTTPException(403, "owner role required")
+    base = (settings.public_url or "").rstrip("/")
+    join_url = f"{base}/#workspace-invite={full}" if base else f"/#workspace-invite={full}"
+    audit_event("workspace.invitation_created", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=workspace_id,
+                details={"role": role}, request=request)
+    return {**_workspace_invitation_json(invite), "join_url": join_url}
+
+
+@app.delete("/api/workspaces/{workspace_id}/invitations/{invitation_id}")
+async def revoke_workspace_invitation(workspace_id: str, invitation_id: str,
+                                      request: Request, s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    _require_workspace(s, actor.id, workspace_id, WS_ROLE_ADMIN)
+    invite = s.get(WorkspaceInvitation, invitation_id)
+    if invite is None or invite.workspace_id != workspace_id:
+        raise HTTPException(404, "not found")
+    if invite.accepted_at is None and invite.revoked_at is None:
+        invite.revoked_at = now()
+        s.commit()
+    audit_event("workspace.invitation_revoked", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=workspace_id,
+                request=request)
+    return {"ok": True}
+
+
+@app.post("/api/workspace-invitations/preview")
+async def preview_workspace_invitation(request: Request,
+                                           s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    body = await request.json()
+    invite = _active_workspace_invitation(s, body.get("token"))
+    workspace = s.get(Workspace, invite.workspace_id)
+    if workspace is None:
+        raise HTTPException(404, "invitation not found")
+    local, _, domain = invite.email.partition("@")
+    masked = f"{local[:1]}***@{domain}" if domain else "***"
+    audit_event("workspace.invitation_previewed", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=workspace.id,
+                request=request)
+    return {"workspace_id": workspace.id, "workspace_name": workspace.name,
+            "email_hint": masked, "role": invite.role,
+            "expires_at": invite.expires_at.isoformat()}
+
+
+@app.post("/api/workspace-invitations/accept")
+async def accept_workspace_invitation(request: Request,
+                                      s: OrmSession = Depends(db)):
+    actor = current_user(request, s)
+    body = await request.json()
+    raw_token = str(body.get("token") or "").strip()
+    actor_email = normalize_email(actor.email)
+    if not actor_email:
+        raise HTTPException(403, "Microsoft account email required")
+
+    token_hash = hash_token(raw_token)
+    claimed = False
+    for attempt in range(3):
+        accepted_at = now()
+        try:
+            result = s.execute(update(WorkspaceInvitation).where(
+                WorkspaceInvitation.token_hash == token_hash,
+                WorkspaceInvitation.email == actor_email,
+                WorkspaceInvitation.accepted_at.is_(None),
+                WorkspaceInvitation.revoked_at.is_(None),
+                WorkspaceInvitation.expires_at > accepted_at,
+            ).values(
+                accepted_at=accepted_at,
+                accepted_by_user_id=actor.id,
+            ))
+            if result.rowcount == 1:
+                claimed = True
+                break
+            s.rollback()
+            break
+        except OperationalError:
+            s.rollback()
+            if attempt == 2:
+                raise
+
+    if not claimed:
+        invite = s.scalar(select(WorkspaceInvitation).where(
+            WorkspaceInvitation.token_hash == token_hash))
+        # Replaying the same successfully accepted link is idempotent.  It
+        # never recreates a membership that was subsequently removed.
+        if (invite is not None
+                and invite.accepted_by_user_id == actor.id
+                and invite.email == actor_email):
+            existing = s.scalar(select(Membership).where(
+                Membership.workspace_id == invite.workspace_id,
+                Membership.user_id == actor.id,
+            ))
+            workspace = s.get(Workspace, invite.workspace_id)
+            if existing is not None and workspace is not None:
+                return {
+                    "workspace": {
+                        "id": workspace.id, "name": workspace.name,
+                    },
+                    "role": existing.role,
+                    "already_member": True,
+                }
+        if (invite is not None
+                and invite.accepted_at is None
+                and invite.revoked_at is None
+                and _as_utc(invite.expires_at) > now()
+                and invite.email != actor_email):
+            raise HTTPException(403, "invitation email does not match")
+        raise HTTPException(404, "invitation not found")
+
+    invite = s.scalar(select(WorkspaceInvitation).where(
+        WorkspaceInvitation.token_hash == token_hash))
+    if invite is None:
+        s.rollback()
+        raise HTTPException(404, "invitation not found")
+    workspace = s.get(Workspace, invite.workspace_id)
+    if workspace is None:
+        s.rollback()
+        raise HTTPException(404, "invitation not found")
+
+    existing = s.scalar(select(Membership).where(
+        Membership.workspace_id == invite.workspace_id,
+        Membership.user_id == actor.id,
+    ))
+    already_member = existing is not None
+    if existing is None:
+        candidate = Membership(
+            id=new_id(), workspace_id=invite.workspace_id,
+            user_id=actor.id, role=invite.role,
+        )
+        try:
+            # Keep the invitation claim if another path concurrently adds the
+            # same membership; only the nested insertion is rolled back.
+            with s.begin_nested():
+                s.add(candidate)
+                s.flush()
+            existing = candidate
+        except IntegrityError:
+            existing = s.scalar(select(Membership).where(
+                Membership.workspace_id == invite.workspace_id,
+                Membership.user_id == actor.id,
+            ))
+            if existing is None:
+                s.rollback()
+                raise
+            already_member = True
+    s.commit()
+    audit_event("workspace.invitation_accepted", actor_user_id=actor.id,
+                resource_type="workspace", resource_id=invite.workspace_id,
+                details={"role": invite.role}, request=request)
+    return {
+        "workspace": {
+            "id": workspace.id, "name": workspace.name,
+        },
+        "role": existing.role,
+        "already_member": already_member,
+    }
+
+
 def _agent_json(a: Agent) -> dict:
     return {"id": a.id, "handle": a.handle, "display_name": a.display_name,
             "runtime": a.runtime, "local_project_id": a.local_project_id,
@@ -715,18 +1143,59 @@ async def _push_agent_directory(devbox_id: str) -> None:
 
 
 def _ensure_personal_workspace(s: OrmSession, u: User) -> Workspace:
-    membership = s.scalar(select(Membership).where(Membership.user_id == u.id)
-                          .order_by(Membership.created_at))
-    if membership:
-        return s.get(Workspace, membership.workspace_id)
-    org = Organization(id=new_id(), name=f"{u.username} personal",
-                       is_personal=True, owner_user_id=u.id)
-    workspace = Workspace(id=new_id(), org_id=org.id, name="Personal",
-                          is_personal=True)
-    s.add_all([org, workspace, Membership(id=new_id(), workspace_id=workspace.id,
-                                          user_id=u.id, role=WS_ROLE_OWNER)])
-    s.flush()
-    return workspace
+    """Return the user's singleton personal workspace, creating it safely.
+
+    Partial unique indexes enforce the singleton invariant.  SQLite WAL can
+    reject a read-to-write upgrade when another request wins the same race, so
+    retry from a fresh transaction after either a uniqueness or snapshot error.
+    Callers invoke this before making other request-scoped mutations.
+    """
+    user_id = u.id
+    username = u.username
+    for attempt in range(3):
+        try:
+            workspace = s.scalar(select(Workspace).join(
+                Organization, Workspace.org_id == Organization.id).where(
+                    Organization.owner_user_id == user_id,
+                    Organization.is_personal.is_(True),
+                    Workspace.is_personal.is_(True),
+                ))
+            if workspace is None:
+                org = s.scalar(select(Organization).where(
+                    Organization.owner_user_id == user_id,
+                    Organization.is_personal.is_(True),
+                ))
+                if org is None:
+                    org = Organization(
+                        id=new_id(), name=f"{username}'s organization",
+                        is_personal=True, owner_user_id=user_id)
+                    s.add(org)
+                    s.flush()
+                workspace = s.scalar(select(Workspace).where(
+                    Workspace.org_id == org.id,
+                    Workspace.is_personal.is_(True),
+                ))
+                if workspace is None:
+                    workspace = Workspace(
+                        id=new_id(), org_id=org.id, name="Personal",
+                        is_personal=True)
+                    s.add(workspace)
+                    s.flush()
+            membership = s.scalar(select(Membership).where(
+                Membership.workspace_id == workspace.id,
+                Membership.user_id == user_id,
+            ))
+            if membership is None:
+                s.add(Membership(
+                    id=new_id(), workspace_id=workspace.id,
+                    user_id=user_id, role=WS_ROLE_OWNER))
+                s.flush()
+            return workspace
+        except (IntegrityError, OperationalError):
+            s.rollback()
+            if attempt == 2 or s.get(User, user_id) is None:
+                raise
+    raise RuntimeError("personal workspace provisioning retry exhausted")
 
 
 def _require_workspace(s: OrmSession, user_id: str, workspace_id: str,
@@ -1468,7 +1937,8 @@ async def ws_term(ws: WebSocket):
         return
     cookie = ws.cookies.get("deepbox_session")
     try:
-        uid = signer.loads(cookie)["uid"] if cookie else None
+        uid = signer.loads(
+            cookie, max_age=settings.session_ttl_seconds)["uid"] if cookie else None
     except BadSignature:
         uid = None
     if not uid:
@@ -1697,6 +2167,8 @@ async def ws_term(ws: WebSocket):
 
 
 # ---------------------------------------------------------------- static web
+# Windows can register .js as text/plain; nosniff then makes the SPA unbootable.
+mimetypes.add_type("application/javascript", ".js")
 if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 

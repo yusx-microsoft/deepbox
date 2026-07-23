@@ -89,10 +89,13 @@ def test_shell_and_static_assets_are_always_revalidated():
     _main, client = build_app()
     shell = client.get("/")
     helper = client.get("/static/ui.js")
+    entrypoint = client.get("/static/app.js")
     assert shell.status_code == 200
     assert helper.status_code == 200
+    assert entrypoint.status_code == 200
     assert shell.headers["cache-control"] == "no-cache"
     assert helper.headers["cache-control"] == "no-cache"
+    assert entrypoint.headers["content-type"].startswith("application/javascript")
 
 
 def test_production_cookie_mutation_requires_allowed_origin():
@@ -121,6 +124,8 @@ def test_production_login_rate_limit_returns_retry_after():
     })
     assert limited.status_code == 429
     assert int(limited.headers["retry-after"]) >= 1
+    microsoft_callback = fresh.get("/api/auth/microsoft/callback")
+    assert microsoft_callback.status_code == 429
 
 
 def test_owner_can_securely_erase_recording_payload_and_checkpoints():

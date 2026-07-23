@@ -295,6 +295,55 @@
       normalize(a && a.devbox_name).indexOf(needle) !== -1);
   }
 
+  // ---- workspaces --------------------------------------------------------
+
+  function selectWorkspace(workspaces, preferredId){
+    const list = Array.isArray(workspaces) ? workspaces : [];
+    if(!list.length) return null;
+    const preferred = list.find(w => w && w.id === preferredId);
+    if(preferred) return preferred;
+    return list.find(w => w && w.is_personal) || list[0];
+  }
+
+  function devboxesForWorkspace(devboxes, workspaceId){
+    const list = Array.isArray(devboxes) ? devboxes : [];
+    return list.filter(d => d && d.workspace_id === workspaceId);
+  }
+
+  function canAdminWorkspace(role){
+    return role === 'owner' || role === 'admin';
+  }
+
+  function workspaceInvitationCopy(preview){
+    const data = preview || {};
+    const name = String(data.workspace_name || 'workspace');
+    const role = String(data.role || 'member');
+    const emailHint = String(data.email_hint || 'the invited account');
+    return {
+      title: 'Join ' + name,
+      description: 'You were invited as ' + role +
+        '. Every member can access all devboxes and agents in this workspace. Invitation: ' +
+        emailHint + '.',
+    };
+  }
+
+  function workspaceAcceptanceCopy(result){
+    const data = result || {};
+    const workspace = data.workspace || {};
+    const name = String(workspace.name || 'this workspace');
+    const role = String(data.role || 'member');
+    if(data.already_member === true){
+      return {
+        title: 'Already a member',
+        description: 'You already have ' + role + ' access to ' + name + '.',
+      };
+    }
+    return {
+      title: 'Workspace joined',
+      description: 'You now have ' + role + ' access to ' + name + '.',
+    };
+  }
+
   // ---- command palette ---------------------------------------------------
 
   // Build the command list from the current view model. Pure data only; the
@@ -384,6 +433,11 @@
     filterDevboxes: filterDevboxes,
     flattenAgents: flattenAgents,
     filterAgents: filterAgents,
+    selectWorkspace: selectWorkspace,
+    devboxesForWorkspace: devboxesForWorkspace,
+    canAdminWorkspace: canAdminWorkspace,
+    workspaceInvitationCopy: workspaceInvitationCopy,
+    workspaceAcceptanceCopy: workspaceAcceptanceCopy,
     commandItems: commandItems,
     filterCommands: filterCommands,
     moveSelection: moveSelection,

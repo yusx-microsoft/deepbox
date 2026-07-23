@@ -1,110 +1,89 @@
-# Onboarding: bootstrap, roles, invitations (P1 Cut 1)
+# Onboarding and account management
 
-This document is the operator reference for how the **first owner** is created
-and how additional users are onboarded. It covers the exact routes, environment
-variables, the threat model, and step-by-step operator instructions.
+Deepbox has two identity paths and two different invitation types:
 
-## Roles
+- **Local account invitation**: a deployment owner creates a new password account.
+- **Workspace invitation**: a workspace owner/admin grants an existing or future Microsoft identity access to one workspace.
 
-There are exactly two roles:
+The browser reads `GET /api/auth/config` and only shows the sign-in methods enabled by `DEEPBOX_AUTH_MODE`:
 
-- `owner` — full control: mint/list/revoke invitations, list users, disable and
-  re-enable members.
-- `member` — a regular user created via an invitation (or via dev registration).
+| Mode | Local password | Microsoft Easy Auth | Intended use |
+|---|---:|---:|---|
+| `local` | yes | no | local development and the safe default |
+| `hybrid` | yes | yes | migrating an existing deployment |
+| `microsoft` | no | yes | Microsoft-only Azure deployment |
 
-The first bootstrap user is an `owner`. Every invitee is a `member`.
+`microsoft` and `hybrid` are safe only behind correctly configured Azure App Service Easy Auth. A directly reachable ASGI server must stay in `local` mode because client-supplied `X-MS-CLIENT-PRINCIPAL*` headers are not an identity boundary.
 
-These are **account administration roles**, distinct from Cut 8 workspace roles. Every user gets a
-personal workspace with workspace role `owner`; a workspace owner/admin can add existing enabled
-users as `viewer`, `operator`, `admin`, or `owner`. Workspace roles control resource visibility and
-terminal input, but never grant global invitation/user administration. See
-[`implementation.md`](implementation.md#72-cut-8workspace角色与协作).
+## 1. First deployment owner (local mode)
 
-### Upgrading a pre-onboarding database
+When the database has no bootstrap owner, open the root page. The setup panel asks for a username, display name, and password, then calls:
 
-The additive migration gives legacy users the `member` role; it deliberately does
-**not** guess which existing account should become Owner. Before exposing an
-upgraded instance, stop the app and promote one verified account directly in its
-SQLite database:
-
-```sql
-UPDATE user SET role = 'owner' WHERE username = '<verified-user>';
+```text
+POST /api/bootstrap
 ```
 
-Back up the database first, verify exactly one intended row changed, and then
-restart the app. Do not enable public registration or try to use bootstrap on a
-database that already contains users.
+This route works exactly once and creates the first deployment-level owner. It is separate from workspace roles.
 
-## Environment variables
+## 2. Local password-account onboarding
 
-| Variable | Purpose |
-|---|---|
-| `DEEPBOX_BOOTSTRAP_TOKEN` | One-time token used to create the first owner. Only its SHA-256 hash is held in `Settings`; the plaintext env var is cleared from the process after load and is never stored, logged, or echoed. Remove after first-owner setup. |
-| `DEEPBOX_REGISTRATION_ENABLED` | Self-service `/api/auth/register`. **Production must keep this `false`.** Invitations are the production onboarding mechanism. Defaults to `false` in production, `true` in development. |
+Production should keep public self-registration disabled:
 
-## Routes
+```env
+DEEPBOX_REGISTRATION_ENABLED=false
+```
 
-| Method | Route | Auth | Purpose |
-|---|---|---|---|
-| `GET`  | `/api/auth/bootstrap-status` | none | Safe boolean `{"available": bool}`. Never echoes the token/hash. |
-| `POST` | `/api/auth/bootstrap` | bootstrap token | Create the first owner exactly once. Generic `404` for any invalid/unavailable case. |
-| `POST` | `/api/auth/register` | none / invite | Dev self-register (when enabled) or redeem an invite (`invite_code`). Invitees become members. |
-| `POST` | `/api/invitations` | owner | Mint an invitation with bounded TTL. Returns plaintext token **exactly once**. |
-| `GET`  | `/api/invitations` | owner | List invitation metadata (no token/hash). |
-| `DELETE` | `/api/invitations/{id}` | owner | Revoke an unredeemed invitation. |
-| `GET`  | `/api/users` | owner | List users. |
-| `POST` | `/api/users/{id}/disable` | owner | Disable a member. Cannot leave zero enabled owners. |
-| `POST` | `/api/users/{id}/enable` | owner | Re-enable a user. |
+A deployment owner can create an account invitation from **Manage users**. The server returns a plaintext invitation code and join link once; the database stores only a SHA-256 hash plus a short preview. The recipient opens the link, chooses a username/password, and redeems the invitation atomically. Invalid, expired, revoked, exhausted, and conflicting claims all return the same opaque response.
 
-## Threat model
+These local account invitations do **not** add workspace access. Add the account as an existing member from the workspace manager afterward.
 
-- **Token secrecy.** The bootstrap token and invitation tokens exist in plaintext
-  only transiently: the bootstrap token plaintext never leaves the operator/env
-  and is dropped after config load; an invitation's plaintext is returned exactly
-  once at mint time. The database stores **only SHA-256 hashes**. Logs never
-  contain tokens or hashes.
-- **Single first owner.** Bootstrap is guarded by a persistent, concurrency-safe
-  latch: the `bootstrap_state` singleton row (`id=1`) is inserted in the **same
-  transaction** as the owner user. The unique primary key means that under
-  concurrent attempts exactly one commit wins; the others fail the unique
-  constraint and receive a generic `404`. Any pre-existing user also makes
-  bootstrap unavailable.
-- **No enumeration.** Wrong bootstrap token, already-bootstrapped, existing
-  users, and malformed input all return an identical generic `404 not found`.
-- **One-time invitations.** Redemption is a single conditional `UPDATE` that
-  requires `redeemed_at IS NULL AND revoked_at IS NULL AND expires_at > <claim
-  time>`, so an invite is single-use, cannot be redeemed after expiry, and cannot
-  be redeemed after revoke. Invalid/expired/used codes return a generic `404`.
-- **Account disable.** Disabled users cannot log in or use existing browser
-  sessions. Active browser and connector WebSockets are closed with code `4001`,
-  and connector bearer tokens owned by the account stop authorizing requests.
-  The system refuses to disable the last enabled owner (including self-lockout).
+## 3. Microsoft account sign-in
 
-## Operator steps
+On an Azure deployment configured per [azure-deployment.md](azure-deployment.md):
 
-### First deploy — create the first owner
+1. Select **Continue with Microsoft**.
+2. Deepbox redirects through `/.auth/login/aad`; App Service validates the provider response.
+3. `/api/auth/microsoft/callback` maps the injected tenant + subject to a Deepbox user and issues a time-limited `deepbox_session` cookie.
+4. Deepbox stores no Microsoft access or refresh token.
 
-1. In production keep `DEEPBOX_REGISTRATION_ENABLED=false`.
-2. Set `DEEPBOX_BOOTSTRAP_TOKEN` to a long random value in the Server Host `.env`.
-3. Start the server. `GET /api/auth/bootstrap-status` reports `available: true`
-   while there are no users.
-4. Open the web UI at `/`; the first-owner setup form appears. Enter the
-   bootstrap token, username, and password to create the owner.
-5. **Remove `DEEPBOX_BOOTSTRAP_TOKEN`** from the environment and restart. Once a
-   user exists, bootstrap is permanently unavailable regardless of the token.
+New external users become deployment members and receive a personal workspace. Emails listed in `DEEPBOX_MICROSOFT_OWNER_EMAILS` become deployment owners; during migration, an allow-listed identity may claim the sole unlinked local owner. Keep this allow-list narrow and normalized.
 
-### Inviting members
+## 4. Create and share a workspace
 
-1. As owner, open the **Owner** section in the web UI.
-2. Mint an invitation (optional note, bounded TTL in hours). The plaintext code
-   and a prefilled invite URL (`/#invite=<code>`) are shown **once** — copy them.
-3. Send the URL to the invitee. The code is carried in the URL fragment, which is
-   never sent to HTTP access logs, and is removed from the address bar as soon as
-   the page loads. The invite form stays prefilled in memory; the invitee chooses
-   a username/password and registers as a member.
-4. Revoke unused invitations any time from the same section.
+Any signed-in user can create another workspace. Its creator is the workspace `owner`. The left panel renders:
 
-### Managing members
+```text
+Workspace
+  Devbox
+    Agent
+```
 
-- List users, disable a misbehaving member (their sessions immediately stop
-  working), and re-enable later. Owners cannot disable the last enabled owner.
+Every member can discover the Devboxes and Agents inside that workspace. Permissions are role-based:
+
+- `viewer`: observe workspace resources and sessions
+- `operator`: viewer rights plus input/message operations
+- `admin`: manage members and invite `viewer`/`operator` users
+- `owner`: admin rights, may grant `admin`, and is protected as the last owner
+
+Open the workspace manager to either add an existing enabled username or create an email invitation. A workspace invitation is single-use, expires after `DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS`, can be revoked, and is bound to a normalized email. Reissuing an invitation for the same workspace/email invalidates the prior pending link.
+
+The token remains in `#workspace-invite=...` so it is not sent in the initial HTTP request. The UI stores it in `sessionStorage` across the Microsoft OAuth redirect, previews it with `POST /api/workspace-invitations/preview`, and accepts it with `POST /api/workspace-invitations/accept`. The signed-in account email must match exactly.
+
+## 5. Disable or re-enable users
+
+Deployment owners can disable or re-enable accounts from **Manage users**. Disabling rejects new requests and login attempts and actively closes that user's current WebSocket connections. Workspace membership alone never grants deployment-owner controls.
+
+## 6. Recommended production settings
+
+```env
+DEEPBOX_ENV=production
+DEEPBOX_REGISTRATION_ENABLED=false
+DEEPBOX_COOKIE_SECURE=true
+DEEPBOX_COOKIE_SAMESITE=lax
+DEEPBOX_INVITATION_TTL_HOURS=72
+DEEPBOX_INVITATION_MAX_USES=1
+DEEPBOX_SESSION_TTL_SECONDS=28800
+DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS=7
+```
+
+Also set `DEEPBOX_ALLOWED_ORIGINS` to exact trusted HTTPS origins and configure a stable `DEEPBOX_SECRET`. For Microsoft sign-in, follow the Easy Auth trust-boundary and secret-handling checklist in [azure-deployment.md](azure-deployment.md).

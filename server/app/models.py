@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 from sqlalchemy import (
     create_engine, String, Text, ForeignKey, DateTime, JSON, Integer, Float,
-    UniqueConstraint, inspect, text, event,
+    UniqueConstraint, Index, inspect, text, event,
 )
 from sqlalchemy.orm import (
     DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker,
@@ -48,11 +48,23 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "user"
+    __table_args__ = (
+        Index(
+            "uq_user_external_identity",
+            "auth_provider", "external_tenant_id", "external_subject",
+            unique=True,
+            sqlite_where=text("external_subject IS NOT NULL"),
+        ),
+    )
     id: Mapped[str] = mapped_column(String, primary_key=True)
     username: Mapped[str] = mapped_column(String, unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String)
     display_name: Mapped[str] = mapped_column(String)
     role: Mapped[str] = mapped_column(String, default=ROLE_MEMBER)
+    email: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    auth_provider: Mapped[str] = mapped_column(String, default="local")
+    external_tenant_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    external_subject: Mapped[str | None] = mapped_column(String, nullable=True)
     disabled_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
@@ -242,6 +254,14 @@ class RecordingCheckpoint(Base):
 
 class Organization(Base):
     __tablename__ = "organization"
+    __table_args__ = (
+        Index(
+            "uq_personal_organization_owner",
+            "owner_user_id",
+            unique=True,
+            sqlite_where=text("is_personal = 1"),
+        ),
+    )
     id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String)
     is_personal: Mapped[bool] = mapped_column(Integer, default=0)
@@ -255,6 +275,14 @@ class Organization(Base):
 
 class Workspace(Base):
     __tablename__ = "workspace"
+    __table_args__ = (
+        Index(
+            "uq_personal_workspace_organization",
+            "org_id",
+            unique=True,
+            sqlite_where=text("is_personal = 1"),
+        ),
+    )
     id: Mapped[str] = mapped_column(String, primary_key=True)
     org_id: Mapped[str] = mapped_column(
         ForeignKey("organization.id", ondelete="CASCADE"))
@@ -281,6 +309,35 @@ class Membership(Base):
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
 
     workspace: Mapped[Workspace] = relationship(back_populates="memberships")
+
+
+class WorkspaceInvitation(Base):
+    """Single-use, email-bound invitation to a shared workspace."""
+    __tablename__ = "workspace_invitation"
+    __table_args__ = (
+        Index(
+            "uq_workspace_invitation_open_email",
+            "workspace_id", "email",
+            unique=True,
+            sqlite_where=text(
+                "accepted_at IS NULL AND revoked_at IS NULL"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspace.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String, index=True)
+    role: Mapped[str] = mapped_column(String, default=WS_ROLE_VIEWER)
+    token_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    token_preview: Mapped[str] = mapped_column(String)
+    created_by_user_id: Mapped[str] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime)
+    accepted_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    accepted_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("user.id", ondelete="SET NULL"), nullable=True)
+    revoked_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class SessionParticipant(Base):
@@ -347,12 +404,14 @@ def _tune_sqlite(engine) -> None:
     def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
         cur = dbapi_conn.cursor()
         try:
+            # Install the lock wait before journal negotiation so concurrent
+            # worker startup does not fail immediately on a busy database.
+            cur.execute("PRAGMA busy_timeout=5000")
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
             # SQLite does not enforce declared ON DELETE cascades unless this
             # is enabled separately for every database connection.
             cur.execute("PRAGMA foreign_keys=ON")
-            cur.execute("PRAGMA busy_timeout=5000")
             cur.execute("PRAGMA wal_autocheckpoint=1000")
         finally:
             cur.close()
@@ -375,6 +434,16 @@ def _migrate(engine) -> None:
         )
     if "disabled_at" not in user_cols:
         stmts.append("ALTER TABLE user ADD COLUMN disabled_at DATETIME")
+    if "email" not in user_cols:
+        stmts.append("ALTER TABLE user ADD COLUMN email VARCHAR")
+    if "auth_provider" not in user_cols:
+        stmts.append(
+            "ALTER TABLE user ADD COLUMN auth_provider VARCHAR "
+            "NOT NULL DEFAULT 'local'")
+    if "external_tenant_id" not in user_cols:
+        stmts.append("ALTER TABLE user ADD COLUMN external_tenant_id VARCHAR")
+    if "external_subject" not in user_cols:
+        stmts.append("ALTER TABLE user ADD COLUMN external_subject VARCHAR")
     if "session" in inspector.get_table_names():
         session_cols = {c["name"] for c in inspector.get_columns("session")}
         if "retention" not in session_cols:
@@ -390,7 +459,9 @@ def _migrate(engine) -> None:
     if "devbox" in inspector.get_table_names():
         devbox_cols = {c["name"] for c in inspector.get_columns("devbox")}
         if "workspace_id" not in devbox_cols:
-            stmts.append("ALTER TABLE devbox ADD COLUMN workspace_id VARCHAR")
+            stmts.append(
+                "ALTER TABLE devbox ADD COLUMN workspace_id VARCHAR "
+                "REFERENCES workspace(id) ON DELETE SET NULL")
     if "agent" in inspector.get_table_names():
         agent_cols = {c["name"] for c in inspector.get_columns("agent")}
         if "local_project_id" not in agent_cols:
@@ -404,7 +475,9 @@ def _migrate(engine) -> None:
     if "session" in inspector.get_table_names():
         session_cols = {c["name"] for c in inspector.get_columns("session")}
         if "workspace_id" not in session_cols:
-            stmts.append("ALTER TABLE session ADD COLUMN workspace_id VARCHAR")
+            stmts.append(
+                "ALTER TABLE session ADD COLUMN workspace_id VARCHAR "
+                "REFERENCES workspace(id) ON DELETE SET NULL")
     if "keyboard_lease" in inspector.get_table_names():
         lease_cols = {c["name"] for c in inspector.get_columns("keyboard_lease")}
         if "version" not in lease_cols:
@@ -412,6 +485,29 @@ def _migrate(engine) -> None:
     with engine.begin() as conn:
         for stmt in stmts:
             conn.execute(text(stmt))
+        # SQLite cannot add a UNIQUE constraint with ALTER TABLE.  Keep this
+        # unconditional so an interrupted prior migration repairs the index.
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_external_identity "
+            "ON user(auth_provider, external_tenant_id, external_subject) "
+            "WHERE external_subject IS NOT NULL"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_personal_organization_owner "
+            "ON organization(owner_user_id) WHERE is_personal = 1"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_personal_workspace_organization "
+            "ON workspace(org_id) WHERE is_personal = 1"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uq_workspace_invitation_open_email "
+            "ON workspace_invitation(workspace_id, email) "
+            "WHERE accepted_at IS NULL AND revoked_at IS NULL"
+        ))
     _backfill_workspaces(engine)
 
 
@@ -421,6 +517,10 @@ def _backfill_workspaces(engine) -> None:
     session = sessionmaker(bind=engine, expire_on_commit=False)()
     try:
         import uuid as _uuid
+
+        # Serialize startup backfills across processes.  A deferred SQLite
+        # transaction can otherwise let two workers observe the same gap.
+        session.execute(text("BEGIN IMMEDIATE"))
 
         # One personal org/workspace/membership per Devbox owner.
         owner_ws: dict[str, str] = {}

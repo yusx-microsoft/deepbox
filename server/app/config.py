@@ -70,6 +70,12 @@ class Settings:
     rate_limit_api_per_minute: int = 300
     rate_limit_login_per_minute: int = 10
     rate_limit_token_per_minute: int = 20
+    # Browser authentication. Microsoft mode trusts principals only after Azure
+    # App Service Authentication has validated and injected its identity headers.
+    auth_mode: str = "local"
+    session_ttl_seconds: int = 8 * 60 * 60
+    microsoft_owner_emails: frozenset[str] = frozenset()
+    workspace_invitation_ttl_days: int = 7
 
     @property
     def production(self) -> bool:
@@ -78,6 +84,14 @@ class Settings:
     @property
     def is_azure(self) -> bool:
         return self.platform == PLATFORM_AZURE
+
+    @property
+    def microsoft_auth_enabled(self) -> bool:
+        return self.auth_mode in {"microsoft", "hybrid"}
+
+    @property
+    def password_auth_enabled(self) -> bool:
+        return self.auth_mode in {"local", "hybrid"}
 
     def origin_allowed(self, origin: str | None) -> bool:
         # Development remains convenient for localhost. Production always has
@@ -103,6 +117,22 @@ class Settings:
             raise RuntimeError("DEEPBOX_COOKIE_SECURE must be true in production")
         if self.cookie_samesite not in {"lax", "strict", "none"}:
             raise RuntimeError("DEEPBOX_COOKIE_SAMESITE must be lax, strict, or none")
+        if self.auth_mode not in {"local", "microsoft", "hybrid"}:
+            raise RuntimeError("DEEPBOX_AUTH_MODE must be local, microsoft, or hybrid")
+        if self.production and self.microsoft_auth_enabled and not self.is_azure:
+            raise RuntimeError("Microsoft authentication requires azure-app-service in production")
+        if self.session_ttl_seconds < 300:
+            raise RuntimeError("DEEPBOX_SESSION_TTL_SECONDS must be at least 300")
+        if not 1 <= self.workspace_invitation_ttl_days <= 30:
+            raise RuntimeError(
+                "DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS must be between 1 and 30")
+        if self.auth_mode == "microsoft":
+            if not self.microsoft_owner_emails:
+                raise RuntimeError(
+                    "DEEPBOX_MICROSOFT_OWNER_EMAILS is required in microsoft mode")
+            if not self.public_url:
+                raise RuntimeError(
+                    "DEEPBOX_PUBLIC_URL is required in microsoft mode")
         # Loopback-only in production, except on Azure App Service where the
         # managed front end terminates TLS and forwards to the container's
         # published port. That platform must bind 0.0.0.0 to be reachable.
@@ -211,6 +241,15 @@ def load_settings() -> Settings:
         rate_limit_api_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_API_PER_MINUTE", "300")),
         rate_limit_login_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_LOGIN_PER_MINUTE", "10")),
         rate_limit_token_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_TOKEN_PER_MINUTE", "20")),
+        auth_mode=os.getenv("DEEPBOX_AUTH_MODE", "local").strip().lower(),
+        session_ttl_seconds=int(os.getenv("DEEPBOX_SESSION_TTL_SECONDS", str(8 * 60 * 60))),
+        microsoft_owner_emails=frozenset(
+            value.strip().casefold()
+            for value in os.getenv("DEEPBOX_MICROSOFT_OWNER_EMAILS", "").split(",")
+            if value.strip()
+        ),
+        workspace_invitation_ttl_days=int(os.getenv(
+            "DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS", "7")),
     )
     result.validate()
     return result

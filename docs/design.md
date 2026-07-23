@@ -28,76 +28,73 @@ deepradio 与 deepbox 的关键差异：
 
 ---
 
-## 1. 三个实体（Human / Devbox / Agent）
+## 1. 实体层级（Workspace / Devbox / Agent）
 
-```
-┌─────────────┐   owns   ┌──────────────────────────────┐
-│   Human     │─────────▶│           Devbox             │  e.g. "Alex 的开发机 / 集群登录节点"
-│ (user 登录) │          │  一台跑 connector 的机器     │
-└─────────────┘          │  由一个 TOKEN 认证           │
-                         └───────────────┬──────────────┘
-                                         │ hosts (1:N)
-                    ┌────────────────────┼────────────────────┐
-                    ▼                    ▼                     ▼
-              ┌──────────┐        ┌──────────┐         ┌──────────┐
-              │  Agent   │        │  Agent   │         │  Agent   │  每个 = 一个 agent principal
-              │@claude   │        │@copilot  │         │@codex    │  绑定 devbox_id + runtime
-              └──────────┘        └──────────┘         └──────────┘
+```text
+Human ── Membership(role) ──▶ Workspace ── owns ──▶ Devbox ── runs ──▶ Agent
 ```
 
-| 实体 | 是什么 | 认证 |
-|---|---|---|
-| **Human** | 平台用户，浏览器登录 | session cookie（P0 用户名/密码；后续 OAuth） |
-| **Devbox** | 一台跑 `connector` 的机器，认证单元，Human 拥有 | `hpc_box_<64hex>` bearer token，只存 hash |
-| **Agent** | 一个可交互的 CLI 实例（runtime=claude-code/copilot-cli/codex-cli/mock），host 在某个 Devbox 上 | 继承其 Devbox 的 token，只能通过该 Devbox 说话 |
+- **Human**：浏览器用户；通过本地密码或 Azure App Service Easy Auth 的 Microsoft 身份登录，随后使用 deepbox 自己签发的限时 `deepbox_session` cookie。
+- **Workspace**：用户可见的协作与授权边界。一个用户可加入多个 workspace；一个 workspace 可包含多个 Devbox。
+- **Membership**：Human 在某个 Workspace 内的 `viewer / operator / admin / owner` 角色。workspace 成员可发现该空间下全部 Devbox 与 Agent；写操作继续按角色检查。
+- **Devbox**：一台用户机器上的 connector/supervisor。连接时只带 Devbox bearer token，不带 Microsoft token 或模型 key。
+- **Agent**：Devbox 上由 supervisor 管理的 CLI 进程；浏览器看到的层级固定为 **Workspace → Devbox → Agent**。
 
-- **一个 Human 可拥有多个 Devbox**（多台开发机 / 多个集群节点）。
-- **一个 Devbox 可 host 多个 Agent**（同一台机器上跑多个不同 CLI）。
-- **Devbox 不是 principal**：它是基础设施，从不出现在消息作者里，只有它的 Agent 会。
+部署级 `User.role`（`owner / member`）只控制全局用户管理等控制面能力；它与 workspace membership 分离。服务端仍然不运行模型，也不持有 Claude/Copilot/Codex 凭据。
 
 ---
 
 ## 2. 数据模型（SQLite / SQLAlchemy）
 
+核心表（省略部分时间戳和辅助字段）：
+
+```text
+user(id, username, password_hash, display_name, role, email,
+     auth_provider, external_tenant_id, external_subject, disabled_at)
+organization(id, name, owner_user_id, is_personal)
+workspace(id, organization_id, name, is_personal)
+membership(id, workspace_id, user_id, role)
+workspace_invitation(id, workspace_id, email, role, token_hash, token_preview,
+                     created_by_user_id, expires_at, accepted_at,
+                     accepted_by_user_id, revoked_at)
+devbox(id, owner_id, name, last_seen_at, runtime_capabilities_json, workspace_id)
+devbox_project(id, devbox_id, path, label, is_default, capability_flags)
+token(id, devbox_id, token_hash, preview, created_at, last_used_at)
+agent(id, devbox_id, handle, runtime, launcher, model, mode, system_prompt,
+      use_subscription, provider_id, status, created_at)
+session(id, user_id, agent_id, title, retention_seconds, workspace_id, created_at)
+session_participant(id, session_id, user_id, role, joined_at)
+message(id, session_id, sender_kind, sender_user_id, sender_agent_id, content, created_at)
+recording_frame(id, session_id, seq, timestamp_ns, direction, payload)
+recording_checkpoint(id, session_id, frame_seq, timestamp_ns, screen_*)
+invitation(id, email, role, token_hash, token_preview, expires_at,
+           max_uses, used_count, revoked_at)
 ```
-user           id, username, password_hash, display_name, created_at
-devbox         id, owner_user_id, name, created_at, last_seen_at, capabilities(JSON)
-devbox_project id, devbox_id, name, runtime_config(JSON), created_at, updated_at
-token          id, devbox_id, hash, preview, created_at, last_used_at, revoked_at
-agent          id, devbox_id, handle, display_name, runtime, local_project_id,
-               runtime_config(JSON), cwd, launch_cmd,
-               presence(offline|online|busy|error), created_at
 
-`Devbox.capabilities` 是 connector 上报、Server 不解释的 opaque capability blob。当前 blob 的
-`schema_version` 为 `2`：每个 user-facing runtime family 包含安装/兼容性/认证状态、模型目录和
-`terminal` / `structured` surfaces；surface descriptor 才携带内部 adapter ID 与 controls。
-session        id, user_id, agent_id, title, created_at            # 一次人-agent 的会话/频道
-message        id, session_id, author_kind(user|agent|system),
-               author_id, body, created_at
-# 流式 CLI 输出不进 message 表逐条存；见 §5 的传输模型。
-```
+关键约束：
 
-> 命名保持"无聊耐用"：代码里就叫 `devbox/agent/session/message`。产品/营销层面可以再包装
-> HPC 术语（"接入节点 / 作业 / 会话"）。
+- `uq_user_external_identity` 对非空 `(auth_provider, external_tenant_id, external_subject)` 建唯一索引，保证同一 Microsoft 主体只映射一个用户。
+- `membership` 对 `(workspace_id, user_id)` 唯一；最后一个 workspace owner 不可降级或删除。
+- workspace 邀请只持久化 SHA-256 token hash 与短 preview；链接明文只在创建响应出现一次。邀请按标准化邮箱绑定、单次接受、可过期/撤销；重新签发会撤销旧的未领取链接。
+- 接受 workspace 邀请在同一事务内创建 membership 并标记 `accepted_at`；并发双击捕获唯一约束冲突后重查 membership，返回幂等成功。
+- `runtime_capabilities_json` 与 `capability_flags` 对 server 都是 opaque JSON；服务端不解释 runtime/model 字符串。
+- `_migrate()` 补列/补索引；`_backfill_workspaces()` 为旧用户建立 personal workspace，并回填 Devbox/Session 归属与 owner membership。
 
-Token 规则（照搬 deepradio，已验证过的做法）：
-- 格式 `hpc_box_` + 64 hex（32 随机字节）。
-- 只存 `sha256(token)`，按 hash 查。
-- `preview` = `hpc_box_` + 随机部分前 6 位 + `…`，供 UI 显示"是哪一个 token"。
-- 创建时**完整 token 只返回一次**，之后不可再取。
-- 可轮换（发新的）、可吊销（`revoked_at`，hub 立即断开在用的连接）。
+### Token 规则
 
-### LocalProject：路径只留在 connector
+- 明文格式：`hpc_box_<urlsafe>`
+- 只在创建/轮换响应中出现一次
+- SQLite 只保存 `SHA-256(token)` 和短 `preview`
+- connector WebSocket 用 `Authorization: Bearer hpc_box_...`
 
-每个 connector 在 `~/.deepbox/state.db` 保存 `local_project(id, name, path, created_at, updated_at)`。
-`id` 是稳定 opaque UUID，`path` 是 connector 本机解析后的绝对目录；Server 与 browser 只看到
-`{id, name}`，agent 通过 `local_project_id` 引用它。连接前，connector 把 ID 解析为实际 `cwd`；
-目录不存在或 ID 无法解析时返回 `project_error`，而不是上传路径或猜测默认目录。
+### LocalProject
 
-项目列表由 connector 通过 `POST /api/devboxes/{id}/projects` 权威替换。Server 校验 project/agent
-都属于同一 devbox；本地删除后的下一次 report 会删除 path-free 投影，并把引用它的 agent
-`local_project_id` 置空。旧 agent 的 `cwd` 只会短暂出现在 connector directory：connector 导入为
-LocalProject 并上报 migration 后，Server 在成功 report 内清空所有 legacy `cwd`。
+- `DevboxProject` 归属一个 `Devbox`
+- 唯一键是 `(devbox_id, path)`
+- `is_default=true` 表示该 Devbox 的默认工作目录；同一 Devbox 最多保留一个默认项目
+- `capability_flags` 是 connector 上报的 opaque JSON
+- workspace 成员可读项目；只有 `admin/owner` 可改项目目录或 capability
+- connector 可通过 `project_sync` 消息同步本机项目清单；server 不探测本机文件系统
 
 ---
 
@@ -234,39 +231,35 @@ Structured options 和附件在 connector 按 adapter descriptor 二次验证；
 - Connector WebSocket 使用 30s open timeout、20s ping、60s pong tolerance、5s close timeout 和
   16 MiB frame bound；异常断线后外层 loop 继续退避重连及 spool 续传。
 
-## 6. REST 面（管理 + 运行时）
+## 6. REST API（核心）
 
-**管理（浏览器 / 登录 Human）**
-| 方法 · 路径 | 作用 |
-|---|---|
-| `POST /api/auth/register` `{username,password}` | 注册 |
-| `POST /api/auth/login` | 登录，设 session cookie |
-| `POST /api/devboxes` `{name}` | 创建 Devbox + 首个 token，**完整 token 返回一次** |
-| `GET /api/devboxes` | 列出我的 Devbox（含 agents、在线状态） |
-| `DELETE /api/devboxes/:id` | 删除（级联 token；其 agent 一并移除） |
-| `POST /api/devboxes/:id/agents` `{handle,display_name,runtime,cwd?,launch_cmd?}` | 新建一个 host 的 agent |
-| `DELETE /api/agents/:id` | 删除 agent；SQLite 外键级联 session/message，浏览器 watcher 收到 exit，在线 connector 立即收到新权威目录并终止本地 PTY/structured session 并丢弃该 agent 的待发帧 |
-| `POST /api/devboxes/:id/tokens` | 轮换：发新 token（返回一次） |
-| `DELETE /api/tokens/:id` | 吊销 token |
-| `GET /api/agents/:id/sessions` | 列出该 agent 的会话及 live/inactive/ended 状态 |
-| `POST /api/agents/:id/sessions` | 开一个新会话，返回 session_id |
-| `GET /api/sessions/:id/messages` | 会话历史（结构化消息） |
-| `GET /api/sessions/:id/recording` | 下载 asciicast v2 DVR 录制 |
+| Method | Path | Auth | 说明 |
+|---|---|---|---|
+| `GET` | `/api/auth/config` | 无 | 返回启用的本地/Microsoft 登录方式 |
+| `POST` | `/api/auth/login` | 无 | `local/hybrid` 的密码登录 |
+| `GET` | `/api/auth/microsoft/start` | 无 | 跳转 `/.auth/login/aad` |
+| `GET` | `/api/auth/microsoft/callback` | Easy Auth headers | tenant+subject upsert，签发 Deepbox cookie |
+| `GET` | `/api/auth/microsoft/logout` | 无 | 清 cookie 并跳转 `/.auth/logout` |
+| `GET` | `/api/me` | Cookie | 当前用户资料 |
+| `GET/POST` | `/api/workspaces` | Cookie | 列出 membership / 创建 workspace（创建者为 owner） |
+| `GET/POST` | `/api/workspaces/{id}/members` | Cookie + workspace role | 列出成员 / 添加已有用户 |
+| `PATCH/DELETE` | `/api/workspaces/{id}/members/{user_id}` | Cookie + admin/owner | 改角色 / 删除成员，保护最后 owner |
+| `GET/POST` | `/api/workspaces/{id}/invitations` | Cookie + admin | 列出 / 创建邮箱绑定邀请；admin 不可授予 admin |
+| `DELETE` | `/api/workspaces/{id}/invitations/{invite_id}` | Cookie + admin | 撤销未领取邀请 |
+| `POST` | `/api/workspace-invitations/preview` | 无 | body 中提交 token，返回 workspace/角色/掩码邮箱 |
+| `POST` | `/api/workspace-invitations/accept` | Cookie | 邮箱严格匹配后原子接受，重复提交幂等 |
+| `GET/POST` | `/api/devboxes` | Cookie + workspace role | 聚合用户所有 workspace 的 Devbox / 在 workspace 创建 |
+| `POST` | `/api/devboxes/{id}/tokens` | Cookie + workspace admin | 签发新 connector token |
+| `DELETE` | `/api/devboxes/{id}/tokens/{token_id}` | Cookie + workspace admin | 撤销 connector token |
+| `GET/POST` | `/api/devboxes/{id}/agents` | Cookie + workspace role | 列出 / 创建 Agent |
+| `GET/POST` | `/api/agents/{id}/sessions` | Cookie + workspace role | 列出 / 创建共享会话 |
+| `GET/POST` | `/api/sessions/{id}/messages` | Cookie + participant/role | 列出 / 发送结构化消息 |
+| `GET/POST` | `/api/sessions/{id}/tasks` | Cookie + participant/role | 列出 / 创建结构化任务 |
+| `GET/POST` | `/api/devboxes/{id}/projects` | Cookie + workspace role | 列出 / 注册 LocalProject |
 
-**运行时（connector / Bearer token）**
-| 方法 · 路径 | 作用 |
-|---|---|
-| `GET /api/me` | 返回本 Devbox 的 path-free projects、agents 与 legacy migration bridge |
-| `POST /api/devboxes/:id/runtimes` `{capabilities}` | connector 在建 WS 前上报 capability v2 inventory；包含未安装 family，Server 只作 opaque JSON 存储 |
-| `POST /api/devboxes/:id/projects` `{projects,migrations}` | connector 权威上报 `{id,name}` project 列表及旧 agent 迁移 |
-| `POST /api/devboxes/:id/agents` | 创建引用 `local_project_id` 的 agent；Server 校验同属该 devbox |
+Microsoft 登录的信任边界在 Azure App Service Easy Auth：平台先验证 OAuth/OIDC，再注入 `X-MS-CLIENT-PRINCIPAL*`。应用不接收浏览器 Microsoft bearer token，不存 access/refresh token；非 App Service 或未正确启用 Easy Auth 的部署必须保持 `DEEPBOX_AUTH_MODE=local`。`microsoft` 模式还要求明确的 owner 邮箱 allowlist 与 `DEEPBOX_PUBLIC_URL`。
 
-> **配置切分（保护凭证与本机路径）**：Server 只保存 handle、runtime、opaque local project ID
-> 和非机密 `runtime_config`；新流程不保存 absolute path。`cwd/launch_cmd` 字段仅为旧数据迁移桥接，
-> 成功 project report 后会清空。**任何 API key / 登录态以及 LocalProject path** 只存在 connector
-> 本地环境，Server 永不经手。这就是整个设计的意义所在。
-
----
+workspace 邀请 token 放在 URL fragment `#workspace-invite=...`，不会随首个 HTTP 请求发送；前端仅为跨 OAuth redirect 暂存到 `sessionStorage`，preview 使用 POST body，避免 token 出现在查询字符串和常规访问日志。
 
 ## 7. connector 包（`connector/`，Python）
 
@@ -300,8 +293,9 @@ python -m connector --server-url http://localhost:8077 --token hpc_box_...
 
 ## 9. Roadmap
 
-- **已完成骨架与可靠性**：身份/devbox/agent/session、connector hot registration、Protocol v3 durable
-  spool/ACK/resend/fence、DVR/retention、workspace/RBAC/keyboard lease 与 Azure 部署。
+- **已完成骨架与可靠性**：本地账号生命周期、Microsoft Easy Auth 身份映射、邮箱绑定 workspace 邀请、
+  Workspace → Devbox → Agent 导航、connector hot registration、Protocol v3 durable spool/ACK/resend/fence、
+  DVR/retention、workspace RBAC/keyboard lease 与 Azure 部署。
 - **当前主线**：headless structured adapters + 自有聊天 UI；补齐 capability-driven controls、附件、
   session restore 和 connector transport 稳定性。PTY/xterm 只做兼容 fallback。
 - **下一阶段**：真实多机 E2E、更多 adapter、可审计的 runtime permission、长任务/通知与生产容量治理。

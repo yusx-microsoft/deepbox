@@ -1,9 +1,13 @@
 """Tests for models._migrate additive migration + workspace backfill."""
+import datetime as dt
 import os
 import sqlite3
 import tempfile
 import unittest
 import uuid
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from server.app import models
 from server.app.models import (
@@ -11,7 +15,9 @@ from server.app.models import (
     Membership,
     Organization,
     Session,
+    User,
     Workspace,
+    WorkspaceInvitation,
 )
 
 
@@ -23,6 +29,69 @@ class NewDatabaseStartupTests(unittest.TestCase):
             # migration is idempotent
             models._migrate(engine)
             self.assertTrue(engine is not None)
+            engine.dispose()
+
+    def test_personal_singletons_and_open_invites_are_unique(self):
+        with tempfile.TemporaryDirectory() as d:
+            url = f"sqlite:///{os.path.join(d, 'unique.db')}"
+            engine = models.init_db(url)
+            with models.SessionLocal() as db:
+                db.add(User(
+                    id="u1", username="owner", password_hash="hash",
+                    display_name="Owner", role="owner"))
+                db.commit()
+                db.add(Organization(
+                    id="o1", name="Personal", is_personal=True,
+                    owner_user_id="u1"))
+                db.commit()
+
+                db.add(Organization(
+                    id="o2", name="Duplicate", is_personal=True,
+                    owner_user_id="u1"))
+                with self.assertRaises(IntegrityError):
+                    db.commit()
+                db.rollback()
+
+                db.add(Workspace(
+                    id="w1", org_id="o1", name="Personal",
+                    is_personal=True))
+                db.commit()
+                db.add(Workspace(
+                    id="w2", org_id="o1", name="Duplicate",
+                    is_personal=True))
+                with self.assertRaises(IntegrityError):
+                    db.commit()
+                db.rollback()
+
+                expiry = models.now() + dt.timedelta(days=1)
+                db.add(WorkspaceInvitation(
+                    id="i1", workspace_id="w1", email="member@example.com",
+                    role="viewer", token_hash="hash-1", token_preview="one",
+                    created_by_user_id="u1", expires_at=expiry))
+                db.commit()
+                db.add(WorkspaceInvitation(
+                    id="i2", workspace_id="w1", email="member@example.com",
+                    role="operator", token_hash="hash-2", token_preview="two",
+                    created_by_user_id="u1", expires_at=expiry))
+                with self.assertRaises(IntegrityError):
+                    db.commit()
+                db.rollback()
+
+                first = db.get(WorkspaceInvitation, "i1")
+                first.revoked_at = models.now()
+                db.commit()
+                db.add(WorkspaceInvitation(
+                    id="i3", workspace_id="w1", email="member@example.com",
+                    role="operator", token_hash="hash-3", token_preview="tri",
+                    created_by_user_id="u1", expires_at=expiry))
+                db.commit()
+                open_invites = db.scalars(select(WorkspaceInvitation).where(
+                    WorkspaceInvitation.workspace_id == "w1",
+                    WorkspaceInvitation.email == "member@example.com",
+                    WorkspaceInvitation.accepted_at.is_(None),
+                    WorkspaceInvitation.revoked_at.is_(None),
+                )).all()
+                self.assertEqual(["i3"], [item.id for item in open_invites])
             engine.dispose()
 
 

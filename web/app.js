@@ -12,6 +12,9 @@ if(!document.querySelector('link[data-deepbox-styles]')){
   document.head.appendChild(link);
 }
 let me = null, devboxes = [], term = null, fit = null, termWS = null, curSession = null;
+let workspaces = [], activeWorkspaceId = null;
+let authConfig = {mode:'local', password_enabled:true, microsoft_enabled:false};
+let workspaceInviteOpen = false;
 let fleetLoadRequest = 0;
 let replayMode = false;
 let curAgentId = null;   // currently open agent, for active-row highlighting
@@ -90,10 +93,13 @@ function resetStructuredChat(){
 
 async function loadUI(){
   uiPromise = uiPromise || loadScriptOnce(
-    '/static/ui.js?cap=immediate-terminal-input-v1',
+    '/static/ui.js?cap=workspace-identity-v2',
     'DeepboxUI',
     'failed to load compatible ui helpers',
     mod => typeof mod.createTerminalInputSender === 'function'
+      && typeof mod.selectWorkspace === 'function'
+      && typeof mod.workspaceInvitationCopy === 'function'
+      && typeof mod.workspaceAcceptanceCopy === 'function'
   );
   ui = await uiPromise;
   return ui;
@@ -102,7 +108,17 @@ async function loadUI(){
 const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
 const queryParams = new URLSearchParams(location.search);
 let pendingInvite = hashParams.get('invite') || queryParams.get('invite') || '';
-if (pendingInvite) history.replaceState(null, '', location.pathname);
+let pendingWorkspaceInvite = hashParams.get('workspace-invite') || '';
+try {
+  if(pendingWorkspaceInvite) sessionStorage.setItem('deepbox.workspaceInvite', pendingWorkspaceInvite);
+  else pendingWorkspaceInvite = sessionStorage.getItem('deepbox.workspaceInvite') || '';
+} catch {}
+if (pendingInvite || hashParams.get('workspace-invite')) history.replaceState(null, '', location.pathname);
+
+function clearPendingWorkspaceInvite(){
+  pendingWorkspaceInvite = '';
+  try { sessionStorage.removeItem('deepbox.workspaceInvite'); } catch {}
+}
 
 async function api(path, opts={}) {
   const r = await fetch(path, {credentials:'same-origin',
@@ -127,10 +143,24 @@ async function renderLogin() {
   let status = {available:false};
   try { status = await api('/api/auth/bootstrap-status'); } catch {}
   if (status.available) return renderBootstrap();
+  try { authConfig = await api('/api/auth/config'); } catch {}
 
   const inviteFromUrl = pendingInvite;
+  const passwordEnabled = authConfig.password_enabled !== false;
+  const microsoftEnabled = authConfig.microsoft_enabled === true;
   const psCmd = 'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex';
   const shCmd = 'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash';
+  const microsoftHtml = microsoftEnabled ? `<button type="button" id="microsoft-login" class="microsoft-login" aria-label="Continue with Microsoft">
+      <span class="microsoft-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+      Continue with Microsoft</button>` : '';
+  const passwordHtml = passwordEnabled ? `${microsoftEnabled?'<div class="auth-divider">or use a local account</div>':''}
+      <input id="u" placeholder="username" autocomplete="username"/>
+      <input id="p" type="password" placeholder="password" autocomplete="current-password"/>
+      <div class="row"><button id="login" style="flex:1">Sign in</button></div>
+      <div class="auth-divider">or use an invite</div>
+      <input id="inv" placeholder="invite code" value="${escapeHtml(inviteFromUrl)}"/>
+      <input id="rd" placeholder="display name (optional)"/>
+      <div class="row"><button class="ghost" id="reg" style="flex:1">Register with invite</button></div>` : '';
   app.innerHTML = `<div class="auth auth-split">
     <section class="auth-hero">
       <div class="auth-brand"><span class="glyph">_</span><b>deepbox</b></div>
@@ -162,42 +192,42 @@ async function renderLogin() {
       </div>
     </section>
     <div class="auth-card stack">
-      <div class="auth-sub">Sign in to reach the fleet.</div>
-      <input id="u" placeholder="username" autocomplete="username"/>
-      <input id="p" type="password" placeholder="password" autocomplete="current-password"/>
-      <div class="row"><button id="login" style="flex:1">Sign in</button></div>
-      <div class="auth-divider">or use an invite</div>
-      <input id="inv" placeholder="invite code" value="${escapeHtml(inviteFromUrl)}"/>
-      <input id="rd" placeholder="display name (optional)"/>
-      <div class="row"><button class="ghost" id="reg" style="flex:1">Register with invite</button></div>
+      <div class="auth-sub">${pendingWorkspaceInvite?'Sign in with the invited Microsoft account.':'Sign in to reach your workspaces.'}</div>
+      ${microsoftHtml}${passwordHtml}
       <div id="err" class="auth-err"></div>
     </div></div>`;
-  const copyBtn = (btnId, text) => {
+  const copyBtn = (btnId, value) => {
     const b = document.getElementById(btnId);
     if (!b) return;
     b.onclick = async () => {
-      try { await navigator.clipboard.writeText(text); const o=b.textContent; b.textContent='Copied'; setTimeout(()=>{b.textContent=o;},1200); } catch {}
+      try { await navigator.clipboard.writeText(value); const o=b.textContent; b.textContent='Copied'; setTimeout(()=>{b.textContent=o;},1200); } catch {}
     };
   };
   copyBtn('copy-ps', psCmd);
   copyBtn('copy-sh', shCmd);
-  login.onclick = async () => {
+  const microsoftLogin = document.getElementById('microsoft-login');
+  if(microsoftLogin) microsoftLogin.onclick = () => { location.assign(authConfig.microsoft_login_url || '/api/auth/microsoft/start'); };
+  const loginButton = document.getElementById('login');
+  const registerButton = document.getElementById('reg');
+  const password = document.getElementById('p');
+  if(loginButton) loginButton.onclick = async () => {
     try {
       me = await api('/api/auth/login', {method:'POST', body: JSON.stringify({
-        username:u.value, password:p.value})});
+        username:document.getElementById('u').value, password:password.value})});
       boot();
-    } catch(e){ err.textContent = e.message; }
+    } catch(e){ document.getElementById('err').textContent = e.message; }
   };
-  reg.onclick = async () => {
+  if(registerButton) registerButton.onclick = async () => {
     try {
       me = await api('/api/auth/register', {method:'POST', body: JSON.stringify({
-        username:u.value, password:p.value, display_name:rd.value||undefined,
-        invite_code:inv.value||undefined})});
+        username:document.getElementById('u').value, password:password.value,
+        display_name:document.getElementById('rd').value||undefined,
+        invite_code:document.getElementById('inv').value||undefined})});
       pendingInvite = '';
       boot();
-    } catch(e){ err.textContent = e.message; }
+    } catch(e){ document.getElementById('err').textContent = e.message; }
   };
-  p.addEventListener('keydown', e=>{ if(e.key==='Enter') login.click(); });
+  if(password && loginButton) password.addEventListener('keydown', e=>{ if(e.key==='Enter') loginButton.click(); });
 }
 
 function renderBootstrap() {
@@ -224,15 +254,29 @@ function renderBootstrap() {
 async function boot() {
   try { me = me || await api('/api/me/user'); }
   catch { return renderLogin(); }
-  if (await loadDevboxes()) renderShell();
+  if (await loadDevboxes()) {
+    renderShell();
+    if(pendingWorkspaceInvite) setTimeout(presentWorkspaceInvitation, 0);
+  }
 }
 
 async function loadDevboxes(){
   const request = ++fleetLoadRequest;
-  const loaded = await api('/api/devboxes');
-  if(request !== fleetLoadRequest) return false;
-  devboxes = loaded;
-  return true;
+  try {
+    const [nextWorkspaces, nextDevboxes] = await Promise.all([
+      api('/api/workspaces'), api('/api/devboxes')]);
+    if(request !== fleetLoadRequest) return false;
+    workspaces = nextWorkspaces;
+    devboxes = nextDevboxes;
+    let preferred = activeWorkspaceId;
+    try { preferred = preferred || localStorage.getItem('deepbox.workspace'); } catch {}
+    const selected = ui.selectWorkspace(workspaces, preferred);
+    activeWorkspaceId = selected ? selected.id : null;
+    return true;
+  } catch(e) {
+    if(request === fleetLoadRequest) showAlert('Could not load workspaces', e.message);
+    return false;
+  }
 }
 
 function renderShell() {
@@ -256,7 +300,13 @@ function renderShell() {
       <div class="stage-body" id="stagebody"></div>
     </section>
   </main>`;
-  logout.onclick = async()=>{ await api('/api/auth/logout',{method:'POST'}); me=null; renderLogin(); };
+  logout.onclick = async()=>{
+    if(me.auth_provider === 'microsoft') {
+      location.assign(authConfig.microsoft_logout_url || '/api/auth/microsoft/logout');
+      return;
+    }
+    await api('/api/auth/logout',{method:'POST'}); me=null; renderLogin();
+  };
   document.getElementById('cmdk').onclick = openCommandPalette;
   if(me.role==='owner') document.getElementById('owner').onclick = renderOwner;
   renderFleet();
@@ -272,8 +322,17 @@ function cmdKeyLabel(){
 function renderFleet() {
   const fleet = document.getElementById('fleet');
   if(!fleet) return;
-  const summary = ui.fleetSummary(devboxes);
-  const filtered = ui.filterDevboxes(devboxes, fleetQuery);
+  const workspace = ui.selectWorkspace(workspaces, activeWorkspaceId);
+  if(!workspace){
+    fleet.innerHTML = '<div class="fleet-empty"><h4>No workspace</h4><p class="muted">Create a workspace to organize your devboxes.</p><button id="workspace-create-empty">Create workspace</button></div>';
+    const create = document.getElementById('workspace-create-empty'); if(create) create.onclick = createWorkspace;
+    return;
+  }
+  activeWorkspaceId = workspace.id;
+  const canAdmin = ui.canAdminWorkspace(workspace.role);
+  const workspaceBoxes = ui.devboxesForWorkspace(devboxes, workspace.id);
+  const summary = ui.fleetSummary(workspaceBoxes);
+  const filtered = ui.filterDevboxes(workspaceBoxes, fleetQuery);
 
   const boxesHtml = filtered.map(d => {
     const boxStatus = ui.devboxStatus(d);
@@ -294,7 +353,7 @@ function renderFleet() {
         <div class="agent-actions">
           ${hasTerminalFallback ? `<button class="ghost" data-open-terminal="${esc(a.id)}" data-terminal-name="${esc(a.display_name)}">Terminal</button>` : ''}
           <button class="ghost" data-hist="${esc(a.id)}" data-histname="${esc(a.display_name)}">History</button>
-          <button class="danger" data-agent-del="${esc(a.id)}" data-agent-delname="${esc(a.display_name||a.handle)}">Delete</button>
+          ${canAdmin?`<button class="danger" data-agent-del="${esc(a.id)}" data-agent-delname="${esc(a.display_name||a.handle)}">Delete</button>`:''}
         </div>
       </div>`;
     }).join('') || '<div class="box-empty">No agents on this devbox yet.</div>';
@@ -307,37 +366,49 @@ function renderFleet() {
       </div>
       <div class="agent-list">${agents}</div>
       <div class="box-foot">
-        <button class="ghost" data-agent="${esc(d.id)}">+ Agent</button>
+        ${canAdmin?`<button class="ghost" data-agent="${esc(d.id)}">+ Agent</button>`:''}
         <button class="ghost" data-runtimes="${esc(d.id)}">Runtimes</button>
         <span class="spacer"></span>
-        <button class="ghost" data-token="${esc(d.id)}">Rotate token</button>
-        <button class="danger" data-del="${esc(d.id)}">Delete</button>
+        ${canAdmin?`<button class="ghost" data-token="${esc(d.id)}">Rotate token</button>
+        <button class="danger" data-del="${esc(d.id)}">Delete</button>`:''}
       </div>
     </div>`;
   }).join('');
 
-  const listHtml = filtered.length ? boxesHtml : (devboxes.length
+  const listHtml = filtered.length ? boxesHtml : (workspaceBoxes.length
     ? '<div class="fleet-empty"><div class="muted">No matches for your search.</div></div>'
-    : `<div class="fleet-empty"><h4>No devboxes yet</h4>
-        <p class="muted">Create a devbox, then run the connector on your machine to bring agents online.</p>
-        <button id="fleet-create">Create devbox</button></div>`);
+    : `<div class="fleet-empty"><h4>No devboxes here</h4>
+        <p class="muted">${canAdmin?'Create a devbox, then connect its token from a machine.':'A workspace admin has not added a devbox yet.'}</p>
+        ${canAdmin?'<button id="fleet-create">Create devbox</button>':''}</div>`);
+  const workspaceRows = workspaces.map(item=>`<button class="workspace-row${item.id===workspace.id?' is-active':''}" data-workspace="${esc(item.id)}">
+      <span class="workspace-name">${esc(item.name)}</span>
+      <span class="workspace-role">${esc(item.role)}</span>
+    </button>`).join('');
 
   fleet.innerHTML = `
+    <div class="workspace-nav">
+      <div class="workspace-nav-head"><span>Workspaces</span><button class="ghost compact" id="new-workspace" title="Create workspace">+</button></div>
+      <div class="workspace-list">${workspaceRows}</div>
+      <button class="workspace-manage ghost" id="workspace-manage">Members &amp; invitations</button>
+    </div>
     <div class="fleet-head">
-      <div class="fleet-title"><h3>Fleet</h3>
-        <button class="ghost" id="newbox" style="padding:4px 9px;font-size:12px">+ Devbox</button></div>
+      <div class="fleet-title"><h3>Devboxes</h3>
+        ${canAdmin?'<button class="ghost" id="newbox" style="padding:4px 9px;font-size:12px">+ Devbox</button>':''}</div>
       <div class="fleet-summary">
         <span class="metric"><span class="status-dot" style="background:var(--ok)"></span>
-          <b>${summary.devboxOnline}</b>/${summary.devboxTotal} devboxes online</span>
+          <b>${summary.devboxOnline}</b>/${summary.devboxTotal} online</span>
         <span class="metric"><b>${summary.agentOnline}</b>/${summary.agentTotal} agents</span>
       </div>
       <div class="fleet-search">
-        <span class="icon">\u2315</span>
-        <input id="fleet-q" placeholder="Search devboxes and agents" value="${esc(fleetQuery)}"/>
+        <span class="icon">⌕</span>
+        <input id="fleet-q" placeholder="Search this workspace" value="${esc(fleetQuery)}"/>
       </div>
     </div>
     <div class="fleet-list">${listHtml}</div>`;
 
+  fleet.querySelectorAll('[data-workspace]').forEach(button=>button.onclick=()=>selectWorkspace(button.dataset.workspace));
+  const createWorkspaceButton = document.getElementById('new-workspace'); if(createWorkspaceButton) createWorkspaceButton.onclick = createWorkspace;
+  const manageWorkspaceButton = document.getElementById('workspace-manage'); if(manageWorkspaceButton) manageWorkspaceButton.onclick = ()=>openWorkspaceManager(workspace.id);
   const q = document.getElementById('fleet-q');
   if(q){
     q.oninput = () => { fleetQuery = q.value; renderFleet();
@@ -367,6 +438,158 @@ function renderFleet() {
   });
   fleet.querySelectorAll('[data-token]').forEach(b=>b.onclick=()=>rotateToken(b.dataset.token));
   fleet.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>delDevbox(b.dataset.del));
+}
+
+function selectWorkspace(workspaceId){
+  if(!workspaces.some(workspace=>workspace.id === workspaceId)) return;
+  activeWorkspaceId = workspaceId;
+  try { localStorage.setItem('deepbox.workspace', workspaceId); } catch {}
+  fleetQuery = '';
+  clearAgentView();
+  renderFleet();
+}
+
+async function createWorkspace(){
+  const values = await showForm({
+    title:'Create workspace',
+    desc:'A workspace shares every devbox and agent with its members.',
+    fields:[{name:'name', label:'Workspace name', placeholder:'Product engineering', required:true}],
+    submit:'Create workspace'
+  });
+  if(!values) return;
+  try {
+    const created = await api('/api/workspaces', {method:'POST', body:JSON.stringify({name:values.name})});
+    activeWorkspaceId = created.id;
+    try { localStorage.setItem('deepbox.workspace', created.id); } catch {}
+    if(await loadDevboxes()) { clearAgentView(); renderFleet(); }
+  } catch(error) { showAlert('Could not create workspace', error.message); }
+}
+
+function workspaceRoleOptions(workspace){
+  const options = [
+    {value:'viewer', label:'Viewer — read and replay'},
+    {value:'operator', label:'Operator — interact with agents'}
+  ];
+  if(workspace.role === 'owner') options.push({value:'admin', label:'Admin — manage devboxes and invitations'});
+  return options;
+}
+
+async function openWorkspaceManager(workspaceId){
+  const workspace = workspaces.find(item=>item.id === workspaceId);
+  if(!workspace) return;
+  const canAdmin = ui.canAdminWorkspace(workspace.role);
+  try {
+    const members = await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/members`);
+    const invitations = canAdmin
+      ? await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/invitations`)
+      : [];
+    const memberRows = members.map(member=>`<div class="workspace-member">
+      <span class="avatar">${esc(ui.initials(member.display_name||member.username))}</span>
+      <span class="workspace-member-name"><b>${esc(member.display_name||member.username)}</b><small>@${esc(member.username)}</small></span>
+      <span class="workspace-member-role">${esc(member.role)}</span>
+    </div>`).join('');
+    const inviteRows = invitations.map(invitation=>{
+      const state = invitation.accepted_at ? 'joined' : invitation.revoked_at ? 'revoked' : 'pending';
+      return `<div class="workspace-invite-row" data-invitation-row="${esc(invitation.id)}">
+        <span><b>${esc(invitation.email)}</b><small>${esc(invitation.role)} · ${state}</small></span>
+        ${state==='pending'?`<button class="ghost compact" data-revoke-invitation="${esc(invitation.id)}">Revoke</button>`:''}
+      </div>`;
+    }).join('') || '<p class="muted workspace-none">No invitations yet.</p>';
+    const roleOptions = workspaceRoleOptions(workspace).map(option=>
+      `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
+    const adminHtml = canAdmin ? `<section class="workspace-manager-section">
+      <h4>Invite someone</h4>
+      <form id="workspace-invite-form" class="workspace-invite-form">
+        <input id="workspace-invite-email" type="email" placeholder="name@example.com" required/>
+        <select id="workspace-invite-role">${roleOptions}</select>
+        <button type="submit">Create invitation</button>
+      </form>
+      <div id="workspace-invite-result" class="workspace-invite-result" hidden>
+        <label>Share this one-time link</label>
+        <div><input id="workspace-invite-link" readonly/><button id="workspace-invite-copy" class="ghost">Copy</button></div>
+      </div>
+      <div class="workspace-invitations"><h4>Invitations</h4>${inviteRows}</div>
+    </section>` : '';
+
+    showModal({
+      title:workspace.name,
+      desc:`Workspace role: ${workspace.role}`,
+      bodyHtml:`<section class="workspace-manager-section"><h4>Members</h4>
+          <div class="workspace-members">${memberRows}</div></section>${adminHtml}`,
+      actions:[{label:'Close', primary:true, value:true}],
+      onReady:overlay=>{
+        overlay.querySelectorAll('[data-revoke-invitation]').forEach(button=>button.onclick=async()=>{
+          button.disabled = true;
+          try {
+            await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/invitations/${encodeURIComponent(button.dataset.revokeInvitation)}`, {method:'DELETE'});
+            const row = button.closest('[data-invitation-row]');
+            if(row){ row.querySelector('small').textContent = row.querySelector('small').textContent.replace('pending','revoked'); button.remove(); }
+          } catch(error) { button.disabled=false; showAlert('Could not revoke invitation', error.message); }
+        });
+        const form = overlay.querySelector('#workspace-invite-form');
+        if(!form) return;
+        form.onsubmit = async event=>{
+          event.preventDefault();
+          const submit = form.querySelector('button[type=submit]');
+          submit.disabled = true;
+          try {
+            const invitation = await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/invitations`, {
+              method:'POST', body:JSON.stringify({
+                email:overlay.querySelector('#workspace-invite-email').value,
+                role:overlay.querySelector('#workspace-invite-role').value})});
+            const result = overlay.querySelector('#workspace-invite-result');
+            const link = overlay.querySelector('#workspace-invite-link');
+            link.value = invitation.join_url;
+            result.hidden = false;
+            overlay.querySelector('#workspace-invite-copy').onclick = async()=>{
+              try { await navigator.clipboard.writeText(link.value); overlay.querySelector('#workspace-invite-copy').textContent='Copied'; }
+              catch { link.select(); }
+            };
+          } catch(error) { showAlert('Could not create invitation', error.message); }
+          finally { submit.disabled = false; }
+        };
+      }
+    });
+  } catch(error) { showAlert('Could not load workspace', error.message); }
+}
+
+async function presentWorkspaceInvitation(){
+  if(!pendingWorkspaceInvite || workspaceInviteOpen) return;
+  workspaceInviteOpen = true;
+  try {
+    const token = pendingWorkspaceInvite;
+    const preview = await api('/api/workspace-invitations/preview', {
+      method: 'POST', body: JSON.stringify({ token }),
+    });
+    const copy = ui.workspaceInvitationCopy(preview);
+    const accepted = await showModal({
+      title:copy.title,
+      desc:copy.description,
+      bodyHtml:`<div class="workspace-join-note">Signed in as <b>${esc(me.email||me.username)}</b></div>`,
+      actions:[
+        {label:'Not now', value:false},
+        {label:'Join workspace', primary:true, value:true}
+      ]
+    });
+    if(!accepted) return;
+    try {
+      const result = await api('/api/workspace-invitations/accept', {
+        method:'POST', body:JSON.stringify({token})});
+      clearPendingWorkspaceInvite();
+      activeWorkspaceId = result.workspace.id;
+      try { localStorage.setItem('deepbox.workspace', activeWorkspaceId); } catch {}
+      if(await loadDevboxes()) { clearAgentView(); renderFleet(); }
+      const acceptance = ui.workspaceAcceptanceCopy(result);
+      showAlert(acceptance.title, acceptance.description);
+    } catch(error) {
+      await showAlert('Could not join workspace', `${error.message} Check that you signed in with the invited Microsoft account.`);
+    }
+  } catch(error) {
+    clearPendingWorkspaceInvite();
+    await showAlert('Invitation unavailable', error.message);
+  } finally {
+    workspaceInviteOpen = false;
+  }
 }
 
 // Empty state for the terminal stage (no agent open).
@@ -474,7 +697,8 @@ async function createDevbox() {
     fields:[{name:'name', label:'Name', value:'My Devbox', required:true}],
     submit:'Create'});
   if(!name) return;
-  const res = await api('/api/devboxes',{method:'POST',body:JSON.stringify({name:name.name})});
+  const res = await api('/api/devboxes',{method:'POST',body:JSON.stringify({
+    name:name.name, workspace_id:activeWorkspaceId})});
   if (await loadDevboxes()) renderFleet();
   await showToken(res.token);
 }
@@ -1420,7 +1644,10 @@ let paletteState = null; // {items, filtered, index}
 function openCommandPalette(){
   if(!ui || !me) return;
   closeOverlay();
-  const items = ui.commandItems({devboxes, isOwner: me.role==='owner'});
+  const workspace = ui.selectWorkspace(workspaces, activeWorkspaceId);
+  const workspaceBoxes = workspace ? ui.devboxesForWorkspace(devboxes, workspace.id) : [];
+  let items = ui.commandItems({devboxes:workspaceBoxes, isOwner: me.role==='owner'});
+  if(!workspace || !ui.canAdminWorkspace(workspace.role)) items = items.filter(item=>item.id !== 'devbox.create');
   paletteState = {items, filtered: items, index: 0};
   const overlay = document.createElement('div');
   overlay.className = 'overlay';

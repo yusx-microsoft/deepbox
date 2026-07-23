@@ -146,6 +146,54 @@ test('moveSelection wraps in both directions', () => {
 });
 
 
+test('workspace selection keeps a valid preference and falls back to personal', () => {
+  const shared = {id: 'shared', name: 'Team'};
+  const personal = {id: 'personal', name: 'Mine', is_personal: true};
+  assert.strictEqual(ui.selectWorkspace([shared, personal], 'shared'), shared);
+  assert.strictEqual(ui.selectWorkspace([shared, personal], 'missing'), personal);
+  assert.equal(ui.selectWorkspace([], 'missing'), null);
+});
+
+test('workspace devbox filtering never leaks boxes from another workspace', () => {
+  const mine = {id: 'a', workspace_id: 'one'};
+  const theirs = {id: 'b', workspace_id: 'two'};
+  assert.deepEqual(ui.devboxesForWorkspace([mine, theirs, null], 'one'), [mine]);
+  assert.deepEqual(ui.devboxesForWorkspace(null, 'one'), []);
+});
+
+test('only workspace owners and admins receive workspace admin controls', () => {
+  assert.equal(ui.canAdminWorkspace('owner'), true);
+  assert.equal(ui.canAdminWorkspace('admin'), true);
+  assert.equal(ui.canAdminWorkspace('operator'), false);
+  assert.equal(ui.canAdminWorkspace('viewer'), false);
+});
+
+test('workspace invitation copy follows the preview API flat response contract', () => {
+  assert.deepEqual(ui.workspaceInvitationCopy({
+    workspace_name: 'Model Lab', role: 'operator', email_hint: 'a***@example.com',
+  }), {
+    title: 'Join Model Lab',
+    description: 'You were invited as operator. Every member can access all devboxes and agents in this workspace. Invitation: a***@example.com.',
+  });
+  assert.equal(ui.workspaceInvitationCopy(null).title, 'Join workspace');
+});
+
+test('workspace acceptance copy distinguishes new and existing memberships', () => {
+  assert.deepEqual(ui.workspaceAcceptanceCopy({
+    workspace: {name: 'Model Lab'}, role: 'operator', already_member: false,
+  }), {
+    title: 'Workspace joined',
+    description: 'You now have operator access to Model Lab.',
+  });
+  assert.deepEqual(ui.workspaceAcceptanceCopy({
+    workspace: {name: 'Model Lab'}, role: 'viewer', already_member: true,
+  }), {
+    title: 'Already a member',
+    description: 'You already have viewer access to Model Lab.',
+  });
+});
+
+
 test('terminal focus policy protects forms but restores xterm deliberately', () => {
   assert.equal(ui.shouldFocusTerminal(false, 'INPUT', false), false);
   assert.equal(ui.shouldFocusTerminal(false, 'BUTTON', false), false);
