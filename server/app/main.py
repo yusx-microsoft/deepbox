@@ -22,8 +22,9 @@ from sqlalchemy.orm import Session as OrmSession
 
 from . import models
 from .models import (
-    User, Devbox, Token, Agent, Session, Message, BootstrapState, Invitation,
-    Organization, Workspace, Membership, SessionParticipant, KeyboardLease,
+    User, Devbox, DevboxProject, Token, Agent, Session, Message, BootstrapState,
+    Invitation, Organization, Workspace, Membership, SessionParticipant,
+    KeyboardLease,
     PROTOCOL_VERSION, ROLE_OWNER, ROLE_MEMBER, now,
     WS_ROLE_OWNER, WS_ROLE_ADMIN, WS_ROLE_OPERATOR, WS_ROLE_VIEWER,
     VALID_WS_ROLES,
@@ -661,18 +662,29 @@ async def remove_workspace_member(workspace_id: str, user_id: str, request: Requ
 
 def _agent_json(a: Agent) -> dict:
     return {"id": a.id, "handle": a.handle, "display_name": a.display_name,
-            "runtime": a.runtime, "cwd": a.cwd, "launch_cmd": a.launch_cmd,
+            "runtime": a.runtime, "local_project_id": a.local_project_id,
+            "runtime_config": a.runtime_config or {},
+            # Legacy bridge only: the connector imports this path locally and a
+            # successful project report clears it from the server.
+            "cwd": a.cwd, "launch_cmd": a.launch_cmd,
             "presence": "online" if hub.is_agent_online(a.id) else "offline"}
+
+
+def _project_json(project: DevboxProject) -> dict:
+    """Path-free project metadata safe to expose through the control plane."""
+    return {"id": project.id, "name": project.name,
+            "runtime_config": project.runtime_config or {}}
 
 
 def _connector_agent_dir(agents: list[Agent]) -> list[dict]:
     """Agent directory in the shape the connector's supervisor consumes.
 
-    Mirrors the ``/api/me`` payload (id/handle/runtime/cwd/launch_cmd) so a
-    live-pushed ``agents`` frame and a fresh ``fetch_me`` produce an identical
-    runtime lookup on the connector.
+    Mirrors the ``/api/me`` payload so a live-pushed ``agents`` frame and a
+    fresh bootstrap produce an identical runtime lookup on the connector.
     """
     return [{"id": a.id, "handle": a.handle, "runtime": a.runtime,
+             "local_project_id": a.local_project_id,
+             "runtime_config": a.runtime_config or {},
              "cwd": a.cwd, "launch_cmd": a.launch_cmd}
             for a in agents]
 
@@ -760,6 +772,7 @@ def _devbox_json(d: Devbox) -> dict:
             "online": hub.is_devbox_online(d.id),
             "last_seen_at": d.last_seen_at.isoformat() if d.last_seen_at else None,
             "capabilities": d.capabilities,
+            "projects": [_project_json(p) for p in d.projects],
             "agents": [_agent_json(a) for a in d.agents]}
 
 
@@ -874,10 +887,21 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     body = await request.json()
+    local_project_id = body.get("local_project_id") or None
+    if local_project_id:
+        project = s.get(DevboxProject, local_project_id)
+        if not project or project.devbox_id != d.id:
+            raise HTTPException(422, "local project does not belong to this devbox")
+    runtime_config = body.get("runtime_config") or {}
+    if not isinstance(runtime_config, dict):
+        raise HTTPException(422, "runtime_config must be an object")
+    if len(json.dumps(runtime_config)) > 16 * 1024:
+        raise HTTPException(422, "runtime_config is too large")
     a = Agent(
         id=new_id(), devbox_id=d.id,
         handle=body["handle"], display_name=body.get("display_name") or body["handle"],
         runtime=body.get("runtime", "mock"),
+        local_project_id=local_project_id, runtime_config=runtime_config,
         cwd=body.get("cwd"), launch_cmd=body.get("launch_cmd"),
     )
     s.add(a)
@@ -1101,9 +1125,8 @@ async def me_devbox(request: Request, s: OrmSession = Depends(db)):
     d = devbox_from_bearer(request, s)
     return {"devbox_id": d.id, "name": d.name,
             "protocol_version": PROTOCOL_VERSION,
-            "agents": [{"id": a.id, "handle": a.handle, "runtime": a.runtime,
-                        "cwd": a.cwd, "launch_cmd": a.launch_cmd}
-                       for a in d.agents]}
+            "projects": [_project_json(project) for project in d.projects],
+            "agents": _connector_agent_dir(list(d.agents))}
 
 
 @app.post("/api/devboxes/{devbox_id}/runtimes")
@@ -1115,6 +1138,89 @@ async def report_runtimes(devbox_id: str, request: Request, s: OrmSession = Depe
     d.capabilities = body.get("capabilities")
     s.commit()
     return {"ok": True}
+
+
+@app.post("/api/devboxes/{devbox_id}/projects")
+async def report_projects(devbox_id: str, request: Request,
+                          s: OrmSession = Depends(db)):
+    """Replace connector-owned project metadata without receiving local paths."""
+    d = devbox_from_bearer(request, s)
+    if d.id != devbox_id:
+        raise HTTPException(403, "wrong devbox")
+    body = await request.json()
+    raw_projects = body.get("projects", [])
+    raw_migrations = body.get("migrations", [])
+    if not isinstance(raw_projects, list) or not isinstance(raw_migrations, list):
+        raise HTTPException(422, "projects and migrations must be arrays")
+    if len(raw_projects) > 500 or len(raw_migrations) > 1000:
+        raise HTTPException(422, "project report is too large")
+
+    projects: dict[str, dict] = {}
+    for item in raw_projects:
+        if not isinstance(item, dict):
+            raise HTTPException(422, "project entries must be objects")
+        project_id = item.get("id")
+        name = item.get("name")
+        runtime_config = item.get("runtime_config") or {}
+        if (not isinstance(project_id, str) or not project_id or len(project_id) > 64
+                or not isinstance(name, str) or not name.strip() or len(name) > 200
+                or not isinstance(runtime_config, dict)
+                or len(json.dumps(runtime_config)) > 16 * 1024):
+            raise HTTPException(422, "invalid project metadata")
+        if any(key in item for key in ("path", "cwd", "root")):
+            raise HTTPException(422, "local paths are not accepted")
+        if project_id in projects:
+            raise HTTPException(422, "duplicate project id")
+        claimed = s.get(DevboxProject, project_id)
+        if claimed is not None and claimed.devbox_id != d.id:
+            raise HTTPException(422, "project id belongs to another devbox")
+        projects[project_id] = {
+            "name": name.strip(), "runtime_config": runtime_config}
+
+    migrations: list[tuple[str, str]] = []
+    for item in raw_migrations:
+        if not isinstance(item, dict):
+            raise HTTPException(422, "migration entries must be objects")
+        agent_id = item.get("agent_id")
+        project_id = item.get("local_project_id")
+        if not isinstance(agent_id, str) or project_id not in projects:
+            raise HTTPException(422, "invalid project migration")
+        migrations.append((agent_id, project_id))
+
+    existing = {project.id: project for project in s.scalars(select(
+        DevboxProject).where(DevboxProject.devbox_id == d.id)).all()}
+    for project_id, metadata in projects.items():
+        project = existing.get(project_id)
+        if project is None:
+            project = DevboxProject(
+                id=project_id, devbox_id=d.id,
+                name=metadata["name"], runtime_config=metadata["runtime_config"])
+            s.add(project)
+        else:
+            project.name = metadata["name"]
+            project.runtime_config = metadata["runtime_config"]
+    s.flush()
+
+    agents = {agent.id: agent for agent in s.scalars(select(
+        Agent).where(Agent.devbox_id == d.id)).all()}
+    for agent_id, project_id in migrations:
+        agent = agents.get(agent_id)
+        if agent is None:
+            raise HTTPException(422, "migration agent does not belong to this devbox")
+        agent.local_project_id = project_id
+    # One release-cycle privacy bridge: after any successful authoritative report,
+    # no absolute legacy cwd remains in the server database.
+    for agent in agents.values():
+        agent.cwd = None
+        if agent.local_project_id not in projects:
+            agent.local_project_id = None
+    for project_id, project in existing.items():
+        if project_id not in projects:
+            s.delete(project)
+    s.commit()
+    await _push_agent_directory(d.id)
+    return {"ok": True, "projects": len(projects),
+            "migrations": len(migrations)}
 
 
 # ---------------------------------------------------------------- WS: devbox (connector)
@@ -1290,14 +1396,34 @@ async def ws_devbox(ws: WebSocket):
             elif t in ("ready", "presence"):
                 sid = frame.get("session_id")
                 if sid:
+                    outbound = frame
                     if t == "ready":
                         conn.active_session_ids.add(sid)
-                    await hub.to_session_humans(sid, frame)
+                        outbound = {
+                            **frame,
+                            "type": "session.ready",
+                            "surface": frame.get("surface", "terminal"),
+                        }
+                    await hub.to_session_humans(sid, outbound)
                 if t == "presence":
                     a = s.get(Agent, frame.get("agent_id"))
                     if a:
                         a.presence = frame.get("state", "online")
                         s.commit()
+            elif t == "runtime.unavailable":
+                sid = frame.get("session_id")
+                if sid:
+                    await hub.to_session_humans(sid, {
+                        "type": "runtime.unavailable",
+                        "session_id": sid,
+                        "code": frame.get("code", "runtime_unavailable"),
+                        "runtime": frame.get("runtime"),
+                        "surface": frame.get("surface"),
+                        "installation": frame.get("installation"),
+                        "compatibility": frame.get("compatibility"),
+                        "authentication": frame.get("authentication"),
+                        "available_surfaces": frame.get("available_surfaces"),
+                    })
             elif t == "sessions":
                 conn.active_session_ids = {
                     item["session_id"] for item in frame.get("sessions", [])
@@ -1391,6 +1517,12 @@ async def ws_term(ws: WebSocket):
                 s.commit()
                 cols = frame.get("cols", 120)
                 rows = frame.get("rows", 30)
+                surface = frame.get("surface")
+                if surface not in (None, "structured", "terminal"):
+                    await ws.send_json({"type": "error",
+                                        "code": "invalid_surface",
+                                        "message": "invalid session surface"})
+                    continue
                 # ensure a LiveSession exists (rebuilds screen from .cast if server restarted)
                 ls = live_registry.get_or_create(sess.id, cols, rows)
                 ls.subscribers.add(conn)
@@ -1411,7 +1543,8 @@ async def ws_term(ws: WebSocket):
                 # 2) ask the connector to ensure the PTY is alive (idempotent)
                 ok = await hub.to_devbox(sess.agent_id, {
                     "type": "open", "agent_id": sess.agent_id,
-                    "session_id": sess.id, "cols": cols, "rows": rows})
+                    "session_id": sess.id, "cols": cols, "rows": rows,
+                    "surface": surface})
                 await ws.send_json({"type": "status", "session_id": sess.id,
                                     "state": "live" if ok else "offline"})
             elif t == "keyboard_acquire":

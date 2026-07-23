@@ -42,7 +42,9 @@ __all__ = [
     "get",
     "has",
     "all_adapters",
+    "runtime_families",
     "runtime_ids",
+    "get_for_surface",
     "build_command",
     "validate_executable",
     "validate_program",
@@ -191,6 +193,22 @@ class RuntimeAdapter:
     permission_modes: dict[str, tuple[str, ...]] = field(default_factory=dict)
     environment: dict[str, str] = field(default_factory=dict)
     probe_hint: Callable[[], bool] | None = None
+    # Capability-v2 identity. Multiple internal adapters may expose different
+    # surfaces for one user-facing runtime family during the rolling migration.
+    family: str | None = None
+    surface: str | None = None
+    default_surface: bool = False
+    install_url: str | None = None
+    install_command: str | None = None
+    auth_argv: tuple[str, ...] = ()
+    version_argv: tuple[str, ...] = ("--version",)
+    allow_custom_models: bool = True
+    # Optional safe model-discovery hook. It receives stdout from a declared
+    # argv probe and returns model ids; credentials and raw output never leave
+    # the connector. Current CLIs without a stable listing command report their
+    # adapter catalogue as partial instead of pretending it is complete.
+    model_discovery_argv: tuple[str, ...] = ()
+    model_discovery_parser: Callable[[str], tuple[str, ...]] | None = None
     # When True this runtime is driven headless via a structured JSON protocol
     # (connector.agent_session.StructuredAgentSession) instead of a PTY. The
     # web UI renders a chat surface (bubbles/tool cards/permission prompts)
@@ -211,6 +229,14 @@ class RuntimeAdapter:
     @property
     def executable(self) -> str:
         return self.base_argv[0]
+
+    @property
+    def family_id(self) -> str:
+        return self.family or self.id
+
+    @property
+    def surface_id(self) -> str:
+        return self.surface or ("structured" if self.structured else "terminal")
 
     def capabilities(self, *, installed: bool, version: str | None = None,
                      path: str | None = None) -> dict:
@@ -262,6 +288,15 @@ def register(adapter: RuntimeAdapter, *, replace: bool = False) -> RuntimeAdapte
     validate_executable(adapter.base_argv[0])
     validate_argv(list(adapter.base_argv))
     # Validate declared permission-mode flag tokens up front.
+    if adapter.surface_id not in {"structured", "terminal"}:
+        raise InvalidCommandError(
+            f"adapter {adapter.id!r} has unsupported surface {adapter.surface_id!r}")
+    if not adapter.family_id:
+        raise InvalidCommandError("adapter family must be non-empty")
+    for declared in (adapter.version_argv, adapter.auth_argv,
+                     adapter.model_discovery_argv):
+        if declared:
+            validate_argv([adapter.executable, *declared])
     for mode, extra in adapter.permission_modes.items():
         for tok in extra:
             if not isinstance(tok, str) or tok == "":
@@ -293,15 +328,35 @@ def get(runtime_id: str) -> RuntimeAdapter:
 
 
 def has(runtime_id: str) -> bool:
-    return runtime_id in _REGISTRY
+    return runtime_id in _REGISTRY or any(
+        adapter.family_id == runtime_id for adapter in _REGISTRY.values())
 
 
 def all_adapters() -> list[RuntimeAdapter]:
     return list(_REGISTRY.values())
 
 
+def runtime_families() -> list[str]:
+    """Return user-facing family ids in deterministic registration order."""
+    return list(dict.fromkeys(adapter.family_id for adapter in _REGISTRY.values()))
+
+
 def runtime_ids() -> list[str]:
     return list(_REGISTRY)
+
+
+def get_for_surface(runtime_id: str, surface: str) -> RuntimeAdapter:
+    """Resolve a family or legacy adapter id to one explicit surface."""
+    family_id = (_REGISTRY[runtime_id].family_id
+                 if runtime_id in _REGISTRY else runtime_id)
+    candidates = [adapter for adapter in _REGISTRY.values()
+                  if adapter.family_id == family_id and adapter.surface_id == surface]
+    if not candidates:
+        available = sorted({adapter.surface_id for adapter in _REGISTRY.values()
+                            if adapter.family_id == family_id})
+        raise UnknownRuntimeError(
+            f"runtime {runtime_id!r} has no {surface!r} surface; available: {available}")
+    return candidates[0]
 
 
 def build_command(runtime_id: str, *, model: str | None = None,
@@ -326,7 +381,13 @@ def build_command(runtime_id: str, *, model: str | None = None,
         if adapter.model_flag is None:
             raise InvalidCommandError(
                 f"runtime {runtime_id!r} does not accept a model")
-        if adapter.models and chosen_model not in adapter.models:
+        valid_model = (isinstance(chosen_model, str)
+                       and 0 < len(chosen_model) <= 200
+                       and not any(ord(ch) < 0x20 for ch in chosen_model))
+        if not valid_model:
+            raise InvalidCommandError(f"runtime {runtime_id!r} received invalid model id")
+        if (adapter.models and chosen_model not in adapter.models
+                and not adapter.allow_custom_models):
             raise InvalidCommandError(
                 f"runtime {runtime_id!r} does not support model {chosen_model!r}; "
                 f"allowed: {list(adapter.models)}")
@@ -353,8 +414,14 @@ def sanitize_options(runtime_id: str, raw: object) -> dict:
     if not isinstance(raw, dict):
         return {}
     clean = {}
+    permission_mode = raw.get("permission_mode")
+    if (isinstance(permission_mode, str)
+            and permission_mode in adapter.permission_modes):
+        clean["permission_mode"] = permission_mode
     model = raw.get("model")
-    if isinstance(model, str) and model in adapter.models:
+    if (isinstance(model, str) and 0 < len(model) <= 200
+            and not any(ord(ch) < 0x20 for ch in model)
+            and (model in adapter.models or adapter.allow_custom_models)):
         clean["model"] = model
     for control in adapter.controls:
         value = raw.get(control.key)
@@ -405,12 +472,15 @@ _REGISTRY["mock"] = RuntimeAdapter(
     label="Mock Agent",
     base_argv=(sys.executable, "-u", "-m", "connector.mockcli"),
     probe_hint=lambda: True,
+    family="mock", surface="terminal", default_surface=True,
+    version_argv=(), allow_custom_models=False,
 )
 
 register(RuntimeAdapter(
     id="claude-code",
     label="Claude Code",
     base_argv=("claude",),
+    family="claude-code", surface="terminal",
     model_flag="--model",
     models=("sonnet", "opus", "haiku"),
     permission_modes={
@@ -420,12 +490,16 @@ register(RuntimeAdapter(
         "plan": ("--permission-mode", "plan"),
         "bypassPermissions": ("--dangerously-skip-permissions",),
     },
+    install_url="https://docs.anthropic.com/en/docs/claude-code/overview",
+    install_command="npm install -g @anthropic-ai/claude-code",
+    auth_argv=("auth", "status"),
 ))
 
 register(RuntimeAdapter(
     id="copilot-cli",
     label="GitHub Copilot CLI",
     base_argv=("copilot",),
+    family="copilot-cli", surface="terminal",
     model_flag="--model",
     models=("gpt-5", "claude-sonnet-4.5"),
     permission_modes={
@@ -433,12 +507,18 @@ register(RuntimeAdapter(
         "default": (),
         "allowAll": ("--allow-all-tools",),
     },
+    install_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
+    install_command="npm install -g @github/copilot",
+    # Copilot exposes interactive /login, not a reliable non-interactive
+    # authentication-status command. Report "unknown" instead of blocking it.
+    auth_argv=(),
 ))
 
 register(RuntimeAdapter(
     id="codex-cli",
     label="Codex CLI",
     base_argv=("codex",),
+    family="codex-cli", surface="terminal", default_surface=True,
     model_flag="--model",
     models=("gpt-5-codex", "o4-mini"),
     permission_modes={
@@ -447,6 +527,9 @@ register(RuntimeAdapter(
         "auto": ("--ask-for-approval", "on-failure"),
         "full-auto": ("--ask-for-approval", "never", "--sandbox", "workspace-write"),
     },
+    install_url="https://developers.openai.com/codex/cli/",
+    install_command="npm install -g @openai/codex",
+    auth_argv=("login", "status"),
 ))
 
 # ---------------------------------------------------------------------------
@@ -464,7 +547,8 @@ register(RuntimeAdapter(
 # ---------------------------------------------------------------------------
 register(RuntimeAdapter(
     id="claude-code-structured",
-    label="Claude Code (chat)",
+    label="Claude Code",
+    family="claude-code", surface="structured", default_surface=True,
     base_argv=(
         "claude", "-p",
         "--output-format", "stream-json",
@@ -486,6 +570,9 @@ register(RuntimeAdapter(
             accept="text/*,.md,.json,.yaml,.yml,.py,.js,.ts,.tsx,.css,.html",
             max_files=4, max_total_bytes=1024 * 1024),
     ),
+    install_url="https://docs.anthropic.com/en/docs/claude-code/overview",
+    install_command="npm install -g @anthropic-ai/claude-code",
+    auth_argv=("auth", "status"),
     permission_modes={
         # Default trusts this session (auto-accept edits) per product decision.
         "": ("--permission-mode", "acceptEdits"),
@@ -498,7 +585,8 @@ register(RuntimeAdapter(
 
 register(RuntimeAdapter(
     id="copilot-cli-structured",
-    label="GitHub Copilot (chat)",
+    label="GitHub Copilot CLI",
+    family="copilot-cli", surface="structured", default_surface=True,
     # Copilot's ``-p`` runs one prompt then exits, emitting newline-delimited
     # JSON. Each user turn spawns a fresh process (per_turn=True); the prompt
     # text is appended after ``prompt_argv``. Context does not currently carry
@@ -519,13 +607,18 @@ register(RuntimeAdapter(
         RuntimeControl(
             key="reasoning_effort", label="Reasoning", kind="select",
             scope="turn",
-            choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+            choices=("low", "medium", "high", "xhigh", "max"),
             flag="--reasoning-effort"),
         RuntimeControl(
             key="attachments", label="Files", kind="file", scope="turn",
             flag="--attachment", max_files=4,
             max_total_bytes=4 * 1024 * 1024),
     ),
+    install_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli",
+    install_command="npm install -g @github/copilot",
+    # Authentication is interactive via /login; do not turn an unprobeable
+    # status into a false-negative spawn gate.
+    auth_argv=(),
     permission_modes={
         # Non-interactive turns require tool auto-approval; make it the default.
         "": ("--allow-all-tools",),

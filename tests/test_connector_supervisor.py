@@ -435,6 +435,46 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(p.killed)
         self.assertEqual(len(sup.ptys), 0)
 
+    async def test_structured_turn_uses_sanitized_runtime_permission_mode(self):
+        calls = []
+        sessions = []
+
+        def capture_resolve(runtime, launch, **kwargs):
+            calls.append(kwargs)
+            return ["fake"]
+
+        class FakeStructuredSession:
+            def __init__(self, *args, command_builder=None,
+                         option_sanitizer=None, **kwargs):
+                self.command_builder = command_builder
+                self.option_sanitizer = option_sanitizer
+                self.alive = True
+                sessions.append(self)
+
+            async def start(self):
+                options = self.option_sanitizer({})
+                self.command_builder(options, [])
+
+            def is_alive(self):
+                return self.alive
+
+            def kill(self):
+                self.alive = False
+
+        sup = SessionSupervisor({"a": {
+            "runtime": "claude-code",
+            "runtime_config": {"permission_mode": "plan"},
+        }})
+        with mock.patch.object(supervisor_mod, "resolve_cmd", capture_resolve),                 mock.patch.object(supervisor_mod, "StructuredAgentSession",
+                                  FakeStructuredSession),                 mock.patch.object(supervisor_mod, "probe_family",
+                                  return_value={}),                 mock.patch.object(supervisor_mod, "availability",
+                                  return_value=(True, None)):
+            await sup.open_pty("a", "s", surface="structured")
+
+        self.assertEqual(len(sessions), 1)
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[-1]["permission_mode"], "plan")
+
 
 class SupervisorBootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_bootstrap_failure_does_not_bind_empty_supervisor(self):

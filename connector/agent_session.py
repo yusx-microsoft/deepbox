@@ -350,6 +350,8 @@ class StructuredAgentSession:
         self._attachment_max_bytes = max(0, int(attachment_max_bytes or 0))
         self._session_option_keys = tuple(session_option_keys)
         self._session_options: dict[str, object] | None = None
+        self._turn_end_seen = False
+        self._streamed_assistant_text = False
         self._proc = None
         self._alive = False
         self._stderr_tail: list[str] = []
@@ -529,11 +531,18 @@ class StructuredAgentSession:
             if not line:
                 break
             await self._handle_line(line)
+        code = 0
         try:
-            await proc.wait()
+            code = await proc.wait()
         except Exception:
             pass
-        await self._emit(_event(EV_TURN_END, subtype="process_exit"))
+        # Some CLIs communicate completion only by exiting. Do not add a second
+        # turn boundary when their structured transcript already supplied one.
+        if not self._turn_end_seen:
+            self._turn_end_seen = True
+            await self._emit(_event(
+                EV_TURN_END, subtype="process_exit", is_error=bool(code),
+                result=None))
 
     async def _read_stdout(self, proc):
         stream = proc.stdout
@@ -579,15 +588,43 @@ class StructuredAgentSession:
         try:
             obj = json.loads(text)
         except json.JSONDecodeError:
-            await self._emit(_event(EV_STATUS, note=text[:500]))
+            # Never relay arbitrary native output; it can contain provider
+            # internals or secrets and is not part of the display-safe protocol.
+            await self._emit(_event(EV_ERROR, message="Agent emitted invalid JSON"))
             return
-        for ev in self._translate(obj):
-            await self._emit(ev)
+
+        native_type = obj.get("type")
+        stream_type = ((obj.get("event") or {}).get("type")
+                       if native_type == "stream_event" else None)
+        if stream_type == "message_start":
+            self._streamed_assistant_text = False
+
+        events = self._translate(obj)
+        # Claude emits both partial Messages API events and a full assistant
+        # snapshot when --include-partial-messages is enabled. Keep the live
+        # deltas and suppress only duplicated text in the later snapshot; tool
+        # snapshots remain useful because they contain the completed input.
+        if native_type == "assistant" and self._streamed_assistant_text:
+            events = [event for event in events
+                      if event.get("ev") != EV_MESSAGE]
+            self._streamed_assistant_text = False
+
+        for event in events:
+            ev = event.get("ev")
+            if (native_type == "stream_event" and ev == EV_MESSAGE_DELTA
+                    and event.get("text")):
+                self._streamed_assistant_text = True
+            if ev == EV_TURN_END:
+                if self._turn_end_seen:
+                    continue
+                self._turn_end_seen = True
+            await self._emit(event)
 
     async def _emit(self, ev: dict):
         await self.on_output(json.dumps(ev))
 
     async def _dispatch_turn(self, data: str, raw_options: object):
+        self._turn_end_seen = False
         options = self._option_sanitizer(raw_options)
         if not self._per_turn and self._session_option_keys:
             if self._session_options is None:

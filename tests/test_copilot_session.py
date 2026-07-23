@@ -159,6 +159,7 @@ async def _co_per_turn():
     evs = [e["ev"] for e in got]
     assert A.EV_MESSAGE_DELTA in evs
     assert A.EV_TURN_END in evs
+    assert evs.count(A.EV_TURN_END) == 1
 
 
 def test_per_turn_session_drives_one_process_per_turn_sync():

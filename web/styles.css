@@ -437,8 +437,12 @@ h2,h3,h4{margin:0;font-weight:650;letter-spacing:-0.01em}
 .chat-composer{border-top:1px solid var(--border);background:var(--panel);padding:10px 12px 12px}
 .chat-controls{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px;margin-bottom:9px}
 .chat-control{display:flex;flex-direction:column;gap:3px;color:var(--fg-muted);font-size:10px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
-.chat-control select{min-width:118px;padding:5px 26px 5px 8px;border-color:var(--border-strong);background-color:var(--well);color:var(--fg);font-size:12px;text-transform:none;letter-spacing:0}
-.chat-control select:disabled{cursor:not-allowed;opacity:.58}
+.chat-control select,.chat-control input{min-width:118px;padding:5px 26px 5px 8px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);background-color:var(--well);color:var(--fg);font:12px var(--sans);text-transform:none;letter-spacing:0}
+.chat-control select:disabled,.chat-control input:disabled{cursor:not-allowed;opacity:.58}
+.runtime-setup-row{display:grid;gap:7px;padding:12px 0;border-bottom:1px solid var(--border)}
+.runtime-setup-row:last-child{border-bottom:0}
+.runtime-setup-row>div:first-child{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.runtime-command{display:block;max-width:100%;overflow:auto;padding:8px 10px;border-radius:var(--radius-sm);background:var(--well);color:var(--fg);font:12px/1.5 var(--mono);white-space:nowrap}
 .chat-attach{align-self:flex-end;padding:5px 10px;border:1px solid var(--border-strong);background:var(--panel-2);color:var(--fg-muted);font-size:12px;font-weight:500}
 .chat-attach:hover{border-color:var(--accent-ring);color:var(--fg);background:var(--panel-hover)}
 .chat-file-tray{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}

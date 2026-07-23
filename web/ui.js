@@ -32,20 +32,98 @@
     return value || 'runtime';
   }
 
+  function isCapabilityV2(capability){
+    return !!(capability && Number(capability.schema_version) >= 2
+      && Array.isArray(capability.surfaces));
+  }
+
+  function findRuntimeCapability(capabilities, runtimeId){
+    const wanted = String(runtimeId || '');
+    const list = Array.isArray(capabilities) ? capabilities : [];
+    return list.find(capability=> capability && (
+      capability.runtime === wanted
+      || (Array.isArray(capability.legacy_runtime_ids)
+        && capability.legacy_runtime_ids.includes(wanted))
+      || (Array.isArray(capability.surfaces)
+        && capability.surfaces.some(surface=>surface.legacy_runtime_id === wanted))
+    )) || null;
+  }
+
   function runtimeOptions(capabilities){
-    if(!Array.isArray(capabilities)) return [];
     const seen = new Set();
-    const options = [];
-    for(const capability of capabilities){
-      if(capability && typeof capability === 'object' && capability.installed === false) continue;
-      const value = typeof capability === 'string' ? capability : capability?.runtime;
-      if(typeof value !== 'string') continue;
-      const id = value.trim();
+    const out = [];
+    for(const capability of Array.isArray(capabilities) ? capabilities : []){
+      if(!capability) continue;
+      const installed = typeof capability === 'string' || (isCapabilityV2(capability)
+        ? capability.installation?.status === 'installed'
+        : capability.installed !== false);
+      if(!installed) continue;
+      const id = String(typeof capability === 'string' ? capability : capability.runtime || '').trim();
       if(!id || seen.has(id)) continue;
-      seen.add(id);
-      options.push(id);
+      seen.add(id); out.push(id);
     }
-    return options;
+    return out;
+  }
+
+  function localProjectOptions(projects){
+    const seen = new Set();
+    const out = [];
+    for(const project of Array.isArray(projects) ? projects : []){
+      const id = String(project?.id || '').trim();
+      const name = String(project?.name || '').trim();
+      if(!id || !name || seen.has(id)) continue;
+      seen.add(id);
+      out.push({id, name});
+    }
+    return out;
+  }
+
+  function runtimeInventory(capabilities){
+    return (Array.isArray(capabilities) ? capabilities : []).filter(Boolean).map(capability=>{
+      const v2 = isCapabilityV2(capability);
+      return {
+        id: String(capability.runtime || ''),
+        label: String(capability.label || runtimeLabel(capability.runtime)),
+        installation: v2
+          ? String(capability.installation?.status || 'unknown')
+          : (capability.installed === false ? 'missing' : 'installed'),
+        compatibility: v2
+          ? String(capability.compatibility?.status || 'unknown') : 'unknown',
+        authentication: v2
+          ? String(capability.authentication?.status || 'unknown') : 'unknown',
+        guidance: v2 ? (capability.installation?.guidance || {}) : {},
+      };
+    }).filter(item=>item.id);
+  }
+
+  function preferredSurface(capability){
+    if(!isCapabilityV2(capability)){
+      return capability?.features?.structured ? 'structured' : 'terminal';
+    }
+    const surfaces = capability.surfaces;
+    const selected = surfaces.find(surface=>surface.default)
+      || surfaces.find(surface=>surface.id === 'structured') || surfaces[0];
+    return selected ? selected.id : null;
+  }
+
+  function capabilityForSurface(capability, surfaceId){
+    if(!isCapabilityV2(capability)) return capability;
+    const selectedId = surfaceId || preferredSurface(capability);
+    const surface = capability.surfaces.find(item=>item.id === selectedId);
+    if(!surface) return null;
+    const features = {...(surface.features || {}), structured:selectedId === 'structured'};
+    const modelContract = capability.models || {};
+    const modelIds = Array.isArray(modelContract.items)
+      ? modelContract.items.map(item=>String(item?.id || '')).filter(Boolean) : [];
+    features.controls = (Array.isArray(features.controls) ? features.controls : []).map(control=>{
+      if(control?.key !== 'model') return control;
+      return {
+        ...control,
+        choices:modelIds.length ? modelIds : (control.choices || []),
+        allow_custom:!!modelContract.allow_custom,
+      };
+    });
+    return {...capability, surface:selectedId, surface_available:!!surface.available, features};
   }
 
   function agentApiPath(agentId){
@@ -58,8 +136,8 @@
   // export the two env vars, then pipe the hosted one-line installer. The
   // installer sets up ~/.deepbox (venv + deps) on first run and reuses it after,
   // so the user never clones the repo or installs dependencies by hand.
-  const INSTALL_PS1_URL = 'https://deeporca.blob.core.windows.net/deepbox/install.ps1';
-  const INSTALL_SH_URL = 'https://deeporca.blob.core.windows.net/deepbox/install.sh';
+  const INSTALL_PS1_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1';
+  const INSTALL_SH_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh';
   function windowsConnectorCommand(serverUrl, token){
     const server = String(serverUrl == null ? '' : serverUrl).trim();
     const secret = String(token == null ? '' : token).trim();
@@ -108,9 +186,11 @@
 
   // ---- status helpers ----------------------------------------------------
 
-  function supportsStructuredChat(capability){
-    return !!(capability && typeof capability === 'object' &&
-      capability.features && capability.features.structured === true);
+  function supportsStructuredChat(capability, surfaceId){
+    if(isCapabilityV2(capability)){
+      return (surfaceId || capability.surface || preferredSurface(capability)) === 'structured';
+    }
+    return !!capability?.features?.structured;
   }
 
   // Devbox connection state -> {state, label}. Text is never colour-only.
@@ -285,7 +365,13 @@
     escapeHtml: escapeHtml,
     initials: initials,
     runtimeLabel: runtimeLabel,
+    isCapabilityV2: isCapabilityV2,
+    findRuntimeCapability: findRuntimeCapability,
     runtimeOptions: runtimeOptions,
+    localProjectOptions: localProjectOptions,
+    runtimeInventory: runtimeInventory,
+    preferredSurface: preferredSurface,
+    capabilityForSurface: capabilityForSurface,
     agentApiPath: agentApiPath,
     windowsConnectorCommand: windowsConnectorCommand,
     unixConnectorCommand: unixConnectorCommand,

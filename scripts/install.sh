@@ -6,12 +6,12 @@
 # deepbox server. No git clone and no manual dependency wrangling.
 #
 # Interactive (prompts for server URL + token):
-#     curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash
 #
 # Non-interactive (pre-set the two values):
 #     export DEEPBOX_SERVER_URL='https://deepbox-sixingyu-pa.azurewebsites.net'
 #     export DEEPBOX_TOKEN='hpc_box_xxxxxxxx'
-#     curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash
 #
 # Everything lands under ~/.deepbox and can be removed by deleting that folder.
 # The token is never written to disk; it is passed to the connector process via

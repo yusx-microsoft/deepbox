@@ -157,3 +157,41 @@ test('single-flight gate coalesces a cold burst and resets after settlement', as
   assert.equal(await runOnce(async () => { calls += 1; return 'next'; }), 'next');
   assert.equal(calls, 2);
 });
+
+
+test('capability v2 uses discovered models and permits an explicit custom model', () => {
+  const controls = C.controlsFromCapability({
+    schema_version: 2, models: {items: [{id: 'dynamic-model'}], allow_custom: true},
+    surfaces: [{id: 'structured', default: true, features: {controls: [
+      {key: 'model', label: 'Model', kind: 'select', scope: 'session', choices: ['fallback']},
+    ]}}],
+  });
+  assert.deepEqual(controls[0].choices, ['dynamic-model']);
+  assert.equal(controls[0].allow_custom, true);
+  assert.deepEqual(C.buildTurnOptions(controls, {model: 'future-model'}, {}),
+    {model: 'future-model'});
+  assert.deepEqual(C.reconcileControlValues(controls, {}, {model: 'future-model'}),
+    {model: 'future-model'});
+});
+
+test('tool snapshots update the streaming card with the same tool id', () => {
+  const state = C.initialChatState();
+  C.applyEvent(state, {
+    ev: 'tool.call', tool: 'Read', tool_id: 'tool-1', input: {}, streaming: true,
+  });
+  C.applyEvent(state, {
+    ev: 'tool.call', tool: 'Read', tool_id: 'tool-1',
+    input: { file_path: 'README.md' }, streaming: false,
+  });
+  const tools = state.items.filter((item) => item.kind === 'tool');
+  assert.equal(tools.length, 1);
+  assert.deepEqual(tools[0].input, { file_path: 'README.md' });
+  assert.equal(tools[0].streaming, false);
+});
+
+test('duplicate adjacent turn boundaries render once', () => {
+  const state = C.initialChatState();
+  C.applyEvent(state, { ev: 'turn.end', result: 'ok' });
+  C.applyEvent(state, { ev: 'turn.end', result: 'ok' });
+  assert.equal(state.items.filter((item) => item.kind === 'turn').length, 1);
+});

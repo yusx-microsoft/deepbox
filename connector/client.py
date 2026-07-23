@@ -36,7 +36,6 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
 
 import httpx
 import websockets
@@ -53,7 +52,8 @@ from .ipc import (
     serve_channel,
 )
 from .pty_session import DEFAULT_CMDS
-from . import runtimes
+from .local_store import LocalProjectStore, open_local_store
+from .runtime_probe import RuntimeProbeCache
 from .supervisor import SessionSupervisor
 from .spool import open_spool
 from .transport import (
@@ -97,13 +97,17 @@ class Connector:
     attaches a :class:`TransportSession` over a fresh loopback channel.
     """
 
-    def __init__(self, server_url: str, token: str, spool=None):
+    def __init__(self, server_url: str, token: str, spool=None,
+                 local_store: LocalProjectStore | None = None):
         self.server_url = server_url.rstrip("/")
         self.token = token
-        self.supervisor = SessionSupervisor(spool=spool)
+        self.local_store = local_store
+        self.supervisor = SessionSupervisor(
+            spool=spool, local_store=local_store)
         self.ws = None
         self.connect_count = 0
         self.last_heartbeat_ack = None
+        self.runtime_probe_cache = RuntimeProbeCache()
 
     # -- compatibility shims (used by tests and older call sites) ---------
 
@@ -113,7 +117,7 @@ class Connector:
 
     @agents.setter
     def agents(self, value: dict[str, dict]) -> None:
-        self.supervisor.agents = value
+        self.supervisor.replace_agents(value)
 
     @property
     def ptys(self):
@@ -162,8 +166,10 @@ class Connector:
     async def handle(self, raw: str):
         await self.supervisor.handle_control(json.loads(raw))
 
-    async def open_pty(self, agent_id, session_id, cols=120, rows=30):
-        await self.supervisor.open_pty(agent_id, session_id, cols, rows)
+    async def open_pty(self, agent_id, session_id, cols=120, rows=30,
+                       surface=None):
+        await self.supervisor.open_pty(
+            agent_id, session_id, cols, rows, surface=surface)
 
     # -- HTTP bootstrap ----------------------------------------------------
 
@@ -177,40 +183,57 @@ class Connector:
         if server_protocol != PROTOCOL_VERSION:
             raise RuntimeError(
                 f"protocol mismatch: connector={PROTOCOL_VERSION}, server={server_protocol}")
-        self.supervisor.agents = {a["id"]: a for a in data["agents"]}
+        self.supervisor.replace_agents(data["agents"])
         print(f"[connector] devbox={data['name']} agents={[a['handle'] for a in data['agents']]}")
         return data
 
-    def probe_runtimes(self) -> list[dict]:
-        """Detect installed runtimes and return presentation-safe capabilities.
+    def probe_runtimes(self, devbox_id: str = "local", *,
+                       force: bool = False) -> list[dict]:
+        """Return capability-v2 reports for every registered runtime family.
 
-        Iterates the runtime adapter registry rather than a hard-coded table, so
-        adding a runtime and its generic UI controls stays localized to one
-        adapter definition.
+        Missing CLIs are deliberately included so the browser can explain how
+        to install them. The connector reports normalized states only: never
+        executable paths, raw probe output, environment values, or credentials.
         """
-        caps = []
-        for adapter in runtimes.all_adapters():
-            installed = (bool(adapter.probe_hint())
-                         if adapter.probe_hint is not None
-                         else bool(shutil.which(adapter.executable)))
-            if installed:
-                caps.append(adapter.capabilities(installed=True))
-        return caps
+        return self.runtime_probe_cache.probe_all(devbox_id, force=force)
 
     async def report_runtimes(self, devbox_id: str, caps: list[dict]):
         async with httpx.AsyncClient() as c:
-            await c.post(f"{self.server_url}/api/devboxes/{devbox_id}/runtimes",
-                         headers={"Authorization": f"Bearer {self.token}"},
-                         json={"capabilities": caps})
+            response = await c.post(
+                f"{self.server_url}/api/devboxes/{devbox_id}/runtimes",
+                headers={"Authorization": f"Bearer {self.token}"},
+                json={"capabilities": caps})
+            response.raise_for_status()
+
+    async def report_projects(self, devbox_id: str):
+        """Publish path-free project metadata and one-cycle cwd migrations."""
+        if self.local_store is None:
+            return
+        migrations = self.supervisor.pending_project_migrations()
+        async with httpx.AsyncClient() as c:
+            response = await c.post(
+                f"{self.server_url}/api/devboxes/{devbox_id}/projects",
+                headers={"Authorization": f"Bearer {self.token}"},
+                json={
+                    "projects": self.local_store.public_projects(),
+                    "migrations": migrations,
+                })
+            response.raise_for_status()
+        self.supervisor.clear_project_migrations(migrations)
 
     # -- main run loop -----------------------------------------------------
 
     async def run(self):
         print(f"[connector] authenticating with {self.server_url} (protocol {PROTOCOL_VERSION})")
         me = await self.fetch_me()
-        caps = self.probe_runtimes()
+        await self.report_projects(me["devbox_id"])
+        caps = self.probe_runtimes(me["devbox_id"])
         await self.report_runtimes(me["devbox_id"], caps)
-        print(f"[connector] runtimes available: {caps}")
+        summary = [
+            f"{cap['runtime']}:{cap['installation']['status']}"
+            for cap in caps
+        ]
+        print(f"[connector] runtime capabilities: {summary}")
         print(f"[connector] opening WebSocket {ws_url(self.server_url)}")
 
         # New loopback channel per WS connection. Attaching/detaching the
@@ -264,8 +287,10 @@ class SupervisorService:
     """
 
     def __init__(self, agents: dict[str, dict] | None = None,
-                 endpoint: str | None = None, spool=None):
-        self.supervisor = SessionSupervisor(agents, spool=spool)
+                 endpoint: str | None = None, spool=None,
+                 local_store: LocalProjectStore | None = None):
+        self.supervisor = SessionSupervisor(
+            agents, spool=spool, local_store=local_store)
         self.endpoint = endpoint or default_endpoint()
         self._server = None
         self._busy = asyncio.Lock()  # enforces one transport at a time
@@ -316,25 +341,32 @@ class SupervisorService:
 
 
 async def run_supervisor(server_url: str, token: str,
-                         endpoint: str | None = None) -> None:
+                         endpoint: str | None = None,
+                         state_path: str | None = None) -> None:
     """Run a standalone sessiond that also bootstraps agents from the server."""
     # Fail closed if the catalogue cannot be loaded. An empty catalogue would
     # silently resolve real agent IDs to the mock runtime.
-    bootstrap = Connector(server_url, token)
-    me = await bootstrap.fetch_me()
-    caps = bootstrap.probe_runtimes()
-    await bootstrap.report_runtimes(me["devbox_id"], caps)
-    print("[sessiond] runtimes available: " + ", ".join(
-        str(cap.get("runtime", "unknown")) for cap in caps))
+    local_store = open_local_store(state_path)
+    try:
+        bootstrap = Connector(server_url, token, local_store=local_store)
+        me = await bootstrap.fetch_me()
+        await bootstrap.report_projects(me["devbox_id"])
+        caps = bootstrap.probe_runtimes()
+        await bootstrap.report_runtimes(me["devbox_id"], caps)
+        print("[sessiond] runtimes available: " + ", ".join(
+            str(cap.get("runtime", "unknown")) for cap in caps))
 
-    address = endpoint or default_endpoint()
-    if endpoint_exists(address):
-        # A previous supervisor may have died leaving a stale POSIX socket.
-        if cleanup_stale_endpoint(endpoint=address):
-            print(f"[sessiond] removed stale endpoint state for {address}")
-    service = SupervisorService(dict(bootstrap.agents), endpoint=address,
-                                spool=open_spool(server_url, token))
-    await service.serve()
+        address = endpoint or default_endpoint()
+        if endpoint_exists(address):
+            # A previous supervisor may have died leaving a stale POSIX socket.
+            if cleanup_stale_endpoint(endpoint=address):
+                print(f"[sessiond] removed stale endpoint state for {address}")
+        service = SupervisorService(
+            dict(bootstrap.agents), endpoint=address,
+            spool=open_spool(server_url, token), local_store=local_store)
+        await service.serve()
+    finally:
+        local_store.close()
 
 
 async def run_transport(server_url: str, token: str,
@@ -392,6 +424,42 @@ def _status_payload(server_url: str, mode: str) -> dict:
     }
 
 
+async def _project_command(args) -> None:
+    store = open_local_store(args.state_path)
+    try:
+        project = None
+        if args.project_action == "add":
+            project = store.add(args.path, args.name)
+            print(f"[connector] project added: {project.name} ({project.id}) -> {project.path}")
+        elif args.project_action == "remove":
+            if not store.remove(args.project_id):
+                raise SystemExit(f"unknown project id: {args.project_id}")
+            print(f"[connector] project removed: {args.project_id}")
+        elif args.project_action == "list":
+            projects = store.list_projects()
+            if not projects:
+                print("No local projects registered.")
+            for item in projects:
+                print(f"{item.id}  {item.name}  {item.path}")
+        elif args.project_action != "sync":
+            raise SystemExit("choose a project action: add, remove, list, or sync")
+
+        should_sync = args.project_action == "sync" or (
+            args.project_action in {"add", "remove"} and bool(args.token))
+        if should_sync:
+            if not args.token:
+                raise SystemExit("DEEPBOX_TOKEN or --token is required to sync projects")
+            connector = Connector(
+                args.server_url, args.token, local_store=store)
+            me = await connector.fetch_me()
+            await connector.report_projects(me["devbox_id"])
+            print("[connector] project metadata synced (local paths stayed on this machine)")
+        elif args.project_action in {"add", "remove"}:
+            print("[connector] local change will sync the next time the connector starts")
+    finally:
+        store.close()
+
+
 async def main():
     ap = argparse.ArgumentParser("deepbox-connector")
     ap.add_argument("--server-url", default=os.environ.get("DEEPBOX_SERVER_URL",
@@ -404,6 +472,17 @@ async def main():
                          "transport: WS owner that reconnects to a local sessiond")
     ap.add_argument("--endpoint", default=os.environ.get("DEEPBOX_IPC_ENDPOINT"),
                     help="override the local IPC endpoint (advanced)")
+    ap.add_argument("--state-path", default=None, help=argparse.SUPPRESS)
+    project_parser = ap.add_subparsers(dest="command").add_parser(
+        "project", help="manage connector-local project paths")
+    project_actions = project_parser.add_subparsers(dest="project_action")
+    project_add = project_actions.add_parser("add", help="register a local directory")
+    project_add.add_argument("path")
+    project_add.add_argument("--name", default=None)
+    project_remove = project_actions.add_parser("remove", help="remove a project id")
+    project_remove.add_argument("project_id")
+    project_actions.add_parser("list", help="list local projects")
+    project_actions.add_parser("sync", help="sync path-free metadata to the server")
     ap.add_argument("--doctor", action="store_true",
                     help="check URL, TLS, health, protocol, and authentication, then exit")
     ap.add_argument("--status", action="store_true",
@@ -415,6 +494,10 @@ async def main():
         "supervisor": "supervisor (sessiond; owns PTYs, serves IPC)",
         "transport": "transport (owns WS; connects to sessiond)",
     }[args.mode]
+
+    if args.command == "project":
+        await _project_command(args)
+        return
 
     if args.status:
         print(json.dumps(_status_payload(args.server_url, mode_label), indent=2))
@@ -436,20 +519,27 @@ async def main():
         raise SystemExit("Set DEEPBOX_TOKEN or pass --token")
 
     if args.mode == "supervisor":
-        await run_supervisor(args.server_url, args.token, args.endpoint)
+        await run_supervisor(
+            args.server_url, args.token, args.endpoint, args.state_path)
         return
     if args.mode == "transport":
         await run_transport(args.server_url, args.token, args.endpoint)
         return
 
-    c = Connector(args.server_url, args.token,
-                  spool=open_spool(args.server_url, args.token))
-    while True:
-        try:
-            await c.run()
-        except Exception as exc:
-            print(f"[connector] disconnected: {explain_connection_error(exc)}; retry in 3s")
-            await asyncio.sleep(3)
+    local_store = open_local_store(args.state_path)
+    c = Connector(
+        args.server_url, args.token,
+        spool=open_spool(args.server_url, args.token),
+        local_store=local_store)
+    try:
+        while True:
+            try:
+                await c.run()
+            except Exception as exc:
+                print(f"[connector] disconnected: {explain_connection_error(exc)}; retry in 3s")
+                await asyncio.sleep(3)
+    finally:
+        local_store.close()
 
 
 if __name__ == "__main__":

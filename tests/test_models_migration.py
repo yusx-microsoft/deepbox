@@ -105,6 +105,18 @@ class LegacyBackfillTests(unittest.TestCase):
                         models.text("PRAGMA table_info(keyboard_lease)"))
                 }
                 self.assertIn("version", lease_cols)
+
+                agent_cols = {
+                    row[1] for row in db.execute(
+                        models.text("PRAGMA table_info(agent)"))
+                }
+                self.assertIn("local_project_id", agent_cols)
+                self.assertIn("runtime_config", agent_cols)
+                project_table = db.execute(models.text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='devbox_project'"
+                )).first()
+                self.assertIsNotNone(project_table)
             finally:
                 db.close()
                 engine.dispose()

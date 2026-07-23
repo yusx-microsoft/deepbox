@@ -76,6 +76,23 @@ class Devbox(Base):
         back_populates="devbox", cascade="all, delete-orphan")
     agents: Mapped[list["Agent"]] = relationship(
         back_populates="devbox", cascade="all, delete-orphan")
+    projects: Mapped[list["DevboxProject"]] = relationship(
+        back_populates="devbox", cascade="all, delete-orphan")
+
+
+class DevboxProject(Base):
+    """Path-free metadata for a connector-owned local directory."""
+    __tablename__ = "devbox_project"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    devbox_id: Mapped[str] = mapped_column(
+        ForeignKey("devbox.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String)
+    runtime_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=now, onupdate=now)
+
+    devbox: Mapped[Devbox] = relationship(back_populates="projects")
 
 
 class Token(Base):
@@ -97,7 +114,11 @@ class Agent(Base):
     devbox_id: Mapped[str] = mapped_column(ForeignKey("devbox.id", ondelete="CASCADE"))
     handle: Mapped[str] = mapped_column(String)
     display_name: Mapped[str] = mapped_column(String)
-    runtime: Mapped[str] = mapped_column(String, default="mock")  # mock|claude-code|copilot-cli|codex-cli
+    runtime: Mapped[str] = mapped_column(String, default="mock")  # runtime adapter/family id
+    local_project_id: Mapped[str | None] = mapped_column(
+        ForeignKey("devbox_project.id", ondelete="SET NULL"), nullable=True)
+    runtime_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # One-cycle bridge for pre-project agents; cleared after connector import.
     cwd: Mapped[str | None] = mapped_column(String, nullable=True)
     launch_cmd: Mapped[str | None] = mapped_column(String, nullable=True)
     presence: Mapped[str] = mapped_column(String, default="offline")  # offline|online|busy|error
@@ -370,6 +391,16 @@ def _migrate(engine) -> None:
         devbox_cols = {c["name"] for c in inspector.get_columns("devbox")}
         if "workspace_id" not in devbox_cols:
             stmts.append("ALTER TABLE devbox ADD COLUMN workspace_id VARCHAR")
+    if "agent" in inspector.get_table_names():
+        agent_cols = {c["name"] for c in inspector.get_columns("agent")}
+        if "local_project_id" not in agent_cols:
+            stmts.append(
+                "ALTER TABLE agent ADD COLUMN local_project_id VARCHAR "
+                "REFERENCES devbox_project(id) ON DELETE SET NULL")
+        if "runtime_config" not in agent_cols:
+            stmts.append(
+                "ALTER TABLE agent ADD COLUMN runtime_config JSON "
+                "NOT NULL DEFAULT '{}'")
     if "session" in inspector.get_table_names():
         session_cols = {c["name"] for c in inspector.get_columns("session")}
         if "workspace_id" not in session_cols:

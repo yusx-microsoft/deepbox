@@ -28,6 +28,8 @@ from uuid import UUID, uuid4
 from .ipc import Channel
 from .pty_session import PtySession, resolve_cmd
 from .agent_session import StructuredAgentSession
+from .runtime_probe import availability, probe_family
+from .local_store import LocalProjectStore
 from . import runtimes
 from .spool import InMemorySpool, SpoolBase
 
@@ -71,11 +73,16 @@ class SessionSupervisor:
     """Owns every PtySession for this devbox, independent of any transport."""
 
     def __init__(self, agents: dict[str, dict] | None = None,
-                 spool: SpoolBase | None = None):
-        self.agents: dict[str, dict] = agents or {}
+                 spool: SpoolBase | None = None,
+                 local_store: LocalProjectStore | None = None):
+        self.local_store = local_store
+        self.agents: dict[str, dict] = {}
+        self._project_migrations: dict[str, dict] = {}
+        self.replace_agents(agents or {})
         # key = (agent_id, session_id) -> PtySession and stable process identity.
         self.ptys: dict[tuple[str, str], PtySession] = {}
         self.pty_instances: dict[tuple[str, str], str] = {}
+        self.pty_surfaces: dict[tuple[str, str], str] = {}
         # Durable, sequence-numbered store of un-acked PTY output. Unit tests
         # may inject an InMemorySpool; the CLI injects a DiskSpool.
         self._spool: SpoolBase = spool if spool is not None else InMemorySpool()
@@ -102,6 +109,36 @@ class SessionSupervisor:
         # Un-acked frames recovered from a prior run are immediately eligible.
         if self._spool.pending_records():
             self.pending_event.set()
+
+    # -- local project resolution -----------------------------------------
+
+    def _resolve_agents(self, agents) -> dict[str, dict]:
+        if isinstance(agents, dict):
+            values = []
+            for agent_id, value in agents.items():
+                item = dict(value)
+                item.setdefault("id", agent_id)
+                values.append(item)
+        else:
+            values = list(agents)
+        if self.local_store is None:
+            return {agent["id"]: dict(agent) for agent in values}
+        resolved, migrations = self.local_store.resolve_agents(values)
+        for migration in migrations:
+            self._project_migrations[migration["agent_id"]] = migration
+        return resolved
+
+    def replace_agents(self, agents) -> None:
+        self.agents = self._resolve_agents(agents)
+
+    def pending_project_migrations(self) -> list[dict]:
+        return list(self._project_migrations.values())
+
+    def clear_project_migrations(self, migrations: list[dict]) -> None:
+        for migration in migrations:
+            agent_id = migration.get("agent_id")
+            if self._project_migrations.get(agent_id) == migration:
+                self._project_migrations.pop(agent_id, None)
 
     # -- transport attach/detach ------------------------------------------
 
@@ -271,7 +308,7 @@ class SessionSupervisor:
                    or not agent["id"].strip()
                    for agent in agents):
                 return
-            updated = {agent["id"]: dict(agent) for agent in agents}
+            updated = self._resolve_agents(agents)
             removed_agent_ids = set(self.agents) - set(updated)
             self.agents = updated
             if removed_agent_ids:
@@ -302,11 +339,14 @@ class SessionSupervisor:
                             pass
                         self.ptys.pop(key, None)
                         self.pty_instances.pop(key, None)
+                        self.pty_surfaces.pop(key, None)
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
         if t == "open":
-            await self.open_pty(aid, sid, frame.get("cols", 120), frame.get("rows", 30))
+            await self.open_pty(
+                aid, sid, frame.get("cols", 120), frame.get("rows", 30),
+                surface=frame.get("surface"))
         elif t == "input":
             p = self.ptys.get((aid, sid))
             client_input_id = frame.get("client_input_id")
@@ -346,6 +386,7 @@ class SessionSupervisor:
             if p:
                 p.kill()
             self.pty_instances.pop(key, None)
+            self.pty_surfaces.pop(key, None)
         elif t == "list_sessions":
             self.emit(self.sessions_frame())
 
@@ -380,30 +421,111 @@ class SessionSupervisor:
                 "agent_id": aid,
                 "session_id": sid,
                 "pty_instance_id": self.pty_instances[(aid, sid)],
+                "surface": self.pty_surfaces.get((aid, sid), "terminal"),
             } for aid, sid in self.ptys.keys()],
         }
 
     async def open_pty(self, agent_id: str, session_id: str,
-                       cols: int = 120, rows: int = 30) -> None:
+                       cols: int = 120, rows: int = 30,
+                       surface: str | None = None) -> None:
         key = (agent_id, session_id)
         existing = self.ptys.get(key)
         if existing and existing.is_alive():
+            confirmed = self.pty_surfaces.get(key, "terminal")
+            if surface and surface != confirmed:
+                self.emit({
+                    "type": "runtime.unavailable",
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "code": "surface_mismatch",
+                    "surface": surface,
+                    "available_surfaces": [confirmed],
+                })
+                return
             self.emit({"type": "ready", "agent_id": agent_id,
                        "session_id": session_id,
-                       "pty_instance_id": self.pty_instances[key]})
+                       "pty_instance_id": self.pty_instances[key],
+                       "surface": confirmed,
+                       "structured": confirmed == "structured"})
             return
         if existing:
             # A child can be killed outside the supervisor while the platform PTY
             # reader is still blocked. Do not advertise that stale handle as ready.
             self.ptys.pop(key, None)
             self.pty_instances.pop(key, None)
+            self.pty_surfaces.pop(key, None)
         pty_instance_id = str(uuid4())
-        info = self.agents.get(agent_id, {})
-        runtime_id = info.get("runtime", "mock")
-        cmd = resolve_cmd(runtime_id, info.get("launch_cmd"),
-                          model=info.get("model"),
-                          permission_mode=info.get("permission_mode"))
-        structured = runtimes.has(runtime_id) and runtimes.get(runtime_id).structured
+        info = self.agents.get(agent_id)
+        if not info:
+            return
+        if info.get("project_error"):
+            self.emit({
+                "type": "runtime.unavailable",
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "runtime": info.get("runtime") or "",
+                "code": "project_unavailable",
+                "message": str(info["project_error"]),
+            })
+            return
+        configured_runtime = info.get("runtime", "mock")
+        try:
+            if surface:
+                if configured_runtime in runtimes.runtime_ids():
+                    family = runtimes.get(configured_runtime).family_id
+                else:
+                    family = configured_runtime
+                adapter = runtimes.get_for_surface(family, surface)
+            elif configured_runtime in runtimes.runtime_ids():
+                # Compatibility for old agents/browsers during the rolling
+                # migration: an exact legacy adapter id keeps its old surface.
+                adapter = runtimes.get(configured_runtime)
+            else:
+                candidates = [item for item in runtimes.all_adapters()
+                              if item.family_id == configured_runtime]
+                adapter = next((item for item in candidates
+                                if item.default_surface), candidates[0])
+        except (runtimes.UnknownRuntimeError, IndexError):
+            self.emit({
+                "type": "runtime.unavailable",
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "code": "surface_unavailable",
+                "runtime": configured_runtime,
+                "surface": surface,
+            })
+            return
+        runtime_id = adapter.id
+        confirmed_surface = adapter.surface_id
+
+        # The server-side capability blob is a cached self-report, not an auth
+        # gate. Re-probe installation/auth/compatibility immediately before every
+        # spawn and return a structured, non-secret failure when unavailable.
+        capability = await asyncio.to_thread(
+            probe_family, adapter.family_id, include_models=False)
+        can_spawn, reason = availability(capability, confirmed_surface)
+        if not can_spawn:
+            self.emit({
+                "type": "runtime.unavailable",
+                "agent_id": agent_id,
+                "session_id": session_id,
+                "code": reason,
+                "runtime": adapter.family_id,
+                "surface": confirmed_surface,
+                "installation": capability["installation"]["status"],
+                "compatibility": capability["compatibility"]["status"],
+                "authentication": capability["authentication"]["status"],
+            })
+            return
+        runtime_config = (info.get("runtime_config")
+                          if isinstance(info.get("runtime_config"), dict)
+                          else {})
+        cmd = resolve_cmd(
+            runtime_id, info.get("launch_cmd"),
+            model=runtime_config.get("model", info.get("model")),
+            permission_mode=runtime_config.get(
+                "permission_mode", info.get("permission_mode")))
+        structured = adapter.structured
 
         async def on_output(data: str):
             if agent_id not in self.agents:
@@ -429,19 +551,24 @@ class SessionSupervisor:
                        "pty_instance_id": pty_instance_id,
                        "code": code})
             self.pty_instances.pop(key, None)
+            self.pty_surfaces.pop(key, None)
 
         if structured:
-            adapter = runtimes.get(runtime_id)
             attachment = runtimes.attachment_control(runtime_id)
 
             def sanitize_options(value):
-                return runtimes.sanitize_options(runtime_id, value)
+                merged = dict(runtime_config)
+                if isinstance(value, dict):
+                    merged.update(value)
+                return runtimes.sanitize_options(runtime_id, merged)
 
             def build_turn_command(options, attachment_paths):
-                model = options.get("model") or info.get("model")
+                model = (options.get("model") or runtime_config.get("model")
+                         or info.get("model"))
                 base = resolve_cmd(
                     runtime_id, info.get("launch_cmd"), model=model,
-                    permission_mode=info.get("permission_mode"))
+                    permission_mode=(options.get("permission_mode")
+                                     or info.get("permission_mode")))
                 return base + runtimes.control_argv(
                     runtime_id, options, attachment_paths)
 
@@ -476,9 +603,11 @@ class SessionSupervisor:
             return
         self.ptys[key] = p
         self.pty_instances[key] = pty_instance_id
+        self.pty_surfaces[key] = confirmed_surface
         self.emit({"type": "ready", "agent_id": agent_id,
                    "session_id": session_id,
                    "pty_instance_id": pty_instance_id,
+                   "surface": confirmed_surface,
                    "structured": structured})
         self.emit({"type": "presence", "agent_id": agent_id, "state": "online"})
 
@@ -491,6 +620,7 @@ class SessionSupervisor:
                 "agent_id": aid,
                 "session_id": sid,
                 "pty_instance_id": self.pty_instances[(aid, sid)],
+                "surface": self.pty_surfaces.get((aid, sid), "terminal"),
             } for aid, sid in self.ptys.keys()],
             **spool_status,
         }
@@ -501,4 +631,5 @@ class SessionSupervisor:
             p.kill()
         self.ptys.clear()
         self.pty_instances.clear()
+        self.pty_surfaces.clear()
         self._spool.close()

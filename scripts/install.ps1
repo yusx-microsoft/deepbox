@@ -11,12 +11,12 @@
   Run it straight from the web:
 
       # Interactive (prompts for server URL + token):
-      irm https://deeporca.blob.core.windows.net/deepbox/install.ps1 | iex
+      irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
 
       # Non-interactive (pre-set the two values, then pipe):
       $env:DEEPBOX_SERVER_URL = 'https://deepbox-sixingyu-pa.azurewebsites.net'
       $env:DEEPBOX_TOKEN      = 'hpc_box_xxxxxxxx'
-      irm https://deeporca.blob.core.windows.net/deepbox/install.ps1 | iex
+      irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
 
   Everything is written under %USERPROFILE%\.deepbox and can be removed by
   deleting that folder. The installer never stores your token on disk: it is

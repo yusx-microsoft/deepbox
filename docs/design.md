@@ -62,9 +62,15 @@ deepradio 与 deepbox 的关键差异：
 ```
 user           id, username, password_hash, display_name, created_at
 devbox         id, owner_user_id, name, created_at, last_seen_at, capabilities(JSON)
+devbox_project id, devbox_id, name, runtime_config(JSON), created_at, updated_at
 token          id, devbox_id, hash, preview, created_at, last_used_at, revoked_at
-agent          id, devbox_id, handle, display_name, runtime, cwd, launch_cmd,
+agent          id, devbox_id, handle, display_name, runtime, local_project_id,
+               runtime_config(JSON), cwd, launch_cmd,
                presence(offline|online|busy|error), created_at
+
+`Devbox.capabilities` 是 connector 上报、Server 不解释的 opaque capability blob。当前 blob 的
+`schema_version` 为 `2`：每个 user-facing runtime family 包含安装/兼容性/认证状态、模型目录和
+`terminal` / `structured` surfaces；surface descriptor 才携带内部 adapter ID 与 controls。
 session        id, user_id, agent_id, title, created_at            # 一次人-agent 的会话/频道
 message        id, session_id, author_kind(user|agent|system),
                author_id, body, created_at
@@ -80,6 +86,18 @@ Token 规则（照搬 deepradio，已验证过的做法）：
 - `preview` = `hpc_box_` + 随机部分前 6 位 + `…`，供 UI 显示"是哪一个 token"。
 - 创建时**完整 token 只返回一次**，之后不可再取。
 - 可轮换（发新的）、可吊销（`revoked_at`，hub 立即断开在用的连接）。
+
+### LocalProject：路径只留在 connector
+
+每个 connector 在 `~/.deepbox/state.db` 保存 `local_project(id, name, path, created_at, updated_at)`。
+`id` 是稳定 opaque UUID，`path` 是 connector 本机解析后的绝对目录；Server 与 browser 只看到
+`{id, name}`，agent 通过 `local_project_id` 引用它。连接前，connector 把 ID 解析为实际 `cwd`；
+目录不存在或 ID 无法解析时返回 `project_error`，而不是上传路径或猜测默认目录。
+
+项目列表由 connector 通过 `POST /api/devboxes/{id}/projects` 权威替换。Server 校验 project/agent
+都属于同一 devbox；本地删除后的下一次 report 会删除 path-free 投影，并把引用它的 agent
+`local_project_id` 置空。旧 agent 的 `cwd` 只会短暂出现在 connector directory：connector 导入为
+LocalProject 并上报 migration 后，Server 在成功 report 内清空所有 legacy `cwd`。
 
 ---
 
@@ -103,12 +121,12 @@ connector ──WS upgrade, header: Authorization: Bearer hpc_box_...──▶ s
 server: 校验 token
         ├─ 无效/吊销 → close(4001)
         └─ 有效 → 解析 Devbox D
-                   载入 D 的 agents (agent WHERE devbox_id = D.id)
+                   载入 D 的 projects + agents（路径仍只在 connector 本机）
                    把所有 host 的 agent presence 置为 online
                    touch devbox.last_seen_at
                    conn = DevboxConn(..., outbound=Queue(maxsize=256))
                    注册路由；同 Devbox 的旧连接 retire + close(4002)
-                   先排 hello，再从 fresh DB snapshot 排权威 agents 目录
+                   先排 hello，再从 fresh DB snapshot 排权威 projects + agents 目录
 ```
 断开时：仅当该连接仍是 Hub 当前映射才清路由并把 agent 置为 offline；被替换旧连接的迟到 `finally` 不会覆盖新连接状态。
 
@@ -166,7 +184,9 @@ Connector 的 registry 是扩展边界。每个 adapter 描述：
 - model、permission 和 CLI argv 映射；
 - generic `select` / `file` controls 的 scope、choices、default 与 bounds。
 
-Probe 后 connector 上报 display-safe capability object。Server 将其作为 opaque JSON 保存；浏览器仅根据
+Probe 后 connector 上报 display-safe capability object。稳定 revision 忽略 probe 时间戳；动态发现的 model
+catalogue 会投影到各 surface 的 model control。只有可靠的非交互 authentication status probe 才能阻断启动，
+无法安全探测时状态为 `unknown`。Server 将 capability 作为 opaque JSON 保存；浏览器仅根据
 `features.structured` 选择 chat surface，并从 `features.controls` 生成 model/reasoning/file widgets。
 connector-local executable path 不上报，浏览器也没有 runtime-ID 特判。
 
@@ -186,7 +206,9 @@ Structured adapter 只向上游发送统一事件：
 - `error`
 
 事件只包含 UI 和恢复所需的 display-safe 字段，不包含 raw provider payload、chain-of-thought、token、
-模型凭证或工作站路径。live frame 与 restore JSONL 使用同一个 reducer。
+模型凭证或工作站路径。每个逻辑 turn 最多记录一个 `turn.end`；同一 `tool_id` 的流式开始与完整快照在
+reducer 中更新同一张工具卡。connector 会抑制 provider 在 delta 之后重复发送的完整文本快照。
+live frame 与 restore JSONL 使用同一个 reducer。
 
 ### 5.4 Frame protocol v3
 
@@ -234,12 +256,15 @@ Structured options 和附件在 connector 按 adapter descriptor 二次验证；
 **运行时（connector / Bearer token）**
 | 方法 · 路径 | 作用 |
 |---|---|
-| `GET /api/me` | 返回本 Devbox + 它要跑的 agent 名单（handle/runtime/cwd/launch_cmd） |
-| `POST /api/devboxes/:id/runtimes` `{capabilities}` | connector 在建 WS 前上报本机可用 CLI；Fleet Add agent 下拉框只列已上报 runtime |
+| `GET /api/me` | 返回本 Devbox 的 path-free projects、agents 与 legacy migration bridge |
+| `POST /api/devboxes/:id/runtimes` `{capabilities}` | connector 在建 WS 前上报 capability v2 inventory；包含未安装 family，Server 只作 opaque JSON 存储 |
+| `POST /api/devboxes/:id/projects` `{projects,migrations}` | connector 权威上报 `{id,name}` project 列表及旧 agent 迁移 |
+| `POST /api/devboxes/:id/agents` | 创建引用 `local_project_id` 的 agent；Server 校验同属该 devbox |
 
-> **配置切分（保护凭证）**：非机密的 per-agent 配置（handle、runtime、cwd、启动命令）存在
-> server，`GET /api/me` 下发。**任何 API key / 登录态** 只存在 connector 本地环境，
-> server 永不经手。这就是整个设计的意义所在。
+> **配置切分（保护凭证与本机路径）**：Server 只保存 handle、runtime、opaque local project ID
+> 和非机密 `runtime_config`；新流程不保存 absolute path。`cwd/launch_cmd` 字段仅为旧数据迁移桥接，
+> 成功 project report 后会清空。**任何 API key / 登录态以及 LocalProject path** 只存在 connector
+> 本地环境，Server 永不经手。这就是整个设计的意义所在。
 
 ---
 

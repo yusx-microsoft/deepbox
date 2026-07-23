@@ -39,6 +39,19 @@ test('runtimeOptions preserves reported adapter IDs and removes bad duplicates',
   assert.deepEqual(ui.runtimeOptions(null), []);
 });
 
+test('localProjectOptions keeps path-free ids and names only', () => {
+  assert.deepEqual(ui.localProjectOptions([
+    {id:'p1', name:'Deepbox', path:'C:\\Code\\deepbox'},
+    {id:'p1', name:'duplicate'},
+    {id:'p2', name:'  Research  '},
+    {id:'', name:'bad'}, null,
+  ]), [
+    {id:'p1', name:'Deepbox'},
+    {id:'p2', name:'Research'},
+  ]);
+  assert.deepEqual(ui.localProjectOptions(null), []);
+});
+
 test('agentApiPath safely addresses opaque agent IDs', () => {
   assert.equal(ui.agentApiPath('agent/with spaces'),
     '/api/agents/agent%2Fwith%20spaces');
@@ -49,7 +62,7 @@ test('windowsConnectorCommand is complete and directly copyable', () => {
     ui.windowsConnectorCommand('https://deepbox.example', 'hpc_box_test'),
     '$env:DEEPBOX_SERVER_URL = "https://deepbox.example"\n' +
       '$env:DEEPBOX_TOKEN = "hpc_box_test"\n' +
-      'irm https://deeporca.blob.core.windows.net/deepbox/install.ps1 | iex'
+      'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex'
   );
 });
 
@@ -58,7 +71,7 @@ test('unixConnectorCommand mirrors the Windows one-liner for POSIX shells', () =
     ui.unixConnectorCommand('https://deepbox.example', 'hpc_box_test'),
     'export DEEPBOX_SERVER_URL="https://deepbox.example"\n' +
       'export DEEPBOX_TOKEN="hpc_box_test"\n' +
-      'curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash'
+      'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash'
   );
 });
 
@@ -187,4 +200,42 @@ test('recognizes structured chat only from reported capability facts', () => {
   assert.equal(ui.supportsStructuredChat({structured:true}), false);
   assert.equal(ui.supportsStructuredChat({features:{structured:false}}), false);
   assert.equal(ui.supportsStructuredChat(null), false);
+});
+
+
+test('capability v2 resolves legacy IDs and defaults to structured surface', () => {
+  const capability = {
+    schema_version: 2, runtime: 'claude-code', legacy_runtime_ids: ['claude-code-structured'],
+    installation: {status: 'installed'}, compatibility: {status: 'compatible'},
+    authentication: {status: 'authenticated'},
+    models: {items: [{id: 'sonnet'}], allow_custom: true},
+    surfaces: [
+      {id: 'terminal', available: true, default: false, features: {controls: []}},
+      {id: 'structured', available: true, default: true, features: {controls: [
+        {key: 'model', kind: 'select', scope: 'session', choices: ['fallback']},
+      ]}},
+    ],
+  };
+  assert.strictEqual(ui.findRuntimeCapability([capability], 'claude-code-structured'), capability);
+  assert.equal(ui.preferredSurface(capability), 'structured');
+  const surface = ui.capabilityForSurface(capability, 'structured');
+  assert.equal(ui.supportsStructuredChat(surface), true);
+  const terminalSurface = ui.capabilityForSurface(capability, 'terminal');
+  assert.equal(ui.supportsStructuredChat(terminalSurface), false);
+  assert.equal(surface.features.structured, true);
+  assert.deepEqual(surface.features.controls[0].choices, ['sonnet']);
+  assert.equal(surface.features.controls[0].allow_custom, true);
+  assert.deepEqual(ui.runtimeOptions([capability]), ['claude-code']);
+});
+
+test('runtime inventory retains missing families for setup guidance', () => {
+  assert.deepEqual(ui.runtimeInventory([{
+    schema_version: 2, runtime: 'copilot-cli', label: 'Copilot CLI',
+    installation: {status: 'missing', guidance: {command: 'install copilot'}},
+    compatibility: {status: 'unknown'}, authentication: {status: 'unknown'}, surfaces: [],
+  }]), [{
+    id: 'copilot-cli', label: 'Copilot CLI', installation: 'missing',
+    compatibility: 'unknown', authentication: 'unknown',
+    guidance: {command: 'install copilot'},
+  }]);
 });

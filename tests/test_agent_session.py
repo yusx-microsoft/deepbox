@@ -204,6 +204,44 @@ def test_respond_permission_writes_control_sync():
     asyncio.run(_co_respond_perm())
 
 
+async def _co_canonical_dedup_and_safe_invalid_output():
+    events = []
+
+    async def on_output(raw):
+        events.append(json.loads(raw))
+
+    sess = A.StructuredAgentSession(["claude"], None, on_output, _noop)
+    transcript = [
+        {"type": "stream_event", "event": {
+            "type": "message_start", "message": {}}},
+        {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "hello"}}},
+        {"type": "stream_event", "event": {"type": "message_stop"}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hello"}]}},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "result": "ok"},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "result": "ok"},
+    ]
+    for item in transcript:
+        await sess._handle_line(json.dumps(item).encode())
+    await sess._handle_line(b"secret-looking non-json output")
+
+    assert sum(event.get("ev") == A.EV_TURN_END for event in events) == 1
+    assert sum(event.get("text") == "hello" for event in events) == 1
+    assert not any("secret-looking" in json.dumps(event) for event in events)
+    assert events[-1] == {
+        "ev": A.EV_ERROR,
+        "message": "Agent emitted invalid JSON",
+    }
+
+
+def test_canonical_events_deduplicate_and_hide_invalid_native_output():
+    asyncio.run(_co_canonical_dedup_and_safe_invalid_output())
+
+
 async def _noop(*a, **k):
     pass
 

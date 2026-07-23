@@ -69,14 +69,32 @@
         if (ev.final) state._openAssistant = null;
         break;
       }
-      case 'tool.call':
+      case 'tool.call': {
         state._openAssistant = null;
-        state.items.push({
-          kind: 'tool', tool: ev.tool, tool_id: ev.tool_id,
-          input: ev.input, streaming: !!ev.streaming, result: null,
-          is_error: false,
-        });
+        // A streaming tool start is followed by the provider's complete tool
+        // snapshot. Treat the shared tool_id as an update, not a second card.
+        let pending = null;
+        if (ev.tool_id) {
+          for (let i = state.items.length - 1; i >= 0; i--) {
+            const it = state.items[i];
+            if (it.kind === 'tool' && it.tool_id === ev.tool_id && it.result == null) {
+              pending = it; break;
+            }
+          }
+        }
+        if (pending) {
+          if (ev.tool) pending.tool = ev.tool;
+          if (ev.input !== undefined) pending.input = ev.input;
+          pending.streaming = !!ev.streaming;
+        } else {
+          state.items.push({
+            kind: 'tool', tool: ev.tool, tool_id: ev.tool_id,
+            input: ev.input, streaming: !!ev.streaming, result: null,
+            is_error: false,
+          });
+        }
         break;
+      }
       case 'tool.result': {
         // Attach to the matching tool card if present, else append a card.
         let matched = null;
@@ -104,6 +122,7 @@
         break;
       case 'turn.end':
         state._openAssistant = null;
+        if (state.items.length && state.items[state.items.length - 1].kind === 'turn') break;
         state.items.push({
           kind: 'turn', is_error: !!ev.is_error, cost_usd: ev.cost_usd,
           result: ev.result || null,
@@ -187,7 +206,14 @@
   // schema. Runtime IDs never appear here: a new adapter can add these widgets
   // without a frontend code change.
   function controlsFromCapability(capability) {
-    const features = capability && capability.features ? capability.features : capability;
+    let features = capability && capability.features ? capability.features : capability;
+    let models = capability && capability.models;
+    if (capability && Number(capability.schema_version) >= 2 &&
+        Array.isArray(capability.surfaces)) {
+      const surface = capability.surfaces.find(item => item.default) ||
+        capability.surfaces.find(item => item.id === 'structured') || capability.surfaces[0];
+      features = surface && surface.features;
+    }
     if (!features || !Array.isArray(features.controls)) return [];
     const seen = new Set();
     const controls = [];
@@ -206,9 +232,18 @@
       };
       if (kind === 'select') {
         control.choices = Array.isArray(raw.choices)
-          ? raw.choices.filter((value) => typeof value === 'string' && value.length <= 100)
-            .slice(0, 64) : [];
-        if (!control.choices.length) continue;
+          ? raw.choices.filter((value) => typeof value === 'string' && value.length <= 200)
+            .slice(0, 128) : [];
+        if (key === 'model' && models && Array.isArray(models.items)) {
+          const discovered = models.items.map(item => item && item.id)
+            .filter(value => typeof value === 'string' && value.length <= 200)
+            .slice(0, 128);
+          if (discovered.length) control.choices = discovered;
+          control.allow_custom = models.allow_custom === true;
+        } else {
+          control.allow_custom = raw.allow_custom === true;
+        }
+        if (!control.choices.length && !control.allow_custom) continue;
       } else {
         control.accept = typeof raw.accept === 'string' ? raw.accept.slice(0, 500) : '';
         control.max_files = Math.max(1, Math.min(8, Number(raw.max_files) || 1));
@@ -227,7 +262,9 @@
     for (const control of controls || []) {
       if (control.kind !== 'select') continue;
       const value = confirmed[control.key];
-      if (control.choices.includes(value)) next[control.key] = value;
+      const custom = control.allow_custom && typeof value === 'string' &&
+        value.length > 0 && value.length <= 200 && !/[\x00-\x1f]/.test(value);
+      if (control.choices.includes(value) || custom) next[control.key] = value;
       else delete next[control.key];
     }
     return next;
@@ -240,7 +277,9 @@
     for (const control of controls || []) {
       if (control.kind === 'select') {
         const value = values[control.key];
-        if (control.choices.includes(value)) result[control.key] = value;
+        const custom = control.allow_custom && typeof value === 'string' &&
+          value.length > 0 && value.length <= 200 && !/[\x00-\x1f]/.test(value);
+        if (control.choices.includes(value) || custom) result[control.key] = value;
       } else if (control.kind === 'file') {
         const files = attachments[control.key];
         if (Array.isArray(files) && files.length) result[control.key] = files;

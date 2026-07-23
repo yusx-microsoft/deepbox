@@ -27,6 +27,17 @@ def test_expected_runtimes_registered():
         assert runtimes.get(rid).id == rid
 
 
+def test_surface_lookup_accepts_family_and_legacy_adapter_ids():
+    assert runtimes.get_for_surface("claude-code", "structured").id == "claude-code-structured"
+    assert runtimes.get_for_surface("claude-code", "terminal").id == "claude-code"
+    assert runtimes.get_for_surface("claude-code-structured", "terminal").id == "claude-code"
+
+
+def test_surface_lookup_never_falls_back_to_another_surface():
+    with pytest.raises(runtimes.UnknownRuntimeError):
+        runtimes.get_for_surface("codex-cli", "structured")
+
+
 def test_register_rejects_duplicate():
     existing = runtimes.get("claude-code")
     with pytest.raises(ValueError):
@@ -90,9 +101,12 @@ def test_codex_default_permission_argv():
         "codex", "--ask-for-approval", "on-request"]
 
 
-def test_unsupported_model_rejected():
+def test_custom_model_is_allowed_but_unsafe_model_is_rejected():
+    assert runtimes.build_command(
+        "claude-code", model="new-provider-model")[-2:] == [
+            "--model", "new-provider-model"]
     with pytest.raises(runtimes.InvalidCommandError):
-        runtimes.build_command("claude-code", model="totally-fake-model")
+        runtimes.build_command("claude-code", model="unsafe\nmodel")
 
 
 def test_unsupported_permission_mode_rejected():
@@ -209,6 +223,18 @@ class TestStructuredControls:
         assert controls[0]["scope"] == "session"
         assert controls[2]["kind"] == "file"
 
+    def test_copilot_uses_documented_reasoning_choices_and_nonblocking_auth(self):
+        adapter = runtimes.get("copilot-cli-structured")
+        assert adapter.auth_argv == ()
+        reasoning = next(
+            control for control in adapter.controls
+            if control.key == "reasoning_effort")
+        assert reasoning.choices == ("low", "medium", "high", "xhigh", "max")
+        assert runtimes.get("copilot-cli").auth_argv == ()
+        assert adapter.install_url == (
+            "https://docs.github.com/en/copilot/how-tos/copilot-cli/"
+            "set-up-copilot-cli/install-copilot-cli")
+
     def test_sanitize_and_argv_ignore_undeclared_or_invalid_options(self):
         clean = runtimes.sanitize_options("copilot-cli-structured", {
             "model": "gpt-5",
@@ -221,7 +247,16 @@ class TestStructuredControls:
             "copilot-cli-structured", clean, ("C:/tmp/a.txt",)) == [
                 "--reasoning-effort", "high", "--attachment", "C:/tmp/a.txt"]
         assert runtimes.sanitize_options("copilot-cli-structured", {
-            "model": "not-a-model", "reasoning_effort": "ultra"}) == {}
+            "model": "new-provider-model", "reasoning_effort": "ultra"}) == {
+                "model": "new-provider-model"}
+
+    def test_permission_mode_is_sanitized_for_structured_turns(self):
+        assert runtimes.sanitize_options(
+            "claude-code-structured", {"permission_mode": "plan"}) == {
+                "permission_mode": "plan"}
+        assert runtimes.sanitize_options(
+            "claude-code-structured",
+            {"permission_mode": "not-a-mode"}) == {}
 
     def test_claude_file_control_uses_prompt_transport(self):
         control = runtimes.attachment_control("claude-code-structured")

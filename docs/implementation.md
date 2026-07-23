@@ -398,17 +398,32 @@ model 或 reasoning 值。
 - Structured output 使用 `kind: "event"`，仍带 `(session_id, pty_instance_id, seq)`，先进入 connector
   本地 spool，再由 Server durable commit/ACK。这里的 `pty_instance_id` 是协议兼容字段，不表示一定有 PTY。
 
-### 9.3 Generic capabilities 与 composer controls
+### 9.3 Runtime family、surface negotiation 与 composer controls
 
-- `RuntimeAdapter.capabilities()` 报告 `features.structured`、`features.per_turn` 和 generic
-  `features.controls`。当前 control kind 只有 `select` 与 `file`；descriptor 携带 key、label、scope、
-  choices/default 或文件数量/总字节上限。
+- `connector/runtime_probe.py` 输出 capability schema v2。每个 family item 包含 `runtime`、`label`、
+  `installation`、`compatibility`、`authentication`、`models`、`surfaces` 与排除 `probed_at`
+  时间戳的稳定内容哈希 `revision`；未安装的 runtime 也会上报，以便 UI 给出 adapter 声明的安装命令/文档。
+  Server 不读取 runtime/model 字符串，
+  只把整个数组作为 opaque JSON 保存；executable path、probe 原始输出和 CLI 凭据都不会上传。
+- 一个 family 可以注册多个 `RuntimeAdapter` surface。`surfaces[]` descriptor 携带内部 adapter ID、
+  `terminal` / `structured` 名称、default 位与 generic features/controls。新 runtime family 仍只需 registry
+  entry/adapter，不要求 Server 或 browser 添加 runtime-specific 分支。
+- Browser 打开 agent 时按 family capability 选择 default surface（Claude/Copilot 当前为 `structured`），
+  attach frame 显式发送 `surface`。Connector 用 `session.ready.surface` 确认；找不到或无法启动时返回
+  `runtime.unavailable`（含 installation/compatibility/authentication 与 available surfaces），绝不静默
+  回退到 terminal。
+- Probe 可运行 adapter 声明的安全模型枚举 argv/parser；发现结果同时更新 family catalogue 与各 surface 的
+  model choices。若 CLI 没有稳定枚举接口，`models.source` 为 `catalogue` 且 `complete:false`。浏览器把发现/目录
+  模型渲染为建议，同时允许自定义 model；Connector 最终拒绝控制字符、shell metacharacter 和不允许 custom
+  model 的 adapter 值。只有 adapter 提供可靠的非交互 status argv 时，authentication probe 才会参与 spawn gate；
+  Copilot 仅提供交互式 `/login`，因此上报 `unknown` 而不是制造阻断启动的 false negative。
 - Claude structured 暴露 model、effort 和 file controls；Copilot structured 暴露 model、reasoning
-  effort 和 attachment controls。浏览器不按 runtime ID 分支。
-- `connector/client.py` 把 probe 结果以 `{capabilities: [...]}` 上报；Server 仍将 capability 当 opaque JSON
-  存储。connector-local executable path 不进入上报对象。
+  effort（`low|medium|high|xhigh|max`）和 attachment controls。当前 generic control kind 只有 `select` 与 `file`；
+  descriptor 携带 key、
+  label、scope、choices/default 或文件数量/总字节上限，浏览器不按 runtime ID 分支。
 - Connector 按 adapter allowlist 验证每个 option；session-scope select 在首个 turn 后锁定，per-turn
-  select 每轮应用。`session.config` 只回显 connector 已确认的 scalar 值，浏览器据此校正控件状态。
+  select 每轮应用。agent `runtime_config.permission_mode` 同样先按 adapter allowlist 清洗，再进入每轮实际 argv。
+  `session.config` 只回显 connector 已确认的 scalar 值，浏览器据此校正控件状态。
 
 ### 9.4 文件输入
 
@@ -421,8 +436,9 @@ model 或 reasoning 值。
 
 ### 9.5 Browser chat、tab re-attach 与 restore
 
-- `web/ui.js` 只根据 `features.structured` 选择 chat 或 terminal；`web/chat.js` 独立负责事件解析、reducer、
-  generic control normalization/options 和 semantic HTML；`web/app.js` 负责 DOM/WS/FileReader 接线。
+- `web/ui.js` 先用 family ID（并兼容旧 adapter ID）定位 capability，再由 default surface 决定 chat 或
+  terminal；`web/chat.js` 独立负责事件解析、reducer、generic control normalization/options 和 semantic
+  HTML；`web/app.js` 负责 DOM/WS/FileReader 接线。
 - 打开 structured agent 时，在第一帧到达前就进入 chat surface，避免短暂落入 xterm 后停在
   “resumed live session”。lazy mount 使用 per-view epoch 丢弃旧 agent/view 的延迟结果，并用 single-flight 合并 cold-start
   event burst。live `event` 与 restore `event` 走同一个 reducer。
@@ -430,16 +446,35 @@ model 或 reasoning 值。
   验证每行是 JSON object 后按原顺序组成 JSONL。浏览器把该有界 replay window 当作权威快照，先 reset state
   再逐行独立解析/fold；坏行不会吞掉后面的有效事件。
 - reducer 合并 `session.config`、`user.echo`、assistant message、tool、permission、turn 和 error 状态；
-  optimistic user turn 在收到 canonical `user.echo` 时不会重复显示。
+  optimistic user turn 在收到 canonical `user.echo` 时不会重复显示。同一 `tool_id` 的完整 tool snapshot 更新已有
+  streaming card；connector 对同一 turn 的重复 `turn.end` 去重，并在 Claude partial delta 后抑制重复完整文本，
+  因此 live 与 restore 都不会出现重复气泡/工具卡。非 JSON native stdout 只产生通用 `error`，原文不会进入 relay/recording。
 
-### 9.6 Connector WebSocket 稳定性
+### 9.6 LocalProject 持久化与隐私边界
+
+- `connector/local_store.py` 的 `LocalProjectStore` 使用 `~/.deepbox/state.db`，表为
+  `local_project(id, name, path, created_at, updated_at)`。SQLite 开启 WAL、`synchronous=NORMAL`、
+  `busy_timeout` 和 `foreign_keys`；跨进程 mutation 用相邻 `.lock` 文件串行化。新目录/数据库分别尝试
+  `0700`/`0600` 权限。`add()` 只接受已存在的目录、存为绝对路径，展开 `~` 但不展开路径中合法的环境变量语法；
+  canonical path 重复添加会复用原 ID，显式名称只更新 metadata。
+- `python -m connector project add|remove|list|sync` 与常驻 connector 共用该 store。每次连接和 mutation 后，
+  `Connector.report_projects()` 向 `/api/devboxes/{id}/projects` 只发送 `public_projects()` 的
+  `{id,name}`（以及 legacy migration 的 `{agent_id,local_project_id}`）；绝不发送 `path`。
+- Server 的 `DevboxProject` 只保存 path-free metadata。Agent 通过 `local_project_id` 外键引用 project，删除
+  project 时外键置空；authoritative report 也会清理已消失 project 和悬空引用，再推送新的 agent directory。
+  创建 agent 时 Server 校验 project 属于同一 devbox，`runtime_config` 必须是对象且不超过 16 KiB。
+- `resolve_agents()` 在 connector 本机把 `local_project_id` 解析成 `cwd`。缺失 ID/目录产生 `project_error`，
+  supervisor 的 attach 返回结构化 `runtime.unavailable(code=project_unavailable)`。旧 directory 中的 `cwd`
+  会被导入为 LocalProject；首次成功 report 提交 migration 并清空 Server 上所有 legacy absolute cwd。
+
+### 9.7 Connector WebSocket 稳定性
 
 `Connector.run()` 与 `run_transport()` 统一使用：`open_timeout=30s`、`ping_interval=20s`、
 `ping_timeout=60s`、`close_timeout=5s`、`max_size=16 MiB`。这降低短时调度/SNAT 抖动造成的误断，
 但不会掩盖断线；外层 connector loop 仍在 abnormal close 后退避重连并从 durable spool 续传。
 生产 B1 App Service 的 SNAT 上限仍是平台容量风险，参数硬化不是扩容的替代品。
 
-### 9.7 当前限制与验证
+### 9.8 当前限制与验证
 
 - Claude structured 默认使用 `--permission-mode acceptEdits`，其他声明模式映射到对应 `--permission-mode`，仅
   `bypassPermissions` 使用 `--dangerously-skip-permissions`；Copilot structured 使用 `--allow-all-tools`。workspace

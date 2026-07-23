@@ -15,6 +15,7 @@ let me = null, devboxes = [], term = null, fit = null, termWS = null, curSession
 let fleetLoadRequest = 0;
 let replayMode = false;
 let curAgentId = null;   // currently open agent, for active-row highlighting
+let currentSurface = null;
 let fleetQuery = '';     // fleet search text
 let nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock;
 let deriveCollaborationState, canSendInput;
@@ -128,8 +129,8 @@ async function renderLogin() {
   if (status.available) return renderBootstrap();
 
   const inviteFromUrl = pendingInvite;
-  const psCmd = 'irm https://deeporca.blob.core.windows.net/deepbox/install.ps1 | iex';
-  const shCmd = 'curl -fsSL https://deeporca.blob.core.windows.net/deepbox/install.sh | bash';
+  const psCmd = 'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex';
+  const shCmd = 'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash';
   app.innerHTML = `<div class="auth auth-split">
     <section class="auth-hero">
       <div class="auth-brand"><span class="glyph">_</span><b>deepbox</b></div>
@@ -279,6 +280,9 @@ function renderFleet() {
     const agents = (d.agents||[]).map(a => {
       const st = ui.agentStatus(a);
       const active = a.id === curAgentId ? ' is-active' : '';
+      const capability = ui.findRuntimeCapability(d.capabilities, a.runtime);
+      const hasTerminalFallback = ui.isCapabilityV2(capability) &&
+        capability.surfaces.some(surface=>surface.id === 'terminal' && surface.available);
       return `<div class="agent-row${active}" data-open="${esc(a.id)}" data-name="${esc(a.display_name)}">
         <span class="agent-mono">${esc(ui.initials(a.handle||a.display_name))}</span>
         <div class="agent-main">
@@ -288,6 +292,7 @@ function renderFleet() {
           </div>
         </div>
         <div class="agent-actions">
+          ${hasTerminalFallback ? `<button class="ghost" data-open-terminal="${esc(a.id)}" data-terminal-name="${esc(a.display_name)}">Terminal</button>` : ''}
           <button class="ghost" data-hist="${esc(a.id)}" data-histname="${esc(a.display_name)}">History</button>
           <button class="danger" data-agent-del="${esc(a.id)}" data-agent-delname="${esc(a.display_name||a.handle)}">Delete</button>
         </div>
@@ -303,6 +308,7 @@ function renderFleet() {
       <div class="agent-list">${agents}</div>
       <div class="box-foot">
         <button class="ghost" data-agent="${esc(d.id)}">+ Agent</button>
+        <button class="ghost" data-runtimes="${esc(d.id)}">Runtimes</button>
         <span class="spacer"></span>
         <button class="ghost" data-token="${esc(d.id)}">Rotate token</button>
         <button class="danger" data-del="${esc(d.id)}">Delete</button>
@@ -342,9 +348,14 @@ function renderFleet() {
   const fc = document.getElementById('fleet-create'); if(fc) fc.onclick = createDevbox;
 
   fleet.querySelectorAll('[data-agent]').forEach(b=>b.onclick=()=>createAgent(b.dataset.agent));
+  fleet.querySelectorAll('[data-runtimes]').forEach(b=>b.onclick=()=>showRuntimeSetup(b.dataset.runtimes));
   fleet.querySelectorAll('[data-open]').forEach(b=>b.onclick=(e)=>{
-    if(e.target.closest('[data-hist],[data-agent-del]')) return;
+    if(e.target.closest('[data-hist],[data-agent-del],[data-open-terminal]')) return;
     openAgent(b.dataset.open, b.dataset.name);
+  });
+  fleet.querySelectorAll('[data-open-terminal]').forEach(b=>b.onclick=(e)=>{
+    e.stopPropagation();
+    openAgent(b.dataset.openTerminal, b.dataset.terminalName, 'terminal');
   });
   fleet.querySelectorAll('[data-hist]').forEach(b=>b.onclick=(e)=>{
     e.stopPropagation();
@@ -531,6 +542,30 @@ async function delDevbox(id){
   await api(`/api/devboxes/${id}`,{method:'DELETE'});
   if (await loadDevboxes()) renderFleet();
 }
+function showRuntimeSetup(devboxId){
+  const devbox = devboxes.find(item=>item.id === devboxId);
+  if(!devbox) return;
+  const inventory = ui.runtimeInventory(devbox.capabilities);
+  const bodyHtml = inventory.length ? inventory.map(item=>{
+    const state = item.installation === 'installed'
+      ? `${item.compatibility} · ${item.authentication}` : 'not installed';
+    const command = item.guidance?.command
+      ? `<code class="runtime-command">${esc(item.guidance.command)}</code>` : '';
+    const guide = item.guidance?.url
+      ? `<a href="${esc(item.guidance.url)}" target="_blank" rel="noopener noreferrer">Setup guide</a>` : '';
+    return `<div class="runtime-setup-row">
+      <div><b>${esc(item.label)}</b><span class="muted">${esc(state)}</span></div>
+      ${command}<div>${guide}</div>
+    </div>`;
+  }).join('') : '<p class="muted">Connect this devbox to report runtime status.</p>';
+  showModal({
+    title:`Runtimes on ${devbox.name}`,
+    desc:'Deepbox never installs third-party CLIs or reads their credentials. Run setup commands yourself on this devbox, authenticate in the CLI, then reconnect the connector.',
+    bodyHtml,
+    actions:[{label:'Close', className:'ghost', onClick:closeOverlay}],
+  });
+}
+
 async function createAgent(devboxId){
   const d=devboxes.find(x=>x.id===devboxId);
   if(!d) return;
@@ -540,18 +575,25 @@ async function createAgent(devboxId){
       'Start or reconnect this machine so the connector can report its available runtime adapters.');
     return;
   }
+  const projects = ui.localProjectOptions(d.projects);
+  const projectOptions = [{value:'', label:'No project (runtime default)'}]
+    .concat(projects.map(project=>({value:project.id, label:project.name})));
+  const projectGuidance = projects.length
+    ? 'Project paths stay on this machine and are resolved by its connector.'
+    : 'No local projects yet. On this machine run: python -m connector project add "C:/path/to/repo". Then refresh.';
   const res=await showForm({
-    title:'Add agent', desc:`Register an agent runtime on ${d.name}.`,
+    title:'Add agent', desc:`Register an agent runtime on ${d.name}. ${projectGuidance}`,
     fields:[
       {name:'handle', label:'Handle', placeholder:'e.g. claude', required:true},
       {name:'runtime', label:'Runtime adapter', type:'select', options:runtimes, required:true},
-      {name:'cwd', label:'Working directory (optional)', placeholder:'blank = default'},
+      {name:'local_project_id', label:'Local project', type:'select', options:projectOptions},
     ], submit:'Add agent'});
   if(!res)return;
   try{
     await api(`/api/devboxes/${devboxId}/agents`,{method:'POST',
       body:JSON.stringify({handle:res.handle, display_name:res.handle,
-        runtime:res.runtime, cwd:res.cwd||null})});
+        runtime:res.runtime, local_project_id:res.local_project_id||null,
+        runtime_config:{}})});
     if (await loadDevboxes()) renderFleet();
   }catch(error){
     try{ if (await loadDevboxes()) renderFleet(); }catch(_refreshError){}
@@ -647,9 +689,8 @@ function currentAgentCapability(){
   for(const devbox of devboxes){
     const agent = (devbox.agents || []).find(item => item.id === curAgentId);
     if(!agent) continue;
-    const capabilities = Array.isArray(devbox.capabilities) ? devbox.capabilities : [];
-    return capabilities.find(capability => capability &&
-      typeof capability === 'object' && capability.runtime === agent.runtime) || null;
+    const capability = ui.findRuntimeCapability(devbox.capabilities, agent.runtime);
+    return ui.capabilityForSurface(capability, currentSurface);
   }
   return null;
 }
@@ -688,8 +729,9 @@ function syncChatControls(){
     const select = document.querySelector(`[data-chat-control="${control.key}"]`);
     if(!select) continue;
     const selected = chatControlValues[control.key];
-    select.value = typeof selected === 'string' && control.choices.includes(selected)
-      ? selected : '';
+    const validCustom = control.allow_custom && typeof selected === 'string';
+    select.value = typeof selected === 'string' &&
+      (control.choices.includes(selected) || validCustom) ? selected : '';
     select.disabled = control.scope === 'session' && sessionLocked;
     select.title = select.disabled ? 'Fixed for this live session' : '';
   }
@@ -760,20 +802,35 @@ function setupChatControls(){
       label.className = 'chat-control';
       const caption = document.createElement('span');
       caption.textContent = control.label;
-      const select = document.createElement('select');
-      select.setAttribute('data-chat-control', control.key);
-      const fallback = document.createElement('option');
-      fallback.value = '';
-      fallback.textContent = 'Default';
-      select.appendChild(fallback);
-      for(const choice of control.choices){
-        const option = document.createElement('option');
-        option.value = choice;
-        option.textContent = choice;
-        select.appendChild(option);
+      let select;
+      if(control.allow_custom){
+        select = document.createElement('input');
+        select.setAttribute('list', `chat-choices-${control.key}`);
+        select.placeholder = 'Default or model ID';
+        const datalist = document.createElement('datalist');
+        datalist.id = `chat-choices-${control.key}`;
+        for(const choice of control.choices){
+          const option = document.createElement('option');
+          option.value = choice;
+          datalist.appendChild(option);
+        }
+        label.append(caption, select, datalist);
+      }else{
+        select = document.createElement('select');
+        const fallback = document.createElement('option');
+        fallback.value = '';
+        fallback.textContent = 'Default';
+        select.appendChild(fallback);
+        for(const choice of control.choices){
+          const option = document.createElement('option');
+          option.value = choice;
+          option.textContent = choice;
+          select.appendChild(option);
+        }
+        label.append(caption, select);
       }
-      select.onchange = ()=>{ chatControlValues[control.key] = select.value; };
-      label.append(caption, select);
+      select.setAttribute('data-chat-control', control.key);
+      select.oninput = ()=>{ chatControlValues[control.key] = select.value.trim(); };
       toolbar.appendChild(label);
     }else{
       chatAttachments[control.key] = [];
@@ -900,13 +957,18 @@ function handleChatFrame(f){
 }
 
 
-async function openAgent(agentId, name){
+async function openAgent(agentId, name, surfaceOverride=null){
   await loadCollaborationHelpers();
   // Switching sessions: reset collaboration state so a stale lease/holder from
   // the previous terminal never leaks input rights into the new one.
   collabState = null;
   keyboardRequester = null;
   curAgentId = agentId;
+  const activeDevbox = devboxes.find(devbox =>
+    (devbox.agents || []).some(agent => agent.id === agentId));
+  const activeAgent = (activeDevbox?.agents || []).find(agent => agent.id === agentId);
+  const familyCapability = ui.findRuntimeCapability(activeDevbox?.capabilities, activeAgent?.runtime);
+  currentSurface = surfaceOverride || ui.preferredSurface(familyCapability);
   const structuredCapability = currentAgentCapability();
   const expectsStructured = ui.supportsStructuredChat(structuredCapability);
   // Leaving any previous structured chat surface: reset it before opening the
@@ -972,7 +1034,7 @@ function connectTermWS(){
     reconnectDelay = 500;
     setStat('live', 'online');
     termWS.send(JSON.stringify({type:'attach',session_id:curSession,
-      cols:term.cols,rows:term.rows}));
+      cols:term.cols,rows:term.rows,surface:currentSurface}));
   };
   termWS.onmessage = (ev)=>{
     const f = JSON.parse(ev.data);
@@ -985,6 +1047,25 @@ function connectTermWS(){
       return;
     }
     switch(f.type){
+      case 'session.ready':
+        if(currentSurface && f.surface !== currentSurface){
+          setStat('surface mismatch','busy');
+          termWS.close();
+          showAlert('Session surface mismatch', `Requested ${currentSurface}, but the connector confirmed ${f.surface || 'unknown'}. Deepbox will not silently fall back.`);
+          return;
+        }
+        currentSurface = f.surface || currentSurface;
+        setStat(currentSurface === 'structured' ? 'chat ready' : 'terminal ready','online');
+        break;
+      case 'runtime.unavailable': {
+        const reason = String(f.code || 'runtime_unavailable').replaceAll('_', ' ');
+        setStat(`runtime unavailable: ${reason}`,'busy');
+        if(structuredMode && chatState){
+          chatState.items.push({kind:'error', text:`Runtime unavailable: ${reason}`});
+          renderChatSurface();
+        }
+        break;
+      }
       case 'restore':          // reconnect: instantly repaint current screen
         term.reset(); term.write(f.data); break;
       case 'output':
@@ -1475,8 +1556,11 @@ function showForm({title, desc, fields, submit}){
     const fieldHtml = fields.map((f,i)=>{
       const id = 'f_'+i;
       const control = f.type==='select'
-        ? `<select id="${id}">${f.options.map(o=>
-            `<option value="${esc(o)}"${o===f.value?' selected':''}>${esc(o)}</option>`).join('')}</select>`
+        ? `<select id="${id}">${f.options.map(option=>{
+            const value = typeof option==='object' ? option.value : option;
+            const label = typeof option==='object' ? option.label : option;
+            return `<option value="${esc(value)}"${value===f.value?' selected':''}>${esc(label)}</option>`;
+          }).join('')}</select>`
         : `<input id="${id}" placeholder="${esc(f.placeholder||'')}" value="${esc(f.value||'')}"/>`;
       return `<div class="field"><label for="${id}">${esc(f.label)}</label>${control}</div>`;
     }).join('');
