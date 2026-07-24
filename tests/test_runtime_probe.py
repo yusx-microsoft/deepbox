@@ -95,7 +95,11 @@ def test_probe_missing_runtime_is_reported_without_host_paths(monkeypatch):
             "allow_custom": True,
         }],
     }
-    assert capability["models"]["status"] == "unknown"
+    assert capability["models"]["status"] == "partial"
+    assert capability["models"]["source"] == "adapter"
+    assert capability["models"]["items"] == [
+        {"id": "fallback-model", "label": "fallback-model"},
+    ]
     assert "executable" not in json.dumps(capability)
     assert "path" not in json.dumps(capability)
     assert len(capability["revision"]) == 16

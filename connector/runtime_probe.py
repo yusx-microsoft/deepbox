@@ -165,7 +165,10 @@ def probe_family(
             if model_ids:
                 model_status = "complete"
                 model_source = "runtime"
-    if installed and not model_ids:
+    if not model_ids:
+        # Adapter-declared aliases are part of the control contract, not an
+        # installation probe result. Keep them visible even when discovery is
+        # unavailable or the executable is temporarily offline.
         model_ids = list(dict.fromkeys(
             model for adapter in adapters for model in adapter.models))
         if model_ids:
@@ -174,12 +177,14 @@ def probe_family(
     available = installed and compatibility["status"] != "incompatible"
     surfaces = [_surface_json(adapter, available) for adapter in adapters]
     for adapter, surface_item in zip(adapters, surfaces):
-        if model_ids:
-            surface_item["features"]["models"] = list(model_ids)
+        surface_model_ids = (model_ids if model_source == "runtime" else
+                             list(dict.fromkeys(adapter.models)))
+        if surface_model_ids:
+            surface_item["features"]["models"] = list(surface_model_ids)
         for control in surface_item["features"].get("controls", []):
             if control.get("key") == "model":
-                if model_ids:
-                    control["choices"] = list(model_ids)
+                if surface_model_ids:
+                    control["choices"] = list(surface_model_ids)
                 control["allow_custom"] = adapter.allow_custom_models
     # Exactly one intended default per family. Prefer an explicitly-declared
     # default, then structured, then registry order.

@@ -245,3 +245,56 @@ def test_canonical_events_deduplicate_and_hide_invalid_native_output():
 async def _noop(*a, **k):
     pass
 
+async def _co_live_model_control_precedes_next_prompt():
+    events = []
+
+    async def on_output(raw):
+        events.append(json.loads(raw))
+
+    def controls(previous, current):
+        if previous.get("model") == current.get("model"):
+            return []
+        return [{"subtype": "set_model", "model": current["model"]}]
+
+    sess = A.StructuredAgentSession(
+        ["claude"], None, on_output, _noop,
+        option_sanitizer=lambda value: dict(value),
+        live_control_builder=controls,
+        control_timeout=1.0)
+    sess._proc = _FakeProc([])
+    sess._alive = True
+
+    await sess._dispatch_turn("first", {"model": "sonnet"})
+    sess._proc.stdin.buf = b""
+
+    task = asyncio.create_task(
+        sess._dispatch_turn("second", {"model": "opus"}))
+    for _ in range(50):
+        if b"control_request" in sess._proc.stdin.buf:
+            break
+        await asyncio.sleep(0.01)
+
+    first_line = sess._proc.stdin.buf.splitlines()[0]
+    packet = json.loads(first_line)
+    assert packet == {
+        "type": "control_request",
+        "request_id": "deepbox_1",
+        "request": {"subtype": "set_model", "model": "opus"},
+    }
+    assert b'"second"' not in sess._proc.stdin.buf
+
+    await sess._handle_line(json.dumps({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": "deepbox_1"},
+    }).encode())
+    await task
+
+    assert b'"second"' in sess._proc.stdin.buf
+    assert sess._active_options == {"model": "opus"}
+    configs = [event for event in events if event["ev"] == A.EV_SESSION_CONFIG]
+    assert configs[-1]["options"] == {"model": "opus"}
+
+
+def test_live_model_control_precedes_next_prompt_sync():
+    asyncio.run(_co_live_model_control_precedes_next_prompt())
+

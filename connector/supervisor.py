@@ -590,7 +590,11 @@ class SessionSupervisor:
                 session_option_keys=tuple(
                     (["model"] if adapter.model_scope == "session" else []) +
                     [control.key for control in adapter.controls
-                     if control.scope == "session"]))
+                     if control.scope == "session"]),
+                live_control_builder=(
+                    (lambda previous, current: runtimes.live_control_requests(
+                        adapter.id, previous, current))
+                    if adapter.live_controls else None))
         else:
             p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
                            cols=cols, rows=rows)

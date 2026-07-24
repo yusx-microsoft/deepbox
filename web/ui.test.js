@@ -306,7 +306,7 @@ test('capability v2 resolves legacy IDs and defaults to structured surface', () 
     surfaces: [
       {id: 'terminal', available: true, default: false, features: {controls: []}},
       {id: 'structured', available: true, default: true, features: {controls: [
-        {key: 'model', kind: 'select', scope: 'session', choices: ['fallback']},
+        {key: 'model', kind: 'select', scope: 'turn', choices: [], allow_custom: false},
       ]}},
     ],
   };
@@ -318,9 +318,38 @@ test('capability v2 resolves legacy IDs and defaults to structured surface', () 
   assert.equal(ui.supportsStructuredChat(terminalSurface), false);
   assert.equal(surface.features.structured, true);
   assert.deepEqual(surface.features.controls[0].choices, ['sonnet']);
-  assert.equal(surface.features.controls[0].allow_custom, true);
+  assert.equal(surface.features.controls[0].scope, 'turn');
+  assert.equal(surface.features.controls[0].allow_custom, false);
   assert.deepEqual(ui.runtimeOptions([capability]), ['claude-code']);
 });
+
+test('model choices prefer control, then surface facts, then family discovery', () => {
+  const capability = {
+    schema_version: 2,
+    models: {items: [{id: 'family-model'}], allow_custom: true},
+    surfaces: [{id: 'structured', available: true, default: true, features: {
+      models: [{id: 'sonnet'}, {id: 'opus'}, {id: 'haiku'}],
+      controls: [{key: 'model', kind: 'select', scope: 'turn', choices: [],
+        allow_custom: false}],
+    }}],
+  };
+  const surface = ui.capabilityForSurface(capability, 'structured');
+  assert.deepEqual(surface.features.controls[0].choices, ['sonnet', 'opus', 'haiku']);
+  assert.equal(surface.features.controls[0].allow_custom, false);
+
+  capability.surfaces[0].features.controls[0].choices = ['explicit-model'];
+  assert.deepEqual(
+    ui.capabilityForSurface(capability, 'structured').features.controls[0].choices,
+    ['explicit-model'],
+  );
+  delete capability.surfaces[0].features.models;
+  capability.surfaces[0].features.controls[0].choices = [];
+  assert.deepEqual(
+    ui.capabilityForSurface(capability, 'structured').features.controls[0].choices,
+    ['family-model'],
+  );
+});
+
 
 test('runtime inventory retains missing families for setup guidance', () => {
   assert.deepEqual(ui.runtimeInventory([{

@@ -234,8 +234,24 @@ class TestStructuredControls:
         controls = cap["features"]["controls"]
         assert [c["key"] for c in controls] == [
             "model", "reasoning_effort", "attachments"]
-        assert controls[0]["scope"] == "session"
+        assert controls[0]["scope"] == "turn"
+        assert controls[0]["choices"] == ["sonnet", "opus", "haiku"]
+        assert controls[0]["allow_custom"] is False
         assert controls[2]["kind"] == "file"
+
+    def test_claude_model_changes_compile_to_live_control_requests(self):
+        assert runtimes.live_control_requests(
+            "claude-code-structured",
+            {"model": "sonnet"}, {"model": "opus"}) == [{
+                "subtype": "set_model", "model": "opus"}]
+        assert runtimes.live_control_requests(
+            "claude-code-structured",
+            {"model": "opus"}, {"model": "opus"}) == []
+        with pytest.raises(runtimes.InvalidCommandError, match="cannot be reset"):
+            runtimes.live_control_requests(
+                "claude-code-structured", {"model": "opus"}, {})
+        assert runtimes.sanitize_options(
+            "claude-code-structured", {"model": "opus-4.8"}) == {}
 
     def test_copilot_uses_documented_reasoning_choices_and_nonblocking_auth(self):
         adapter = runtimes.get("copilot-cli-structured")

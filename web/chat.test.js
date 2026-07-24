@@ -46,6 +46,23 @@ test('turn.end appends a turn item and closes assistant', () => {
   assert.ok(s.items.some(i => i.kind === 'turn'));
 });
 
+test('turn result does not duplicate an assistant message', () => {
+  const state = C.initialChatState();
+  C.appendUserTurn(state, 'question');
+  C.applyEvent(state, { ev: 'message', final: true, text: 'same answer' });
+  C.applyEvent(state, { ev: 'turn.end', result: 'same answer' });
+  assert.equal(state.items.filter(item => item.kind === 'assistant').length, 1);
+  assert.equal(state.items.find(item => item.kind === 'turn').result, null);
+});
+
+test('turn result remains a fallback when no assistant message arrives', () => {
+  const state = C.initialChatState();
+  C.appendUserTurn(state, 'question');
+  C.applyEvent(state, { ev: 'turn.end', result: 'fallback answer' });
+  assert.equal(state.items.find(item => item.kind === 'turn').result, 'fallback answer');
+});
+
+
 test('appendUserTurn adds a user bubble immediately', () => {
   let s = C.initialChatState();
   C.appendUserTurn(s, 'do it');

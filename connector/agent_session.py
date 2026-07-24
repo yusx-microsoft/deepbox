@@ -329,7 +329,9 @@ class StructuredAgentSession:
                  attachment_mode: str | None = None,
                  attachment_max_files: int = 0,
                  attachment_max_bytes: int = 0,
-                 session_option_keys: tuple[str, ...] = ()):
+                 session_option_keys: tuple[str, ...] = (),
+                 live_control_builder=None,
+                 control_timeout: float = 10.0):
         self.cmd = cmd
         self.cwd = cwd or None
         self.on_output = on_output
@@ -350,6 +352,11 @@ class StructuredAgentSession:
         self._attachment_max_bytes = max(0, int(attachment_max_bytes or 0))
         self._session_option_keys = tuple(session_option_keys)
         self._session_options: dict[str, object] | None = None
+        self._live_control_builder = live_control_builder
+        self._control_timeout = max(0.1, float(control_timeout))
+        self._active_options: dict[str, object] | None = None
+        self._control_counter = 0
+        self._pending_controls: dict[str, asyncio.Future] = {}
         self._turn_end_seen = False
         self._streamed_assistant_text = False
         self._proc = None
@@ -564,7 +571,15 @@ class StructuredAgentSession:
             code = await proc.wait()
         except Exception:
             pass
+        self._fail_pending_controls("Agent exited before applying runtime control")
         await self.on_exit(int(code or 0))
+
+    def _fail_pending_controls(self, message: str) -> None:
+        pending = list(self._pending_controls.values())
+        self._pending_controls.clear()
+        for future in pending:
+            if not future.done():
+                future.set_exception(ValueError(message))
 
     async def _read_stderr(self, proc):
         stream = proc.stderr
@@ -594,6 +609,15 @@ class StructuredAgentSession:
             return
 
         native_type = obj.get("type")
+        if native_type == "control_response":
+            response = obj.get("response")
+            if isinstance(response, dict):
+                request_id = response.get("request_id")
+                future = (self._pending_controls.pop(request_id, None)
+                          if isinstance(request_id, str) else None)
+                if future is not None and not future.done():
+                    future.set_result(response)
+            return
         stream_type = ((obj.get("event") or {}).get("type")
                        if native_type == "stream_event" else None)
         if stream_type == "message_start":
@@ -623,6 +647,36 @@ class StructuredAgentSession:
     async def _emit(self, ev: dict):
         await self.on_output(json.dumps(ev))
 
+    async def _apply_live_controls(self, options: dict[str, object]):
+        if self._live_control_builder is None or self._active_options is None:
+            return
+        requests = self._live_control_builder(self._active_options, options)
+        for request in requests:
+            if not isinstance(request, dict) or not request.get("subtype"):
+                raise ValueError("invalid live control request")
+            self._control_counter += 1
+            request_id = f"deepbox_{self._control_counter}"
+            future = asyncio.get_running_loop().create_future()
+            self._pending_controls[request_id] = future
+            packet = {
+                "type": "control_request",
+                "request_id": request_id,
+                "request": request,
+            }
+            try:
+                self._proc.stdin.write((json.dumps(packet) + "\n").encode())
+                await self._proc.stdin.drain()
+                response = await asyncio.wait_for(future, self._control_timeout)
+            except asyncio.TimeoutError as exc:
+                raise ValueError(
+                    f"Agent did not confirm {request['subtype']}") from exc
+            finally:
+                self._pending_controls.pop(request_id, None)
+            if response.get("subtype") != "success":
+                detail = response.get("error") or response.get("message") or "rejected"
+                raise ValueError(
+                    f"Agent rejected {request['subtype']}: {detail}")
+
     async def _dispatch_turn(self, data: str, raw_options: object):
         self._turn_end_seen = False
         options = self._option_sanitizer(raw_options)
@@ -640,23 +694,30 @@ class StructuredAgentSession:
             key: value for key, value in options.items()
             if isinstance(value, (str, int, float, bool))
         }
-        await self._emit(_event(EV_SESSION_CONFIG, options=public_options))
         await self._emit(_event(
             EV_USER_ECHO, text=data,
             attachments=self._attachment_metadata(options)))
         try:
             attachments = self._decode_attachments(options)
             if self._per_turn:
+                await self._emit(_event(
+                    EV_SESSION_CONFIG, options=public_options))
                 await self._run_one_turn(data, options, attachments)
                 return
             async with self._write_lock:
                 prompt = self._embed_text_attachments(data, attachments)
-                if self._proc is None:
+                spawned = self._proc is None
+                if spawned:
                     self._proc = await self._spawn_process(self._command(options))
                     self._start_readers(self._proc)
                 stdin = self._proc.stdin
                 if stdin is None:
                     raise ValueError("Agent stdin is unavailable")
+                if not spawned:
+                    await self._apply_live_controls(public_options)
+                self._active_options = dict(public_options)
+                await self._emit(_event(
+                    EV_SESSION_CONFIG, options=public_options))
                 stdin.write(encode_user_message(prompt).encode())
                 drain = getattr(stdin, "drain", None)
                 if drain is not None:
@@ -727,6 +788,10 @@ class StructuredAgentSession:
 
     def kill(self):
         self._alive = False
+        for future in self._pending_controls.values():
+            if not future.done():
+                future.cancel()
+        self._pending_controls.clear()
         if self._proc is None:
             return
         try:

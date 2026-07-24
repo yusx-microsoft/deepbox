@@ -120,14 +120,25 @@
           request_id: ev.request_id, tool: ev.tool, input: ev.input,
         };
         break;
-      case 'turn.end':
+      case 'turn.end': {
         state._openAssistant = null;
         if (state.items.length && state.items[state.items.length - 1].kind === 'turn') break;
+        let hasAssistant = false;
+        for (let i = state.items.length - 1; i >= 0; i--) {
+          if (state.items[i].kind === 'turn' || state.items[i].kind === 'user') break;
+          if (state.items[i].kind === 'assistant' && state.items[i].text) {
+            hasAssistant = true;
+            break;
+          }
+        }
         state.items.push({
           kind: 'turn', is_error: !!ev.is_error, cost_usd: ev.cost_usd,
-          result: ev.result || null,
+          // Some native protocols repeat the completed assistant text in the
+          // lifecycle result. Keep it only as a fallback when no message arrived.
+          result: hasAssistant ? null : (ev.result || null),
         });
         break;
+      }
       case 'session.config':
         // Each event is the connector-confirmed effective scalar set for this
         // turn. Replace rather than merge so returning to a runtime default can

@@ -37,6 +37,7 @@ from typing import Callable
 
 __all__ = [
     "RuntimeAdapter",
+    "RuntimeLiveControl",
     "UnknownRuntimeError",
     "InvalidCommandError",
     "register",
@@ -47,6 +48,7 @@ __all__ = [
     "runtime_ids",
     "get_for_surface",
     "build_command",
+    "live_control_requests",
     "validate_executable",
     "validate_program",
     "validate_argv",
@@ -168,6 +170,21 @@ class RuntimeControl:
 
 
 @dataclass(frozen=True)
+class RuntimeLiveControl:
+    """Map a turn option to one structured-runtime control request.
+
+    ``argument`` is the key expected by the runtime protocol.  ``allow_none``
+    stays false for protocols such as Claude Code where a non-string model
+    payload can wedge the headless session.
+    """
+
+    key: str
+    subtype: str
+    argument: str
+    allow_none: bool = False
+
+
+@dataclass(frozen=True)
 class RuntimeAdapter:
     """Metadata + command construction rules for a single runtime.
 
@@ -230,6 +247,7 @@ class RuntimeAdapter:
     # shared by terminal and structured runtimes.
     model_scope: str = "session"
     controls: tuple[RuntimeControl, ...] = ()
+    live_controls: tuple[RuntimeLiveControl, ...] = ()
 
     @property
     def executable(self) -> str:
@@ -266,6 +284,7 @@ class RuntimeAdapter:
                 "kind": "select",
                 "scope": self.model_scope,
                 "choices": list(self.models),
+                "allow_custom": self.allow_custom_models,
             })
         controls.extend(control.public() for control in self.controls)
         return {
@@ -333,6 +352,22 @@ def register(adapter: RuntimeAdapter, *, replace: bool = False) -> RuntimeAdapte
         seen_controls.add(control.key)
         if control.flag:
             validate_argv([adapter.executable, control.flag])
+    option_keys = seen_controls | ({"model"} if adapter.model_flag else set())
+    seen_live: set[str] = set()
+    for live in adapter.live_controls:
+        if not adapter.structured or adapter.per_turn:
+            raise InvalidCommandError(
+                "live controls require a persistent structured runtime")
+        if (live.key not in option_keys or live.key in seen_live
+                or not live.subtype or not live.argument
+                or not isinstance(live.allow_none, bool)):
+            raise InvalidCommandError(f"invalid live control {live.key!r}")
+        scope = (adapter.model_scope if live.key == "model" else
+                 next(control.scope for control in adapter.controls
+                      if control.key == live.key))
+        if scope != "turn":
+            raise InvalidCommandError("live controls must map turn-scoped options")
+        seen_live.add(live.key)
     _REGISTRY[adapter.id] = adapter
     return adapter
 
@@ -375,6 +410,30 @@ def get_for_surface(runtime_id: str, surface: str) -> RuntimeAdapter:
         raise UnknownRuntimeError(
             f"runtime {runtime_id!r} has no {surface!r} surface; available: {available}")
     return candidates[0]
+
+
+def live_control_requests(runtime_id: str, previous: dict, current: dict) -> list[dict]:
+    """Build protocol control requests for options changed between turns.
+
+    Values come from ``sanitize_turn_options``.  A declaration can explicitly
+    allow ``None``; otherwise clearing a live value is rejected before anything
+    is written to the child process.
+    """
+    adapter = get(runtime_id)
+    requests: list[dict] = []
+    for live in adapter.live_controls:
+        before = previous.get(live.key)
+        after = current.get(live.key)
+        if before == after:
+            continue
+        if after is None and not live.allow_none:
+            raise InvalidCommandError(
+                f"{live.key} cannot be reset while this chat is active; start a new chat")
+        requests.append({
+            "subtype": live.subtype,
+            live.argument: after,
+        })
+    return requests
 
 
 def build_command(runtime_id: str, *, model: str | None = None,
@@ -588,7 +647,8 @@ register(RuntimeAdapter(
     model_flag="--model",
     models=("sonnet", "opus", "haiku"),
     structured=True,
-    model_scope="session",
+    allow_custom_models=False,
+    model_scope="turn",
     controls=(
         RuntimeControl(
             key="reasoning_effort", label="Reasoning", kind="select",
@@ -598,6 +658,10 @@ register(RuntimeAdapter(
             key="attachments", label="Files", kind="file", scope="turn",
             accept="text/*,.md,.json,.yaml,.yml,.py,.js,.ts,.tsx,.css,.html",
             max_files=4, max_total_bytes=1024 * 1024),
+    ),
+    live_controls=(
+        RuntimeLiveControl(
+            key="model", subtype="set_model", argument="model", allow_none=False),
     ),
     install_url="https://docs.anthropic.com/en/docs/claude-code/overview",
     install_command="npm install -g @anthropic-ai/claude-code",

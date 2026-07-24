@@ -188,16 +188,18 @@ Connector 的 registry 是扩展边界。每个 adapter 描述：
 - runtime ID/label、probe 与本地 command；
 - PTY 或 structured 模式，以及 persistent/per-turn 进程策略；
 - model、permission 和 CLI argv 映射；
-- generic `select` / `file` controls 的 scope、choices、default 与 bounds。
+- generic `select` / `file` controls 的 scope、choices、default 与 bounds；
+- persistent structured runtime 的 per-turn option 到 native live `control_request` 的 adapter-local 映射。
 
 Probe 后 connector 上报 display-safe capability object。稳定 revision 忽略 probe 时间戳；动态发现的 model
-catalogue 会投影到各 surface 的 model control。若已安装 runtime 的 live discovery 没有得到 model ID，
-connector 使用该 family 的 adapter static catalog，并标记 `models.status=partial`、`models.source=adapter`；
-有 runtime 结果时标记 `complete/runtime`。只有可靠的非交互 authentication status probe 才能阻断启动，
-无法安全探测时状态为 `unknown`。Server 将 capability 作为 opaque JSON 保存；浏览器仅根据
-`features.structured` 选择 chat surface，并从 `features.controls` 生成 model/reasoning/file widgets。
-UI 始终提供 `Runtime default`，且仅在 model control 声明 `allow_custom=true` 时提供可编辑 model ID combobox。
-connector-local executable path 不上报，浏览器也没有 runtime-ID 特判。
+catalogue 会投影到各 surface 的 model control。live discovery 不可用或没有得到 model ID 时，connector
+保留该 family 的 adapter static catalog，并标记 `models.status=partial`、`models.source=adapter`；有 runtime
+结果时标记 `complete/runtime`。只有可靠的非交互 authentication status probe 才能阻断启动，无法安全探测时
+状态为 `unknown`。Server 将 capability 作为 opaque JSON 保存；浏览器仅根据 `features.structured` 选择 chat
+surface，并从 `features.controls` 生成 model/reasoning/file widgets。model choices 按 control 自带 choices、
+surface `features.models`、family `models.items` 依次回退。UI 始终提供 `Runtime default`，且仅在 model control
+声明 `allow_custom=true` 时提供可编辑 model ID combobox。connector-local executable path 不上报，浏览器也没有
+runtime-ID 特判。
 
 扩展原则仍是：**新增 runtime = 一个 connector adapter；Server 和 Browser 不改。**
 
@@ -216,7 +218,8 @@ Structured adapter 只向上游发送统一事件：
 
 事件只包含 UI 和恢复所需的 display-safe 字段，不包含 raw provider payload、chain-of-thought、token、
 模型凭证或工作站路径。每个逻辑 turn 最多记录一个 `turn.end`；同一 `tool_id` 的流式开始与完整快照在
-reducer 中更新同一张工具卡。connector 会抑制 provider 在 delta 之后重复发送的完整文本快照。
+reducer 中更新同一张工具卡。connector 会抑制 provider 在 delta 之后重复发送的完整文本快照；browser 也只在
+该 turn 没有 assistant message 时把 `turn.end.result` 渲染为 fallback，因此 result 不会复制已流式展示的回复。
 live frame 与 restore JSONL 使用同一个 reducer。
 
 ### 5.4 Frame protocol v3
@@ -242,8 +245,11 @@ Structured options 和附件在 connector 按 adapter descriptor 二次验证；
   后续 timeline。lazy chat mount 以 view epoch 隔离旧视图，并以 single-flight 合并 cold-start event burst。
 - Connector WebSocket 使用 30s open timeout、20s ping、60s pong tolerance、5s close timeout 和
   16 MiB frame bound；异常断线后外层 loop 继续退避重连及 spool 续传。
-- model/reasoning 等 session-scoped controls 在 session 已配置或出现首个 chat item 后锁定。`New chat`
+- permission/reasoning 等真正的 session-scoped controls 在 session 已配置或出现首个 chat item 后锁定。`New chat`
   发送 `terminate`、创建空 persisted session 并重新开放 controls；旧历史不删除。
+- Claude structured model 是 turn-scoped；值变化时 connector 先向同一进程发送字符串 `set_model`
+  `control_request`，收到 success 后才发送下一条 prompt，因此首轮后仍可在显式 model 间切换。该协议不支持
+  清空已设置的 model；恢复 `Runtime default` 需要 `New chat`。
 
 ### 5.6 LocalProject 与用户 Skills
 

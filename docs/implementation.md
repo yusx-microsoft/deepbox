@@ -363,6 +363,11 @@ model 或 reasoning 值。
   `turn.end`、`error`。
 - Claude Code adapter 把 stream-json 翻译为上述事件，并在一个 live session 中保留长生命周期进程；
   Copilot CLI adapter 读取 JSONL，每个 turn 启动一个进程。
+- `RuntimeLiveControl` 在 adapter 内声明 turn option → native control subtype/argument 的映射。Claude 首轮 model
+  仍进入启动 argv；后续 model 变化时，`StructuredAgentSession` 向同一 stdin 发送字符串
+  `control_request(request.subtype=set_model)`，以 `response.request_id` 匹配 `control_response`，并在 success 后才
+  发送 prompt。reject、进程退出或 10 秒 timeout 都使该 turn 明确失败；相同值不重复发送 control request。
+  `set_model` 要求字符串且不支持清空，所以显式 model 之间可 live 切换，恢复 `Runtime default` 需 `New chat`。
 - `connector/supervisor.py` 对 structured session 调用 `write_turn(text, options)`，对 PTY session
   继续调用 `write(data)`；两条路径共用 session/open/terminate 与可靠 output transport。
 - Structured output 使用 `kind: "event"`，仍带 `(session_id, pty_instance_id, seq)`，先进入 connector
@@ -382,12 +387,11 @@ model 或 reasoning 值。
   attach frame 显式发送 `surface`。Connector 用 `session.ready.surface` 确认；找不到或无法启动时返回
   `runtime.unavailable`（含 installation/compatibility/authentication 与 available surfaces），绝不静默
   回退到 terminal。
-- Probe 可运行 adapter 声明的安全模型枚举 argv/parser；发现结果同时更新 family catalogue 与各 surface 的 model choices。live discovery 为空时使用 adapter static catalog，并标记 `models.status=partial`、`models.source=adapter`；runtime 结果标记 `complete/runtime`。浏览器同时接受 bare capability array 与 `{runtimes:[...]}` wrapper，model control 总提供 `Runtime default`，只有 descriptor 的 `allow_custom=true` 才允许输入目录外 ID。Connector 最终拒绝控制字符、shell metacharacter 和不允许 custom model 的 adapter 值。只有 adapter 提供可靠非交互 status argv 时 authentication probe 才参与 spawn gate；Copilot 因此上报 `unknown`，不制造 false negative。
-- Claude structured 暴露 model、effort 和 file controls；Copilot structured 暴露 model、reasoning
+- Probe 可运行 adapter 声明的安全模型枚举 argv/parser；发现结果同时更新 family catalogue 与各 surface 的 model choices。live discovery 不可用或没有 model ID 时仍保留 adapter static catalog，并标记 `models.status=partial`、`models.source=adapter`；runtime 结果标记 `complete/runtime`。浏览器同时接受 bare capability array 与 `{runtimes:[...]}` wrapper，model choices 按 control 自带 choices → surface `features.models` → family `models.items` 回退，并总提供 `Runtime default`；只有 descriptor 的 `allow_custom=true` 才允许输入目录外 ID。Connector 最终拒绝控制字符、shell metacharacter 和不允许 custom model 的 adapter 值。只有 adapter 提供可靠非交互 status argv 时 authentication probe 才参与 spawn gate；Copilot 因此上报 `unknown`，不制造 false negative。
+- Claude structured 暴露 turn-scoped model、session-scoped effort 和 file controls；Copilot structured 暴露 model、reasoning
   effort（`low|medium|high|xhigh|max`）和 attachment controls。当前 generic control kind 只有 `select` 与 `file`；
-  descriptor 携带 key、
-  label、scope、choices/default 或文件数量/总字节上限，浏览器不按 runtime ID 分支。
-- Connector 按 adapter allowlist 验证每个 option；session-scope select 在 session 已有配置或首个 chat item 后锁定，per-turn select 每轮应用。agent `runtime_config.permission_mode` 同样先按 adapter allowlist 清洗，再进入每轮实际 argv。`session.config` 只回显 connector 已确认的 scalar 值，浏览器据此校正控件状态。`New chat` 在已有历史时确认，发送需 operator + keyboard lease 的 `terminate`，创建空 persisted session 并重新开放 controls；detach/close 不终止本机 session。
+  descriptor 携带 key、label、scope、choices/default 或文件数量/总字节上限，浏览器不按 runtime ID 分支。
+- Connector 按 adapter allowlist 验证每个 option；session-scope select 在 session 已有配置或首个 chat item 后锁定，per-turn select 每轮应用。Claude model 由 adapter 的 `set_model` live mapping 在同一进程内切换，故首轮后不锁；没有 mapping 的 turn option 仍由 per-turn argv runtime 处理。agent `runtime_config.permission_mode` 同样先按 adapter allowlist 清洗，再进入每轮实际 argv。`session.config` 只回显 connector 已确认的 scalar 值，浏览器据此校正控件状态。`New chat` 在已有历史时确认，发送需 operator + keyboard lease 的 `terminate`，创建空 persisted session 并重新开放 controls；detach/close 不终止本机 session。
 
 ### 9.4 文件输入
 
@@ -409,8 +413,9 @@ model 或 reasoning 值。
   再逐行独立解析/fold；坏行不会吞掉后面的有效事件。
 - reducer 合并 `session.config`、`user.echo`、assistant message、tool、permission、turn 和 error 状态；
   optimistic user turn 在收到 canonical `user.echo` 时不会重复显示。同一 `tool_id` 的完整 tool snapshot 更新已有
-  streaming card；connector 对同一 turn 的重复 `turn.end` 去重，并在 Claude partial delta 后抑制重复完整文本，
-  因此 live 与 restore 都不会出现重复气泡/工具卡。非 JSON native stdout 只产生通用 `error`，原文不会进入 relay/recording。
+  streaming card；connector 对同一 turn 的重复 `turn.end` 去重，并在 Claude partial delta 后抑制重复完整文本。
+  Browser 只有在该 turn 没有 assistant message 时才把 `turn.end.result` 作为 fallback bubble 渲染，因此 live 与
+  restore 都不会把流式回复和 final result 显示两次。非 JSON native stdout 只产生通用 `error`，原文不会进入 relay/recording。
 
 ### 9.6 LocalProject 持久化与隐私边界
 

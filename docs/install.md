@@ -193,16 +193,21 @@ project, or binding path and never reads model credentials.
 ### Structured chat controls
 
 Opening **Add agent** refreshes runtime capabilities and projects before rendering
-its selectors. For an installed runtime, failed or empty live model discovery
-falls back to the adapter family's static models with `models.status=partial` and
-`models.source=adapter`. Structured chat always includes **Runtime default**.
-Adapters that set `allow_custom_models` receive an editable model combobox; other
-model and reasoning controls remain selects.
+its selectors. When live model discovery is unavailable or empty, the connector
+retains the adapter family's static models with `models.status=partial` and
+`models.source=adapter`. Model choices fall back from control choices to surface
+model facts and then the family catalogue; structured chat always includes
+**Runtime default**. Adapters that allow custom IDs receive an editable model
+combobox; other model and reasoning controls remain selects.
 
-Session-scoped controls are editable until the session is configured or contains
-its first chat item. They then lock with a prompt to start **New chat**. That action
-sends the structured `terminate` frame, creates a blank persisted session, and
-re-enables the controls without deleting saved history. The server forwards
+Claude structured model selection is turn-scoped: after the first turn the connector
+applies a changed model through a native `set_model` request before sending the next
+prompt. Explicit models can therefore be switched live; because the protocol cannot
+clear an applied model, returning to **Runtime default** requires **New chat**. True
+session-scoped controls remain editable until the session is configured
+or contains its first chat item. They then lock with a prompt to start **New chat**.
+That action sends the structured `terminate` frame, creates a blank persisted session,
+and re-enables those controls without deleting saved history. The server forwards
 termination only for an operator who holds the keyboard lease.
 
 ## Upgrade explicitly

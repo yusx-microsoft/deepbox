@@ -155,14 +155,20 @@
     if(!surface) return null;
     const features = {...(surface.features || {}), structured:selectedId === 'structured'};
     const modelContract = capability.models || {};
+    const surfaceModelIds = Array.isArray(features.models)
+      ? features.models.map(item=>typeof item === 'string' ? item : item?.id).filter(Boolean) : [];
     const modelIds = Array.isArray(modelContract.items)
-      ? modelContract.items.map(item=>String(item?.id || '')).filter(Boolean) : [];
+      ? modelContract.items.map(item=>typeof item === 'string' ? item : item?.id).filter(Boolean) : [];
     features.controls = (Array.isArray(features.controls) ? features.controls : []).map(control=>{
       if(control?.key !== 'model') return control;
+      const controlModelIds = Array.isArray(control.choices)
+        ? control.choices.map(item=>typeof item === 'string' ? item : item?.id).filter(Boolean) : [];
       return {
         ...control,
-        choices:modelIds.length ? modelIds : (control.choices || []),
-        allow_custom:!!modelContract.allow_custom,
+        choices:controlModelIds.length ? controlModelIds
+          : (surfaceModelIds.length ? surfaceModelIds : modelIds),
+        allow_custom:typeof control.allow_custom === 'boolean'
+          ? control.allow_custom : !!modelContract.allow_custom,
       };
     });
     return {...capability, surface:selectedId, surface_available:!!surface.available, features};
