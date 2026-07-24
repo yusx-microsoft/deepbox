@@ -13,9 +13,11 @@ resource webApp 'Microsoft.Web/sites@2024-11-01' existing = {
   name: webAppName
 }
 
-// The client secret is deliberately not an IaC parameter. Provision it as the
-// MICROSOFT_PROVIDER_AUTHENTICATION_SECRET App Service setting before enabling
-// Microsoft authentication in the Deepbox runtime configuration.
+// Easy Auth treats this reserved App Service setting as a user-assigned managed
+// identity client ID and redeems the app registration's federated credential
+// without a client secret or uploaded certificate.
+var federatedCredentialSettingName = 'OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID'
+
 resource easyAuth 'Microsoft.Web/sites/config@2024-11-01' = {
   parent: webApp
   name: 'authsettingsV2'
@@ -37,7 +39,7 @@ resource easyAuth 'Microsoft.Web/sites/config@2024-11-01' = {
         enabled: true
         registration: {
           clientId: clientId
-          clientSecretSettingName: 'MICROSOFT_PROVIDER_AUTHENTICATION_SECRET'
+          clientSecretSettingName: federatedCredentialSettingName
           openIdIssuer: uri(
             environment().authentication.loginEndpoint,
             '${tenantId}/v2.0'

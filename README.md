@@ -34,7 +34,7 @@ Copilot CLI、Codex CLI…）连接到 server，然后登录平台，就能像�
 - [`docs/product-design.md`](docs/product-design.md) — **产品定位、用户、对象模型、核心流程与设计原则**
 - [`docs/planning.md`](docs/planning.md) — **从当前 P0 到 MVP、Internal Beta 和团队产品的实施计划**
 - [`docs/remote-deployment.md`](docs/remote-deployment.md) — **三台 Windows 电脑通过 Tailscale 远程连接**
-- [`docs/azure-deployment.md`](docs/azure-deployment.md) — **Azure App Service (Linux) 部署 server**
+- [`docs/azure-deployment.md`](docs/azure-deployment.md) — **Azure App Service (Linux) 部署与无密钥 Entra / Easy Auth 登录**
 - [`docs/install.md`](docs/install.md) — `deepbox` 命令的一次安装、日常连接、显式升级与 Windows 安全刷新
 - [`docs/design.md`](docs/design.md) — 整体技术架构
 - [`docs/implementation.md`](docs/implementation.md) — 当前代码实现说明

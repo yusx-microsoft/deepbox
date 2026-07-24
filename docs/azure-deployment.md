@@ -43,7 +43,7 @@ outbound to the server.
 | `DEEPBOX_MICROSOFT_OWNER_EMAILS` | explicit email list | required in `microsoft` mode; keep narrow |
 | `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS` | explicit Entra tenant ID list | required whenever Microsoft auth is enabled in production |
 | `DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS` | `7` | allowed range 1–30 |
-| `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET` | *secure app setting* | consumed by Easy Auth, never Deepbox |
+| `OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID` | user-assigned managed identity client ID (slot setting) | reserved Easy Auth FIC pointer; non-secret and never read by Deepbox |
 
 Port precedence in code: `DEEPBOX_PORT` → `PORT` → `WEBSITES_PORT` → `8077`.
 
@@ -51,27 +51,33 @@ Port precedence in code: `DEEPBOX_PORT` → `PORT` → `WEBSITES_PORT` → `8077
 
 Keep `DEEPBOX_AUTH_MODE=local` until every item below is complete. Enabling the application mode without the platform identity boundary would trust spoofable client headers.
 
-1. For an employee-only deployment, create a **single-tenant** app registration (`signInAudience = AzureADMyOrg`) in the organization's Entra tenant. Broader organizational or personal-account audiences must be an explicit product decision, not the default.
-2. Add the exact Web redirect URI `https://<app>.azurewebsites.net/.auth/login/aad/callback`. This is the Easy Auth provider callback; `/api/auth/microsoft/callback` is Deepbox's post-login route and is not registered with Entra.
-3. Store the client secret in the App Service setting `MICROSOFT_PROVIDER_AUTHENTICATION_SECRET`. Do not put the value in source, Bicep parameter files, deployment ZIPs, command transcripts, or Deepbox `.env` files. Record its expiry and rotate it before expiration.
-4. Deploy `infra/microsoft-auth.bicep` with the existing App Service name, Entra tenant ID, and public client ID. The template enables Easy Auth v2, uses the tenant-specific issuer, accepts only the client ID audiences, requires HTTPS, disables the unused token store, and deliberately allows anonymous requests through to Deepbox's own route authorization.
+1. For an employee-only deployment, create a **single-tenant** app registration (`signInAudience = AzureADMyOrg`) in the organization's Entra tenant. Broader organizational or personal-account audiences must be an explicit product decision, not the default. Tenants that enforce a Service Tree reference require `az ad app create --service-management-reference <service-tree-guid>`.
+2. Add the exact Web redirect URI `https://<app>.azurewebsites.net/.auth/login/aad/callback`. This is the Easy Auth provider callback; `/api/auth/microsoft/callback` is Deepbox's post-login route and is not registered with Entra. Retain both the public application/client ID and the app registration object ID.
+3. Configure the secretless Easy Auth identity and deploy `authsettingsV2`:
 
    ```powershell
-   az deployment group create `
-     --resource-group <resource-group> `
-     --template-file infra/microsoft-auth.bicep `
-     --parameters webAppName=<app> tenantId=<tenant-guid> clientId=<client-guid>
+   ./scripts/configure-microsoft-auth.ps1 `
+     -SubscriptionId <subscription-guid> `
+     -ResourceGroup <resource-group> `
+     -WebAppName <app> `
+     -TenantId <tenant-guid> `
+     -ClientId <application-client-guid> `
+     -ApplicationObjectId <application-object-guid>
    ```
 
-5. Set `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS=<tenant-guid>` and a narrow normalized `DEEPBOX_MICROSOFT_OWNER_EMAILS` list. Keep `DEEPBOX_AUTH_MODE=local` while validating the platform redirect, then use `hybrid` for the first interactive sign-in so the password path remains a rollback route.
-6. Verify HTTPS-only, the exact redirect URI, issuer and audience, provider secret setting, and that a completed sign-in produces platform-injected `X-MS-CLIENT-PRINCIPAL*` headers. Test a different tenant and confirm Deepbox returns 403. Never expose the ASGI process directly in Microsoft mode.
-7. After sign-in, logout, cookie expiry, owner linking, and a workspace invitation pass end to end, change `DEEPBOX_AUTH_MODE=microsoft` to remove password login.
+   The helper creates or reuses a user-assigned managed identity, assigns it to the web app, and creates an Entra federated identity credential with issuer `https://login.microsoftonline.com/<tenant-guid>/v2.0`, subject equal to the managed identity principal/object ID, and audience `api://AzureADTokenExchange`. It writes the identity's client ID to the sticky, reserved App Service setting `OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID`, then deploys `infra/microsoft-auth.bicep`. The Bicep template points `clientSecretSettingName` at that reserved setting; despite the schema property name, no client secret or certificate exists.
 
-Deepbox never receives or stores Microsoft access/refresh tokens. It maps the Easy Auth tenant + subject to a user, applies its own tenant allowlist, and issues its own signed, time-limited cookie. An allow-listed identity may claim the sole unlinked local owner during migration; ordinary identities are deployment members and join shared workspaces through invitations.
+   The template enables Easy Auth v2, uses the tenant-specific issuer, accepts only the app's audiences, requires HTTPS, disables the unused token store, and deliberately allows anonymous requests through to Deepbox's own route authorization. The helper validates the current tenant and single-tenant app registration, reuses an exact existing FIC, fails closed on a conflicting FIC, and **does not** change `DEEPBOX_AUTH_MODE`.
+4. Set `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS=<tenant-guid>` and a narrow normalized `DEEPBOX_MICROSOFT_OWNER_EMAILS` list. Keep `DEEPBOX_AUTH_MODE=local` while validating the platform redirect, then use `hybrid` for the first interactive sign-in so the password path remains a rollback route.
+5. Verify HTTPS-only, the exact redirect URI, issuer and audiences, UAMI assignment, reserved slot setting, FIC tuple, and that `/.auth/login/aad` redirects to the expected tenant and client ID. A completed sign-in must produce platform-injected `X-MS-CLIENT-PRINCIPAL*` headers. Test a different tenant and confirm Deepbox returns 403. Never expose the ASGI process directly in Microsoft mode.
+6. After sign-in, logout, cookie expiry, owner linking, and a workspace invitation pass end to end, change `DEEPBOX_AUTH_MODE=microsoft` to remove password login.
+
+Deepbox never receives or stores Microsoft access/refresh tokens, app credentials, or model credentials. It maps the Easy Auth tenant + subject to a user, applies its own tenant allowlist, and issues its own signed, time-limited cookie. An allow-listed identity may claim the sole unlinked local owner during migration; ordinary identities are deployment members and join shared workspaces through invitations.
 
 Official references:
 
 - [Configure Microsoft identity for App Service Authentication](https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad)
+- [Use a managed identity instead of a secret](https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad#use-a-managed-identity-instead-of-a-secret)
 - [Supported account types and `signInAudience`](https://learn.microsoft.com/entra/identity-platform/supported-accounts-validation)
 - [App Service Authentication overview](https://learn.microsoft.com/azure/app-service/overview-authentication-authorization)
 

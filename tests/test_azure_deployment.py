@@ -35,9 +35,15 @@ class AzureDeploymentTests(unittest.TestCase):
         )
         self.assertIn("name: 'authsettingsV2'", bicep)
         self.assertIn(
-            "clientSecretSettingName: 'MICROSOFT_PROVIDER_AUTHENTICATION_SECRET'",
+            "federatedCredentialSettingName = "
+            "'OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID'",
             bicep,
         )
+        self.assertIn(
+            "clientSecretSettingName: federatedCredentialSettingName",
+            bicep,
+        )
+        self.assertNotIn("MICROSOFT_PROVIDER_AUTHENTICATION_SECRET", bicep)
         self.assertNotIn("clientSecret:", bicep)
         self.assertNotIn("@secure()", bicep)
         self.assertIn("environment().authentication.loginEndpoint", bicep)
@@ -45,6 +51,21 @@ class AzureDeploymentTests(unittest.TestCase):
         self.assertIn("unauthenticatedClientAction: 'AllowAnonymous'", bicep)
         self.assertIn("requireHttps: true", bicep)
         self.assertIn("enabled: false", bicep)
+
+    def test_microsoft_auth_helper_configures_managed_identity_federation(self) -> None:
+        script = (ROOT / "scripts" / "configure-microsoft-auth.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("az identity create", script)
+        self.assertIn("az webapp identity assign", script)
+        self.assertIn("az ad app federated-credential create", script)
+        self.assertIn("api://AzureADTokenExchange", script)
+        self.assertIn("OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID", script)
+        self.assertIn("--slot-settings", script)
+        self.assertIn("infra/microsoft-auth.bicep", script.replace("\\", "/"))
+        self.assertNotIn("az ad app credential", script)
+        self.assertNotIn("MICROSOFT_PROVIDER_AUTHENTICATION_SECRET", script)
+        self.assertNotIn("DEEPBOX_AUTH_MODE=", script)
 
 
 if __name__ == "__main__":
