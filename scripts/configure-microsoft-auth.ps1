@@ -3,10 +3,11 @@
   Configure secretless, tenant-restricted Microsoft sign-in for an existing Deepbox web app.
 
 .DESCRIPTION
-  Creates or reuses the app registration's home-tenant service principal and a
-  user-assigned managed identity, assigns the identity to the web app, creates
-  the Entra federated identity credential, writes the reserved Easy Auth
-  managed-identity setting, and deploys authsettingsV2.
+  Enables ID-token issuance on the app registration, creates or reuses its
+  home-tenant service principal and a user-assigned managed identity, assigns
+  the identity to the web app, creates the Entra federated identity credential,
+  writes the reserved Easy Auth managed-identity setting, and deploys
+  authsettingsV2.
 
   No client secret or certificate is created. The script deliberately does not
   change DEEPBOX_AUTH_MODE; keep local mode until the first interactive sign-in.
@@ -77,6 +78,25 @@ if ([guid]$application.appId -ne $ClientId) {
 }
 if ($application.signInAudience -ne 'AzureADMyOrg') {
     throw "App registration must be single-tenant (AzureADMyOrg), found '$($application.signInAudience)'."
+}
+
+if (-not $application.web.implicitGrantSettings.enableIdTokenIssuance) {
+    Write-Host 'Enabling ID-token issuance required by the Easy Auth hybrid flow...'
+    & az ad app update `
+        --id $ApplicationObjectId `
+        --enable-id-token-issuance true `
+        --only-show-errors
+    Assert-AzSucceeded 'Enabling app registration ID-token issuance'
+
+    $application = & az ad app show --id $ApplicationObjectId --output json |
+        ConvertFrom-Json
+    Assert-AzSucceeded 'Verifying app registration ID-token issuance'
+    if (-not $application.web.implicitGrantSettings.enableIdTokenIssuance) {
+        throw 'App registration ID-token issuance is still disabled after the update.'
+    }
+}
+else {
+    Write-Host 'App registration ID-token issuance is already enabled.'
 }
 
 $servicePrincipalJson = & az ad sp show --id $ClientId --output json 2>$null
