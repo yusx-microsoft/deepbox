@@ -18,6 +18,14 @@ test('escapeHtml neutralizes markup and quotes', () => {
   assert.equal(ui.escapeHtml(null), '');
 });
 
+test('apiErrorMessage keeps API failures actionable when a proxy returns no body', () => {
+  assert.equal(ui.apiErrorMessage(403, 'Forbidden', ''), 'Request failed (403 Forbidden)');
+  assert.equal(ui.apiErrorMessage(403, '', null), 'Request failed (403)');
+  assert.equal(ui.apiErrorMessage(400, 'Bad Request', '{"detail":"Name is required"}'),
+    'Name is required');
+  assert.equal(ui.apiErrorMessage(500, 'Server Error', 'upstream failed'), 'upstream failed');
+});
+
 test('initials builds a stable monogram', () => {
   assert.equal(ui.initials('Claude Code'), 'CC');
   assert.equal(ui.initials('@copilot'), 'CO');

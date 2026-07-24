@@ -80,7 +80,7 @@ def test_security_headers_and_auth_no_store_are_applied():
     response = client.get("/api/auth/bootstrap-status")
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["x-frame-options"] == "DENY"
-    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["referrer-policy"] == "same-origin"
     assert "strict-transport-security" not in response.headers
     assert response.headers["cache-control"] == "no-store"
 

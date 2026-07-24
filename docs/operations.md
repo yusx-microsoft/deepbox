@@ -55,7 +55,10 @@ unless `DEEPBOX_ALLOWED_ORIGINS` (or `DEEPBOX_PUBLIC_URL`) supplies at least one
 origin and `DEEPBOX_COOKIE_SECURE=true`. Unsafe cookie-authenticated requests must carry
 an allowed `Origin`; `/ws/term` applies the same allowlist. Responses receive
 anti-sniffing, framing, referrer, permissions and CSP headers; production responses
-also receive HSTS.
+also receive HSTS. The default `Referrer-Policy: same-origin` deliberately preserves
+the same-origin `Referer` required by App Service Easy Auth's cookie-request CSRF
+validation while suppressing referrers to other origins; do not tighten it to
+`no-referrer` on an Easy Auth deployment.
 
 Rate limiting defaults on in production and can be controlled with:
 

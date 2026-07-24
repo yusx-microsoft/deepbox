@@ -123,7 +123,13 @@ function clearPendingWorkspaceInvite(){
 async function api(path, opts={}) {
   const r = await fetch(path, {credentials:'same-origin',
     headers:{'Content-Type':'application/json'}, ...opts});
-  if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail);
+  if (!r.ok) {
+    const body = await r.text();
+    const message = ui
+      ? ui.apiErrorMessage(r.status, r.statusText, body)
+      : body.trim() || `Request failed (${[r.status, r.statusText].filter(Boolean).join(' ')})`;
+    throw new Error(message);
+  }
   return r.status === 204 ? null : r.json();
 }
 
@@ -699,8 +705,14 @@ async function createDevbox() {
     fields:[{name:'name', label:'Name', value:'My Devbox', required:true}],
     submit:'Create'});
   if(!name) return;
-  const res = await api('/api/devboxes',{method:'POST',body:JSON.stringify({
-    name:name.name, workspace_id:activeWorkspaceId})});
+  let res;
+  try {
+    res = await api('/api/devboxes',{method:'POST',body:JSON.stringify({
+      name:name.name, workspace_id:activeWorkspaceId})});
+  } catch(error) {
+    await showAlert('Could not create devbox', error.message);
+    return;
+  }
   if (await loadDevboxes()) renderFleet();
   await showToken(res.token);
 }

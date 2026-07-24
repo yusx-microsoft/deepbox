@@ -14,6 +14,22 @@
     });
   }
 
+  function apiErrorMessage(status, statusText, body){
+    const text = String(body == null ? '' : body).trim();
+    if(text){
+      try {
+        const parsed = JSON.parse(text);
+        if(typeof parsed.detail === 'string' && parsed.detail.trim()) return parsed.detail.trim();
+        if(typeof parsed.message === 'string' && parsed.message.trim()) return parsed.message.trim();
+      } catch(_error) {
+        // Preserve plain-text server errors verbatim.
+      }
+      return text;
+    }
+    const label = [status, String(statusText || '').trim()].filter(Boolean).join(' ');
+    return label ? `Request failed (${label})` : 'Request failed';
+  }
+
   // Short label for an avatar/monogram from a display name or handle.
   function initials(name){
     const cleaned = String(name == null ? '' : name).trim();
@@ -466,6 +482,7 @@
 
   return {
     escapeHtml: escapeHtml,
+    apiErrorMessage: apiErrorMessage,
     initials: initials,
     runtimeLabel: runtimeLabel,
     runtimeCapabilities: runtimeCapabilities,

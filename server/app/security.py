@@ -273,7 +273,7 @@ def build_security_headers(
     include_subdomains: bool = True,
     preload: bool = False,
     frame_options: str = "DENY",
-    referrer_policy: str = "no-referrer",
+    referrer_policy: str = "same-origin",
     content_type_options: str = "nosniff",
     extra: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
@@ -282,8 +282,11 @@ def build_security_headers(
     Pure and deterministic given its arguments. HSTS
     (``Strict-Transport-Security``) is only emitted when ``production`` is
     true, because forcing HTTPS on local/plain-HTTP development would break it
-    and can poison browser HSTS caches. ``extra`` headers are merged last and
-    win, letting callers override or augment without mutating globals.
+    and can poison browser HSTS caches. The default referrer policy preserves
+    same-origin referrers required by App Service Easy Auth's cookie-request
+    CSRF check while suppressing referrers to other origins. ``extra`` headers
+    are merged last and win, letting callers override or augment without
+    mutating globals.
     """
 
     headers: Dict[str, str] = {

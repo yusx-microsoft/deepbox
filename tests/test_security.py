@@ -271,7 +271,9 @@ class SecurityHeaderTests(unittest.TestCase):
         h = build_security_headers(production=False)
         self.assertEqual(h["X-Content-Type-Options"], "nosniff")
         self.assertEqual(h["X-Frame-Options"], "DENY")
-        self.assertEqual(h["Referrer-Policy"], "no-referrer")
+        # Easy Auth rejects cookie-authenticated POSTs with 403.60 when the
+        # browser suppresses the same-origin Referer used by its CSRF check.
+        self.assertEqual(h["Referrer-Policy"], "same-origin")
         self.assertNotIn("Strict-Transport-Security", h)
 
     def test_hsts_only_in_production(self):
