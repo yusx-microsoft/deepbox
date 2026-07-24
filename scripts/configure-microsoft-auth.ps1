@@ -3,9 +3,10 @@
   Configure secretless, tenant-restricted Microsoft sign-in for an existing Deepbox web app.
 
 .DESCRIPTION
-  Creates or reuses a user-assigned managed identity, assigns it to the web app,
-  creates the Entra app registration federated identity credential, writes the
-  reserved Easy Auth managed-identity setting, and deploys authsettingsV2.
+  Creates or reuses the app registration's home-tenant service principal and a
+  user-assigned managed identity, assigns the identity to the web app, creates
+  the Entra federated identity credential, writes the reserved Easy Auth
+  managed-identity setting, and deploys authsettingsV2.
 
   No client secret or certificate is created. The script deliberately does not
   change DEEPBOX_AUTH_MODE; keep local mode until the first interactive sign-in.
@@ -76,6 +77,24 @@ if ([guid]$application.appId -ne $ClientId) {
 }
 if ($application.signInAudience -ne 'AzureADMyOrg') {
     throw "App registration must be single-tenant (AzureADMyOrg), found '$($application.signInAudience)'."
+}
+
+$servicePrincipalJson = & az ad sp show --id $ClientId --output json 2>$null
+if ($LASTEXITCODE -eq 0) {
+    $servicePrincipal = $servicePrincipalJson | ConvertFrom-Json
+    Write-Host "Reusing home-tenant service principal '$($servicePrincipal.id)'."
+}
+else {
+    Write-Host 'Creating the app registration home-tenant service principal...'
+    $servicePrincipal = & az ad sp create --id $ClientId --output json |
+        ConvertFrom-Json
+    Assert-AzSucceeded 'Creating the home-tenant service principal'
+}
+if ([guid]$servicePrincipal.appId -ne $ClientId) {
+    throw "Service principal '$($servicePrincipal.id)' has app ID '$($servicePrincipal.appId)', expected '$ClientId'."
+}
+if (-not $servicePrincipal.accountEnabled) {
+    throw "Service principal '$($servicePrincipal.id)' is disabled."
 }
 
 $identityJson = & az identity show `

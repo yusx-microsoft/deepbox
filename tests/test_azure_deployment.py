@@ -56,6 +56,8 @@ class AzureDeploymentTests(unittest.TestCase):
         script = (ROOT / "scripts" / "configure-microsoft-auth.ps1").read_text(
             encoding="utf-8"
         )
+        self.assertIn("az ad sp show", script)
+        self.assertIn("az ad sp create", script)
         self.assertIn("az identity create", script)
         self.assertIn("az webapp identity assign", script)
         self.assertIn("az ad app federated-credential create", script)
@@ -63,6 +65,10 @@ class AzureDeploymentTests(unittest.TestCase):
         self.assertIn("OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID", script)
         self.assertIn("--slot-settings", script)
         self.assertIn("infra/microsoft-auth.bicep", script.replace("\\", "/"))
+        self.assertLess(
+            script.index("az ad sp create"),
+            script.index("az deployment group create"),
+        )
         self.assertNotIn("az ad app credential", script)
         self.assertNotIn("MICROSOFT_PROVIDER_AUTHENTICATION_SECRET", script)
         self.assertNotIn("DEEPBOX_AUTH_MODE=", script)
