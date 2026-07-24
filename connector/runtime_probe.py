@@ -34,7 +34,7 @@ def run_probe(argv: list[str], timeout: float = 5.0) -> ProbeResult:
     try:
         completed = subprocess.run(
             argv,
-            stdin=subprocess.DEVNULL,
+            input="",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

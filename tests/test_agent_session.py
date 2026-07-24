@@ -298,3 +298,84 @@ async def _co_live_model_control_precedes_next_prompt():
 def test_live_model_control_precedes_next_prompt_sync():
     asyncio.run(_co_live_model_control_precedes_next_prompt())
 
+
+async def _co_spawn_retries_windows_access_denied(monkeypatch):
+    calls = []
+    sleeps = []
+    sentinel = object()
+
+    async def fake_create(*argv, **kwargs):
+        calls.append((argv, kwargs))
+        if len(calls) < 3:
+            exc = PermissionError(13, "Access is denied")
+            exc.winerror = 5
+            raise exc
+        return sentinel
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(A, "IS_WIN", True)
+    monkeypatch.setattr(A.shutil, "which", lambda name: r"C:\tools\copilot.exe")
+    monkeypatch.setattr(A.asyncio, "create_subprocess_exec", fake_create)
+    monkeypatch.setattr(A.asyncio, "sleep", fake_sleep)
+
+    session = A.StructuredAgentSession(
+        ["copilot", "--silent"], None, _noop, _noop,
+    )
+    proc = await session._spawn_process(["copilot", "--silent"])
+
+    assert proc is sentinel
+    assert sleeps == [0.1, 0.35]
+    assert len(calls) == 3
+    assert all(call[0][0] == r"C:\tools\copilot.exe" for call in calls)
+    assert all(call[1]["stdin"] == asyncio.subprocess.PIPE for call in calls)
+
+
+def test_spawn_retries_windows_access_denied(monkeypatch):
+    asyncio.run(_co_spawn_retries_windows_access_denied(monkeypatch))
+
+
+async def _co_spawn_failure_becomes_protocol_error():
+    events = []
+
+    async def on_output(raw):
+        events.append(json.loads(raw))
+
+    async def denied(_prompt):
+        exc = PermissionError(13, "Access is denied")
+        exc.winerror = 5
+        raise exc
+
+    old_is_win = A.IS_WIN
+    A.IS_WIN = True
+    try:
+        session = A.StructuredAgentSession(
+            ["copilot"], None, on_output, _noop,
+            spawn=denied,
+            per_turn=True,
+            prompt_argv=("-p",),
+            option_sanitizer=lambda value: dict(value),
+        )
+        await session.start()
+        await session._dispatch_turn("hello", {})
+    finally:
+        A.IS_WIN = old_is_win
+
+    assert events[-2] == {
+        "ev": A.EV_ERROR,
+        "message": (
+            "Windows denied access while starting the agent CLI after retries. "
+            "Check the CLI executable permission, then retry the turn."
+        ),
+    }
+    assert events[-1] == {
+        "ev": A.EV_TURN_END,
+        "subtype": "process_error",
+        "is_error": True,
+    }
+
+
+def test_spawn_failure_becomes_protocol_error_sync():
+    asyncio.run(_co_spawn_failure_becomes_protocol_error())
+

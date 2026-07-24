@@ -99,8 +99,8 @@ def test_claude_bypass_permissions_argv():
 
 def test_copilot_model_and_allow_all_argv():
     assert runtimes.build_command(
-        "copilot-cli", model="gpt-5", permission_mode="allowAll") == [
-        "copilot", "--model", "gpt-5", "--allow-all-tools"]
+        "copilot-cli", model="gpt-5.6-sol", permission_mode="allowAll") == [
+        "copilot", "--model", "gpt-5.6-sol", "--allow-all-tools"]
 
 
 def test_codex_full_auto_argv():
@@ -255,6 +255,19 @@ class TestStructuredControls:
 
     def test_copilot_uses_documented_reasoning_choices_and_nonblocking_auth(self):
         adapter = runtimes.get("copilot-cli-structured")
+        expected_models = (
+            "claude-sonnet-5",
+            "claude-sonnet-4.6",
+            "claude-sonnet-4.5",
+            "claude-haiku-4.5",
+            "claude-opus-4.8",
+            "claude-opus-4.7",
+            "claude-opus-4.6",
+            "claude-opus-4.5",
+            "gpt-5.6-sol",
+        )
+        assert adapter.models == expected_models
+        assert runtimes.get("copilot-cli").models == expected_models
         assert adapter.auth_argv == ()
         reasoning = next(
             control for control in adapter.controls
@@ -267,7 +280,7 @@ class TestStructuredControls:
 
     def test_sanitize_and_argv_ignore_undeclared_or_invalid_options(self):
         clean = runtimes.sanitize_options("copilot-cli-structured", {
-            "model": "gpt-5",
+            "model": "gpt-5.6-sol",
             "reasoning_effort": "high",
             "evil": "--run-anything",
             "attachments": [{"name": "a.txt", "data": "YQ=="}],

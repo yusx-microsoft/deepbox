@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from connector import runtimes
+from connector import runtime_probe, runtimes
 from connector.runtime_probe import (
     ProbeResult,
     RuntimeProbeCache,
@@ -229,3 +230,21 @@ def test_family_surface_resolution_is_explicit():
     assert runtimes.get_for_surface("claude-code", "terminal").id == "claude-code"
     with pytest.raises(runtimes.UnknownRuntimeError, match="no 'structured' surface"):
         runtimes.get_for_surface("codex-cli", "structured")
+
+
+def test_run_probe_closes_stdin_pipe_without_devnull(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(runtime_probe.subprocess, "run", fake_run)
+    result = runtime_probe.run_probe(["copilot", "--version"])
+
+    assert result.returncode == 0
+    assert result.error is False
+    assert seen["argv"] == ["copilot", "--version"]
+    assert seen["input"] == ""
+    assert "stdin" not in seen

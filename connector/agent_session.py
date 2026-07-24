@@ -43,6 +43,7 @@ import base64
 import json
 import logging
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 from typing import Awaitable, Callable
@@ -280,6 +281,34 @@ register_translator("copilot-cli-structured", translate_copilot_event)
 
 _LOG = logging.getLogger(__name__)
 _TEMP_CLEANUP_DELAYS = (0.0, 0.05, 0.2, 0.5)
+_SPAWN_RETRY_DELAYS = (0.1, 0.35)
+
+
+def _resolve_spawn_argv(argv: list[str]) -> list[str]:
+    """Resolve argv[0] so Windows does not race PATH/app aliases."""
+    if not argv or not IS_WIN:
+        return list(argv)
+    executable = shutil.which(argv[0])
+    if not executable:
+        return list(argv)
+    return [executable, *argv[1:]]
+
+
+def _is_windows_access_denied(exc: BaseException) -> bool:
+    return (
+        IS_WIN
+        and isinstance(exc, PermissionError)
+        and (getattr(exc, "winerror", None) == 5 or exc.errno == 13)
+    )
+
+
+def _process_start_error(exc: OSError) -> str:
+    if _is_windows_access_denied(exc):
+        return (
+            "Windows denied access while starting the agent CLI after retries. "
+            "Check the CLI executable permission, then retry the turn."
+        )
+    return "The agent CLI could not be started. Check the local CLI installation and retry."
 
 
 async def _terminate_process(proc) -> None:
@@ -371,12 +400,30 @@ class StructuredAgentSession:
             if self._per_turn:
                 return await self._custom_spawn(prompt)
             return await self._custom_spawn()
-        return await asyncio.create_subprocess_exec(
-            *argv, cwd=self.cwd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+
+        resolved_argv = _resolve_spawn_argv(argv)
+        for attempt in range(len(_SPAWN_RETRY_DELAYS) + 1):
+            try:
+                return await asyncio.create_subprocess_exec(
+                    *resolved_argv, cwd=self.cwd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except PermissionError as exc:
+                if (
+                    not _is_windows_access_denied(exc)
+                    or attempt >= len(_SPAWN_RETRY_DELAYS)
+                ):
+                    raise
+                _LOG.warning(
+                    "Windows denied an agent process start; retrying (%d/%d)",
+                    attempt + 1,
+                    len(_SPAWN_RETRY_DELAYS),
+                )
+                await asyncio.sleep(_SPAWN_RETRY_DELAYS[attempt])
+                resolved_argv = _resolve_spawn_argv(argv)
+        raise RuntimeError("unreachable process-spawn retry state")
 
     def _command(self, options: dict, paths: tuple[str, ...] = ()) -> list[str]:
         if self._command_builder is None:
@@ -725,6 +772,18 @@ class StructuredAgentSession:
         except ValueError as exc:
             await self._emit(_event(EV_ERROR, message=str(exc)))
             await self._emit(_event(EV_TURN_END, subtype="input_error"))
+        except OSError as exc:
+            code = getattr(exc, "winerror", None) or exc.errno
+            _LOG.warning(
+                "Agent process could not start (error code %s)",
+                code if code is not None else "unknown",
+            )
+            await self._emit(_event(
+                EV_ERROR, message=_process_start_error(exc),
+            ))
+            await self._emit(_event(
+                EV_TURN_END, subtype="process_error", is_error=True,
+            ))
 
     def is_alive(self) -> bool:
         if not self._alive:

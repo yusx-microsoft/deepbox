@@ -84,8 +84,12 @@ project scope 的 `list` / `inspect` / `remove` 同样追加 `--project "My proj
 
 live model discovery 不可用或没有返回 model ID 时，connector 会保留 adapter static catalog 作为
 `partial/adapter` fallback；UI 按 control choices → surface model facts → family model catalogue 回退，始终提供
-**Runtime default**，仅在 adapter 允许 custom model ID 时渲染可编辑 model combobox。Claude structured 的
-model 是 per-turn control：后续 turn 会先向同一进程发送 `set_model`，因此首轮后仍可在显式 model 间切换；
+**Runtime default**，仅在 adapter 允许 custom model ID 时渲染可编辑 model combobox。当前 Claude Code catalog
+使用 CLI 的稳定别名 `sonnet|opus|haiku`；Copilot catalog 为 `claude-sonnet-5`、`claude-sonnet-4.6`、
+`claude-sonnet-4.5`、`claude-haiku-4.5`、`claude-opus-4.8`、`claude-opus-4.7`、
+`claude-opus-4.6`、`claude-opus-4.5`、`gpt-5.6-sol`，且仍允许输入 CLI 接受的 custom ID。
+**Runtime default** 不传 `--model`。Claude structured 的 model 是 per-turn control：后续 turn 会先向同一进程发送
+`set_model`，因此首轮后仍可在显式 model 间切换；
 协议不支持把已设置的 model 清空，回到 **Runtime default** 需 **New chat**。真正的 session-scoped controls
 才会在配置完成或出现首个 chat item 后锁定。**New chat** 终止当前 runtime session、
 创建空的 persisted session 并重新开放 controls，不删除旧历史。

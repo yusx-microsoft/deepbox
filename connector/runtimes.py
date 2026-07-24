@@ -60,6 +60,18 @@ __all__ = [
 # defence-in-depth posture and to make injection attempts fail loudly.
 _SHELL_METACHARS = set(";&|<>`$(){}[]!*?~\n\r\t\0\"'\\")
 _EXECUTABLE_RE = re.compile(r"^[A-Za-z0-9_.+-]+$")
+_CLAUDE_CODE_MODELS = ("sonnet", "opus", "haiku")
+_COPILOT_MODELS = (
+    "claude-sonnet-5",
+    "claude-sonnet-4.6",
+    "claude-sonnet-4.5",
+    "claude-haiku-4.5",
+    "claude-opus-4.8",
+    "claude-opus-4.7",
+    "claude-opus-4.6",
+    "claude-opus-4.5",
+    "gpt-5.6-sol",
+)
 
 
 class UnknownRuntimeError(KeyError):
@@ -564,7 +576,7 @@ register(RuntimeAdapter(
     base_argv=("claude",),
     family="claude-code", surface="terminal",
     model_flag="--model",
-    models=("sonnet", "opus", "haiku"),
+    models=_CLAUDE_CODE_MODELS,
     permission_modes={
         "": (),  # default: interactive permission prompts
         "default": ("--permission-mode", "default"),
@@ -585,7 +597,7 @@ register(RuntimeAdapter(
     base_argv=("copilot",),
     family="copilot-cli", surface="terminal",
     model_flag="--model",
-    models=("gpt-5", "claude-sonnet-4.5"),
+    models=_COPILOT_MODELS,
     permission_modes={
         "": (),
         "default": (),
@@ -645,7 +657,7 @@ register(RuntimeAdapter(
         "--verbose",
     ),
     model_flag="--model",
-    models=("sonnet", "opus", "haiku"),
+    models=_CLAUDE_CODE_MODELS,
     structured=True,
     allow_custom_models=False,
     model_scope="turn",
@@ -693,7 +705,7 @@ register(RuntimeAdapter(
         "--no-color",
     ),
     model_flag="--model",
-    models=("gpt-5", "claude-sonnet-4.5"),
+    models=_COPILOT_MODELS,
     structured=True,
     per_turn=True,
     prompt_argv=("-p",),
