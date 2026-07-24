@@ -299,7 +299,7 @@ Structured options 和附件在 connector 按 adapter descriptor 二次验证；
 | `POST` | `/api/devboxes/{id}/projects` | Connector Token | 替换 path-free LocalProject metadata；处理 one-cycle legacy migration，并拒绝删除仍被 skill 引用的项目 |
 | `POST` | `/api/devboxes/{id}/skills` | Connector Token | 替换 sanitized skill inventory（最多 256 项，不接收 path） |
 
-Microsoft 登录的信任边界在 Azure App Service Easy Auth：平台先验证 OAuth/OIDC，再注入 `X-MS-CLIENT-PRINCIPAL*`。应用不接收浏览器 Microsoft bearer token，不存 access/refresh token；非 App Service 或未正确启用 Easy Auth 的部署必须保持 `DEEPBOX_AUTH_MODE=local`。`microsoft` 模式还要求明确的 owner 邮箱 allowlist 与 `DEEPBOX_PUBLIC_URL`。
+Microsoft 登录的信任边界在 Azure App Service Easy Auth：平台先验证 OAuth/OIDC，再注入 `X-MS-CLIENT-PRINCIPAL*`。应用不接收浏览器 Microsoft bearer token，不存 access/refresh token；非 App Service 或未正确启用 Easy Auth 的部署必须保持 `DEEPBOX_AUTH_MODE=local`。生产环境启用 Microsoft 登录时还必须配置 `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS`，应用会对平台 principal 的 tenant claim 再做一层 allowlist 校验；`microsoft` 模式另要求明确的 owner 邮箱 allowlist 与 `DEEPBOX_PUBLIC_URL`。
 
 workspace 邀请 token 放在 URL fragment `#workspace-invite=...`，不会随首个 HTTP 请求发送；前端仅为跨 OAuth redirect 暂存到 `sessionStorage`，preview 使用 POST body，避免 token 出现在查询字符串和常规访问日志。
 

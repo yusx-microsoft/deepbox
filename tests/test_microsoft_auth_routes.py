@@ -9,8 +9,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 
+MICROSOFT_TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+OTHER_TENANT_ID = "11111111-1111-1111-1111-111111111111"
+
+
 def _principal_header(subject: str, email: str, name: str = "Test User",
-                      tenant: str = "tenant-a") -> dict[str, str]:
+                      tenant: str = MICROSOFT_TENANT_ID) -> dict[str, str]:
     payload = {
         "auth_typ": "aad",
         "claims": [
@@ -38,6 +42,7 @@ def _build_app(tmp_path, owner_emails="owner@example.com"):
         "DEEPBOX_PUBLIC_URL": "https://deepbox.example",
         "DEEPBOX_AUTH_MODE": "microsoft",
         "DEEPBOX_MICROSOFT_OWNER_EMAILS": owner_emails,
+        "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS": MICROSOFT_TENANT_ID,
         "DEEPBOX_BOOTSTRAP_TOKEN_HASH": "configured-but-disabled",
         "DEEPBOX_SESSION_TTL_SECONDS": "3600",
         "DEEPBOX_RATE_LIMIT_ENABLED": "0",
@@ -102,6 +107,25 @@ def test_microsoft_callback_provisions_owner_and_reuses_identity(tmp_path):
             assert session.scalar(select(func.count()).select_from(models.Organization)) == 1
             assert session.scalar(select(func.count()).select_from(models.Workspace)) == 1
             assert session.get(models.User, owner_id).external_subject == "owner-subject"
+    finally:
+        client.close()
+        models._engine.dispose()
+
+
+def test_microsoft_callback_rejects_identity_from_unapproved_tenant(tmp_path):
+    client, _, models = _build_app(tmp_path)
+    try:
+        response = client.get(
+            "/api/auth/microsoft/callback",
+            headers=_principal_header(
+                "external-subject", "external@example.com", tenant=OTHER_TENANT_ID
+            ),
+            follow_redirects=False,
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "Microsoft tenant is not allowed"
+        with models.SessionLocal() as session:
+            assert session.scalar(select(func.count()).select_from(models.User)) == 0
     finally:
         client.close()
         models._engine.dispose()
@@ -176,7 +200,7 @@ def test_allowlisted_identity_claims_a_single_legacy_owner(tmp_path):
             assert session.scalar(select(func.count()).select_from(models.User)) == 1
             linked = session.get(models.User, "legacy-owner")
             assert linked.auth_provider == "microsoft"
-            assert linked.external_tenant_id == "tenant-a"
+            assert linked.external_tenant_id == MICROSOFT_TENANT_ID
             assert linked.external_subject == "claimed-subject"
             assert linked.password_hash == "legacy-hash"
     finally:
@@ -192,7 +216,8 @@ def test_existing_microsoft_identity_recovers_missing_personal_workspace(tmp_pat
                 id="partial-login", username="partial", password_hash="!microsoft",
                 display_name="Partial Login", role=models.ROLE_MEMBER,
                 email="partial@example.com", auth_provider="microsoft",
-                external_tenant_id="tenant-a", external_subject="partial-subject",
+                external_tenant_id=MICROSOFT_TENANT_ID,
+                external_subject="partial-subject",
             )
             session.add(user)
             session.commit()

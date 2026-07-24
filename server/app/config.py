@@ -75,6 +75,7 @@ class Settings:
     auth_mode: str = "local"
     session_ttl_seconds: int = 8 * 60 * 60
     microsoft_owner_emails: frozenset[str] = frozenset()
+    microsoft_allowed_tenant_ids: frozenset[str] = frozenset()
     workspace_invitation_ttl_days: int = 7
 
     @property
@@ -121,6 +122,15 @@ class Settings:
             raise RuntimeError("DEEPBOX_AUTH_MODE must be local, microsoft, or hybrid")
         if self.production and self.microsoft_auth_enabled and not self.is_azure:
             raise RuntimeError("Microsoft authentication requires azure-app-service in production")
+        if (
+            self.production
+            and self.microsoft_auth_enabled
+            and not self.microsoft_allowed_tenant_ids
+        ):
+            raise RuntimeError(
+                "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS is required when Microsoft "
+                "authentication is enabled in production"
+            )
         if self.session_ttl_seconds < 300:
             raise RuntimeError("DEEPBOX_SESSION_TTL_SECONDS must be at least 300")
         if not 1 <= self.workspace_invitation_ttl_days <= 30:
@@ -246,6 +256,13 @@ def load_settings() -> Settings:
         microsoft_owner_emails=frozenset(
             value.strip().casefold()
             for value in os.getenv("DEEPBOX_MICROSOFT_OWNER_EMAILS", "").split(",")
+            if value.strip()
+        ),
+        microsoft_allowed_tenant_ids=frozenset(
+            value.strip().casefold()
+            for value in os.getenv(
+                "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS", ""
+            ).split(",")
             if value.strip()
         ),
         workspace_invitation_ttl_days=int(os.getenv(

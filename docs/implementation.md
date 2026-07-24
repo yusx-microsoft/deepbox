@@ -49,7 +49,7 @@ SQLAlchemy Core 模型覆盖用户、内部 organization、workspace/membership�
 
 ### 2.1a Microsoft identity 与 workspace onboarding
 
-`identity.py` 是纯解析模块：它只解析 Easy Auth 已验证后注入的 `X-MS-CLIENT-PRINCIPAL*`，规范化 email/tenant，并生成可读 username seed；不验证或保存 OAuth token。`main.py` 用 `(auth_provider, tenant, subject)` upsert 用户。allowlist 中的 Microsoft email 可一次性 claim 旧的 sole local owner；普通外部身份始终创建独立 member，再通过邀请加入共享 workspace。
+`identity.py` 是纯解析模块：它只解析 Easy Auth 已验证后注入的 `X-MS-CLIENT-PRINCIPAL*`，规范化 email/tenant，并生成可读 username seed；不验证或保存 OAuth token。`main.py` 先用 `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS` 对 tenant claim 做 deployment allowlist 校验，再用 `(auth_provider, tenant, subject)` upsert 用户。owner email allowlist 中的 Microsoft 身份可一次性 claim 旧的 sole local owner；其他允许 tenant 内的身份创建独立 member，再通过邀请加入共享 workspace。
 
 Workspace invitation 的明文 token 只在创建响应的 `join_url` 返回一次；数据库仅存 hash/preview。preview 使用 `POST` JSON body，返回扁平的 `workspace_name / role / email_hint / expires_at`。accept 要求当前用户的规范化 email 精确匹配，并在唯一约束竞争后重查 membership，从而让双击/并发领取幂等。
 
@@ -305,7 +305,7 @@ header token，不接受 query-string token。详见 `remote-deployment.md`。
 - 每个现有/新建用户都有 personal workspace；用户也可创建多个 workspace，并通过 membership 加入其他 workspace。Devbox/Session 均有 `workspace_id`，旧数据在 migration/backfill 后归属明确。
 - 左栏是 `Workspace → Devbox → Agent`；任一成员可发现空间内全部 agent，`viewer < operator < admin < owner` 决定读写和管理能力，最后一个 owner 受保护。
 - workspace manager 可添加已有账号，也可签发 email-bound、single-use、expiring invitation。token 只在 hash fragment 与 sessionStorage 短暂存在，preview 走 POST body，accept email 精确匹配且并发幂等。
-- Microsoft identity 由 App Service Easy Auth 验证；Deepbox 只保存 provider/tenant/subject/email 映射并签自己的限时 cookie。`local / hybrid / microsoft` 三种模式让本地开发与 Azure 迁移共存。
+- Microsoft identity 由 App Service Easy Auth 验证；Deepbox 再检查 production tenant allowlist，只保存 provider/tenant/subject/email 映射并签自己的限时 cookie。`local / hybrid / microsoft` 三种模式让本地开发与 Azure 迁移共存。
 - `GET /api/devboxes`、Agent/Session/recording/project 路由按所有 membership 聚合并授权，不再把 deployment owner 当作 workspace owner。
 
 ## 8. 现在的边界

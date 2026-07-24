@@ -23,8 +23,8 @@ Copilot CLI、Codex CLI…）连接到 server，然后登录平台，就能像�
   UMD 模块 `web/ui.js`，由 `web/ui.test.js`（node:test）覆盖。
 - Workspace collaboration — 每个用户有 personal workspace 且可创建更多空间；左栏按
   **Workspace → Devbox → Agent** 展示，`viewer / operator / admin / owner` 四级角色约束全部资源。
-- Microsoft / local sign-in — Azure 可由 App Service Easy Auth 接入组织 Entra 账号和个人 Microsoft
-  账号；本地密码登录保留给开发环境和 hybrid 迁移。
+- Microsoft / local sign-in — Azure 可由 App Service Easy Auth 接入 tenant-scoped 组织 Entra 账号，
+  Deepbox 再校验 tenant allowlist；本地密码登录保留给开发环境和 hybrid 迁移。
 - Invitations — workspace owner/admin 签发单次、过期、邮箱绑定的加入链接；deployment owner
   另行管理本地账号邀请、禁用和重新启用。
 - Security baseline — Argon2id + 旧 hash 透明升级、生产 Origin allowlist、分层 rate limit、

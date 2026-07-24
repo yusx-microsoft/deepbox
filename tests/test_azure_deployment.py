@@ -29,6 +29,23 @@ class AzureDeploymentTests(unittest.TestCase):
         self.assertIn("healthCheckPath: '/api/ready'", bicep)
         self.assertIn("numberOfWorkers: 1", bicep)
 
+    def test_microsoft_auth_bicep_is_tenant_scoped_and_secretless(self) -> None:
+        bicep = (ROOT / "infra" / "microsoft-auth.bicep").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("name: 'authsettingsV2'", bicep)
+        self.assertIn(
+            "clientSecretSettingName: 'MICROSOFT_PROVIDER_AUTHENTICATION_SECRET'",
+            bicep,
+        )
+        self.assertNotIn("clientSecret:", bicep)
+        self.assertNotIn("@secure()", bicep)
+        self.assertIn("environment().authentication.loginEndpoint", bicep)
+        self.assertIn("'${tenantId}/v2.0'", bicep)
+        self.assertIn("unauthenticatedClientAction: 'AllowAnonymous'", bicep)
+        self.assertIn("requireHttps: true", bicep)
+        self.assertIn("enabled: false", bicep)
+
 
 if __name__ == "__main__":
     unittest.main()

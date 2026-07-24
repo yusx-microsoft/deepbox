@@ -13,7 +13,7 @@ The browser reads `GET /api/auth/config` and only shows the sign-in methods enab
 | `hybrid` | yes | yes | migrating an existing deployment |
 | `microsoft` | no | yes | Microsoft-only Azure deployment |
 
-`microsoft` and `hybrid` are safe only behind correctly configured Azure App Service Easy Auth. A directly reachable ASGI server must stay in `local` mode because client-supplied `X-MS-CLIENT-PRINCIPAL*` headers are not an identity boundary.
+`microsoft` and `hybrid` are safe only behind correctly configured Azure App Service Easy Auth. A directly reachable ASGI server must stay in `local` mode because client-supplied `X-MS-CLIENT-PRINCIPAL*` headers are not an identity boundary. Production Microsoft auth also requires `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS`; Deepbox rejects a valid Easy Auth principal whose tenant claim is not in that list.
 
 ## 1. First deployment owner (local mode)
 

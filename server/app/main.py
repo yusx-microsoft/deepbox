@@ -55,7 +55,7 @@ from .security import (
 )
 from .identity import (
     MicrosoftPrincipal, build_microsoft_principal, normalize_email,
-    normalize_tenant_id, normalize_username_hint,
+    normalize_username_hint,
 )
 from . import version as version_info
 
@@ -297,9 +297,11 @@ def _set_session_cookie(response: Response, user: User) -> None:
 
 
 def _microsoft_tenant_allowed(principal: MicrosoftPrincipal) -> bool:
-    # The App Service provider's app registration controls supported account
-    # types.  Easy Auth validates the token before these headers reach us.
-    return bool(normalize_tenant_id(principal.tenant_id))
+    allowed_tenant_ids = settings.microsoft_allowed_tenant_ids
+    return bool(principal.tenant_id) and (
+        not allowed_tenant_ids
+        or principal.tenant_id.casefold() in allowed_tenant_ids
+    )
 
 
 def _next_external_username(s: OrmSession, principal: MicrosoftPrincipal) -> str:
@@ -422,8 +424,10 @@ async def microsoft_callback(request: Request, s: OrmSession = Depends(db)):
     if not settings.microsoft_auth_enabled:
         raise HTTPException(404, "not found")
     principal = build_microsoft_principal(request.headers)
-    if principal is None or not _microsoft_tenant_allowed(principal):
+    if principal is None:
         raise HTTPException(401, "Microsoft sign-in required")
+    if not _microsoft_tenant_allowed(principal):
+        raise HTTPException(403, "Microsoft tenant is not allowed")
     user = _microsoft_user(s, principal)
     if user.disabled_at is not None:
         raise HTTPException(403, "account disabled")

@@ -124,6 +124,36 @@ class PlatformTests(unittest.TestCase):
         self.assertTrue(settings.is_azure)
 
 
+class MicrosoftAuthSettingsTests(unittest.TestCase):
+    def test_production_microsoft_auth_requires_tenant_allowlist(self):
+        settings = make_settings(
+            environment="production",
+            platform=PLATFORM_AZURE,
+            secret="x-secret",
+            allowed_origins=frozenset({"https://x.example"}),
+            cookie_secure=True,
+            auth_mode="hybrid",
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS"
+        ):
+            settings.validate()
+
+    def test_tenant_allowlist_is_trimmed_and_casefolded(self):
+        tenant_id = "72F988BF-86F1-41AF-91AB-2D7CD011DB47"
+        env = clean_env({
+            "DEEPBOX_ENV": "test",
+            "DEEPBOX_AUTH_MODE": "hybrid",
+            "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS": f" {tenant_id}, tenant-b ",
+        })
+        with patch.dict(os.environ, env, clear=True):
+            settings = load_settings()
+        self.assertEqual(
+            settings.microsoft_allowed_tenant_ids,
+            frozenset({tenant_id.casefold(), "tenant-b"}),
+        )
+
+
 class PortTests(unittest.TestCase):
     def test_websites_port_used_when_deepbox_port_absent(self):
         env = clean_env(dict(PROD_ENV, **{"WEBSITES_PORT": "8000"}))
