@@ -8,13 +8,9 @@ import logging
 
 import pytest
 
-from server.app.audit import (
-    AUDIT_LOGGER,
-    REDACTED,
-    audit_event,
-    redact,
-    redact_headers,
-)
+from starlette.requests import Request
+
+from server.app.audit import AUDIT_LOGGER, REDACTED, audit_event, redact
 
 
 # --- redaction unit tests --------------------------------------------------
@@ -105,22 +101,6 @@ def test_redact_depth_guard():
     assert out is not None
 
 
-def test_redact_headers_from_pairs():
-    out = redact_headers([("Authorization", "Bearer x"), ("Accept", "json")])
-    assert out["Authorization"] == REDACTED
-    assert out["Accept"] == "json"
-
-
-def test_redact_headers_from_mapping():
-    out = redact_headers({"cookie": "sid=1", "host": "example"})
-    assert out["cookie"] == REDACTED
-    assert out["host"] == "example"
-
-
-def test_redact_headers_bad_input_returns_empty():
-    assert redact_headers(123) == {}  # type: ignore[arg-type]
-
-
 # --- audit_event emission tests --------------------------------------------
 
 def test_audit_event_emits_record(caplog):
@@ -138,6 +118,34 @@ def test_audit_event_emits_record(caplog):
     assert rec.actor == {"user": "alice"}
     assert rec.target == {"resource": "devbox-1"}
     assert rec.outcome == "success"
+
+
+def test_audit_event_accepts_request_objects_without_logging_headers(caplog):
+    request = Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/api/workspaces",
+        "query_string": b"access_token=query-secret",
+        "headers": [
+            (b"authorization", b"Bearer header-secret"),
+            (b"cookie", b"session=cookie-secret"),
+        ],
+        "client": ("203.0.113.7", 49152),
+    })
+
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER):
+        audit_event("workspace.create", request=request)
+
+    record = next(r for r in caplog.records if getattr(r, "event", None) == "workspace.create")
+    assert record.request == {
+        "method": "POST",
+        "path": "/api/workspaces",
+        "client_ip": "203.0.113.7",
+    }
+    rendered = repr(record.request)
+    assert "query-secret" not in rendered
+    assert "header-secret" not in rendered
+    assert "cookie-secret" not in rendered
 
 
 def test_audit_event_redacts_request_metadata(caplog):

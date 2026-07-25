@@ -101,8 +101,8 @@ The legacy `~/.deepbox/deepbox-connect.cmd` / `.sh` launcher delegates to
 Project paths live only in connector-local `state.db` under
 `%LOCALAPPDATA%\deepbox` on Windows or
 `${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The server and browser
-receive a stable project ID, display name, and non-secret runtime config, never
-the path. Register a project before selecting it while creating an agent:
+receive only a stable project ID and display name, never the path or local runtime
+configuration. Register a project before selecting it while creating an agent:
 
 ```powershell
 deepbox project add "C:\src\my-repo" --name "my-repo"

@@ -1,54 +1,52 @@
-# deepbox — 设计文档
+# deepbox — Design
 
-> **一句话定位**：deepbox 是一个"agent 交换机 / 管理面"。用户把他们本地
-> devbox 里的 agent CLI（Claude Code、GitHub Copilot CLI、Codex CLI …）连接到我们的
-> server，然后**登录我们的平台，就能像在本地终端里一样**跟这些 agent 交互。
+> **In one line:** deepbox is an "agent switchboard / control plane". Users connect
+> the agent CLIs on their own devbox (Claude Code, GitHub Copilot CLI, Codex CLI,
+> and similar) to the server, sign in to the web UI, and interact with those agents
+> as if they were at the local terminal.
 >
-> **我们是平台，不是 AI 产品。** Server 永远不跑模型、不持有任何 API key、不安装任何
-> CLI。智能与凭证 100% 留在用户的 devbox 上。我们只提供：身份、连接、频道/会话、
-> 消息中继、presence、以及把用户输入和 agent 输出双向转发的"神经"。
+> **The server is a control plane, not an AI product.** It never runs models, never
+> holds a model API key, and never installs a CLI. Intelligence and credentials
+> stay entirely on the user's devbox. The server provides identity, connectivity,
+> channels/sessions, message relay, presence, and the bidirectional transport that
+> carries user input and agent output.
 
 ---
 
-## 0. 灵感来源
-
-本设计直接借鉴姊妹项目 **deepradio** 的 **Computer Model**（`C:\Code\deepradio\docs`）。
-核心思想完全一致：server 发出**不含内容的唤醒/中继信号**，真正的 agent 运行在用户机器上的
-一个用户自启进程里。deepbox 把这套模型用 **Python** 重新实现，并针对
-"HPC 式多 devbox / 多 agent 管理" + "把真实交互式 CLI 原样投射到 web" 做了强化。
-
-deepradio 与 deepbox 的关键差异：
-
-| 维度 | deepradio | deepbox |
-|---|---|---|
-| Agent 本体 | `link` 里的 LLM 循环 / 本地 CLI | **真实的交互式 CLI 进程**（claude/copilot/codex） |
-| 中继粒度 | content-free wake + REST 拉取整条消息 | **持久 PTY 会话**，逐字节双向流式转发 |
-| 用户体验目标 | 聊天室里多了个 AI 队友 | **与本地开终端用该 CLI 完全一致** |
-| 技术栈 | TypeScript / Hono / SQLite | **Python / FastAPI / SQLite** |
-
----
-
-## 1. 实体层级（Workspace / Devbox / Agent）
+## 1. Entity model (Workspace / Devbox / Agent)
 
 ```text
 Human ── Membership(role) ──▶ Workspace ── owns ──▶ Devbox ── runs ──▶ Agent
 ```
 
-- **Human**：浏览器用户；通过本地密码或 Azure App Service Easy Auth 的 Microsoft 身份登录，随后使用 deepbox 自己签发的限时 `deepbox_session` cookie。
-- **Workspace**：用户可见的协作与授权边界。一个用户可加入多个 workspace；一个 workspace 可包含多个 Devbox。
-- **Membership**：Human 在某个 Workspace 内的 `viewer / operator / admin / owner` 角色。workspace 成员可发现该空间下全部 Devbox 与 Agent；写操作继续按角色检查。
-- **Devbox**：一台用户机器上的 connector/supervisor。连接时只带 Devbox bearer token，不带 Microsoft token 或模型 key。
-- **Agent**：Devbox 上由 supervisor 管理的 CLI 进程；浏览器看到的层级固定为 **Workspace → Devbox → Agent**。Agent 可引用一个 path-free `local_project_id`。
-- **LocalProject**：connector-local 项目；绝对路径只存在本机 `state.db`，Server 只持有同 ID 的 path-free `DevboxProject` metadata。
-- **Skill**：用户提供的 `SKILL.md` package；connector 管理内容和 runtime bindings，Server 仅持有 path-free inventory。
+- **Human** — A browser user. Signs in with a local password or with a Microsoft
+  identity via Azure App Service Easy Auth, then carries a short-lived
+  `deepbox_session` cookie that deepbox issues itself.
+- **Workspace** — The visible collaboration and authorization boundary. A user can
+  belong to many workspaces, and a workspace can contain many devboxes.
+- **Membership** — A human's `viewer / operator / admin / owner` role within a
+  workspace. Members can discover every devbox and agent in the workspace; writes
+  are still checked by role.
+- **Devbox** — A connector/supervisor on a user machine. It connects with only a
+  devbox bearer token, never a Microsoft token or a model key.
+- **Agent** — A CLI process on a devbox managed by the supervisor. The browser
+  hierarchy is always Workspace → Devbox → Agent. An agent may reference a
+  path-free `local_project_id`.
+- **LocalProject** — A connector-local project. Its absolute path exists only in
+  the local `state.db`; the server holds only a path-free `DevboxProject` record
+  with the same ID.
+- **Skill** — A user-provided `SKILL.md` package. The connector manages its content
+  and runtime bindings; the server holds only a path-free inventory.
 
-部署级 `User.role`（`owner / member`）只控制全局用户管理等控制面能力；它与 workspace membership 分离。服务端仍然不运行模型，也不持有 Claude/Copilot/Codex 凭据。
+The deployment-level `User.role` (`owner / member`) governs only global control-plane
+abilities such as user management, and is independent of workspace membership. The
+server still runs no models and holds no Claude/Copilot/Codex credentials.
 
 ---
 
-## 2. 数据模型（SQLite / SQLAlchemy）
+## 2. Data model (SQLite / SQLAlchemy)
 
-核心表（省略部分时间戳和辅助字段）：
+Core tables (timestamps and some helper columns omitted):
 
 ```text
 user(id, username, password_hash, display_name, role, email,
@@ -75,137 +73,177 @@ invitation(id, email, role, token_hash, token_preview, expires_at,
            max_uses, used_count, revoked_at)
 ```
 
-`devbox.skills` 是 connector 上报的 sanitized JSON inventory；`devbox_project`
-不含本机 path。`agent.cwd` 仅保留作 one-cycle legacy migration bridge。
-Connector 本机另有 `local_project` 与 `local_skill` 两张 SQLite table；后者保存
-scope、project ID、digest、family targets 与实际 binding paths，均不属于 Server schema。
+`devbox.skills` is the sanitized JSON inventory the connector reports;
+`devbox_project` never contains a host path. `agent.cwd` is retained only as a
+one-cycle legacy migration bridge. The connector also keeps `local_project` and
+`local_skill` SQLite tables locally; the skill table stores scope, project ID,
+digest, family targets, and the actual binding paths, none of which belong to the
+server schema.
 
-关键约束：
+Key constraints:
 
-- `uq_user_external_identity` 对非空 `(auth_provider, external_tenant_id, external_subject)` 建唯一索引，保证同一 Microsoft 主体只映射一个用户。
-- `membership` 对 `(workspace_id, user_id)` 唯一；最后一个 workspace owner 不可降级或删除。
-- workspace 邀请只持久化 SHA-256 token hash 与短 preview；链接明文只在创建响应出现一次。邀请按标准化邮箱绑定、单次接受、可过期/撤销；重新签发会撤销旧的未领取链接。
-- 接受 workspace 邀请在同一事务内创建 membership 并标记 `accepted_at`；并发双击捕获唯一约束冲突后重查 membership，返回幂等成功。
-- `runtime_capabilities_json` 与 `capability_flags` 对 server 都是 opaque JSON；服务端不解释 runtime/model 字符串。
-- `_migrate()` 补列/补索引；`_backfill_workspaces()` 为旧用户建立 personal workspace，并回填 Devbox/Session 归属与 owner membership。
+- `uq_user_external_identity` is a unique index over non-null
+  `(auth_provider, external_tenant_id, external_subject)`, ensuring one Microsoft
+  principal maps to exactly one user.
+- `membership` is unique per `(workspace_id, user_id)`; the last workspace owner
+  cannot be demoted or removed.
+- Workspace invitations persist only a SHA-256 token hash and a short preview; the
+  plaintext link appears once, in the creation response. Invitations are bound to
+  a normalized email, accepted once, and can expire or be revoked; re-issuing
+  revokes the old, unclaimed link.
+- Accepting a workspace invitation creates the membership and marks `accepted_at`
+  in one transaction; a concurrent double-accept re-reads the membership after a
+  unique-constraint conflict and returns idempotently.
+- `runtime_capabilities_json` and `capability_flags` are opaque JSON to the server,
+  which does not interpret runtime/model strings.
+- `_migrate()` adds missing columns/indexes; `_backfill_workspaces()` creates a
+  personal workspace for legacy users and backfills devbox/session ownership and
+  owner membership.
 
-### Token 规则
+### Token rules
 
-- 明文格式：`hpc_box_<urlsafe>`
-- 只在创建/轮换响应中出现一次
-- SQLite 只保存 `SHA-256(token)` 和短 `preview`
-- connector WebSocket 用 `Authorization: Bearer hpc_box_...`
+- Plaintext format: `hpc_box_<urlsafe>`.
+- Appears once, in the create/rotate response.
+- SQLite stores only `SHA-256(token)` and a short `preview`.
+- The connector WebSocket authenticates with `Authorization: Bearer hpc_box_...`.
 
-### LocalProject
+### LocalProject rules
 
-- `DevboxProject` 归属一个 `Devbox`
-- 唯一键是 `(devbox_id, path)`
-- `is_default=true` 表示该 Devbox 的默认工作目录；同一 Devbox 最多保留一个默认项目
-- `capability_flags` 是 connector 上报的 opaque JSON
-- workspace 成员可读项目；只有 `admin/owner` 可改项目目录或 capability
-- connector 可通过 `project_sync` 消息同步本机项目清单；server 不探测本机文件系统
+- The connector's local `state.db` stores an absolute, unique path for each
+  `LocalProject`; that path never leaves the machine.
+- The connector reports an authoritative path-free list to
+  `POST /api/devboxes/{devbox_id}/projects` using its devbox bearer token.
+- The server stores only `id`, `devbox_id`, `name`, and opaque `runtime_config`.
+  A project ID cannot be claimed by a different devbox.
+- Each agent's optional `local_project_id` must refer to a project on the same
+  devbox. Projects missing from a later authoritative report are removed.
 
 ---
 
-## 3. 连接模型（两种 WebSocket）
+## 3. Connection model (two WebSocket types)
 
-Server 维护一个 **Hub**，管理两类连接：
+The server maintains a single **Hub** that manages two kinds of connections:
 
 ```python
 Conn =
-  | HumanConn   { ws, user_id }                       # 浏览器
+  | HumanConn   { ws, user_id }                       # browser
   | DevboxConn  { ws, devbox_id, agent_ids: set,      # connector
                   outbound: Queue[dict], sender_task, retired }
 ```
 
-### Human 连接（浏览器）
-`GET /ws?session=<cookie>` → 校验登录 → 订阅该用户可见的 session 事件。
+### Human connection (browser)
 
-### Devbox 连接（connector）
-```
+`GET /ws?session=<cookie>` → validate the sign-in → subscribe to session events
+visible to that user.
+
+### Devbox connection (connector)
+
+```text
 connector ──WS upgrade, header: Authorization: Bearer hpc_box_...──▶ server
-server: 校验 token
-        ├─ 无效/吊销 → close(4001)
-        └─ 有效 → 解析 Devbox D
-                   载入 D 的 projects + agents（路径仍只在 connector 本机）
-                   把所有 host 的 agent presence 置为 online
+server: validate token
+        ├─ invalid/revoked → close(4001)
+        └─ valid → resolve Devbox D
+                   load D's projects + agents (paths stay on the connector)
+                   set all of D's agent presence to online
                    touch devbox.last_seen_at
                    conn = DevboxConn(..., outbound=Queue(maxsize=256))
-                   注册路由；同 Devbox 的旧连接 retire + close(4002)
-                   先排 hello，再从 fresh DB snapshot 排权威 projects + agents 目录
+                   register routing; retire an older connection for the same
+                     Devbox with close(4002)
+                   enqueue hello first, then an authoritative projects + agents
+                     directory from a fresh DB snapshot
 ```
-断开时：仅当该连接仍是 Hub 当前映射才清路由并把 agent 置为 offline；被替换旧连接的迟到 `finally` 不会覆盖新连接状态。
 
-所有 server → connector 帧只做非阻塞入队，由每条连接唯一的 sender task 保序写 WebSocket。单帧发送超时（5 秒）、失败或 256 帧队列溢出会 retire 并 close(1011)，所以并发增删 agent 的 HTTP 请求不会卡在慢连接网络 I/O 上。`hello {devbox_id, agent_ids, protocol_version: 3}` 在连接可接收并发目录更新前入队，严格保持首帧语义。
+On disconnect, routing is cleared and agents are marked offline only if the
+connection is still the Hub's current mapping; a late `finally` from a replaced
+connection does not overwrite the newer connection's state.
 
-> **为什么用 header 而不是 `?token=`**：connector 是本地进程，能设置 WS upgrade header，
-> 把密钥挡在 URL / 访问日志之外。浏览器不能设 WS header —— 没关系，人类不用 token。
+Every server → connector frame is enqueued non-blocking and written to the socket
+in order by that connection's single sender task. A per-frame send timeout (5s), a
+send failure, or a 256-frame queue overflow retires the connection with
+close(1011), so concurrent agent add/remove HTTP requests never block on slow
+socket I/O. `hello {devbox_id, agent_ids, protocol_version: 3}` is enqueued before
+the connection can receive input or a directory update, keeping the first-frame
+semantics strict.
+
+> **Why a header instead of `?token=`:** the connector is a local process and can
+> set WS upgrade headers, keeping the secret out of URLs and access logs. Browsers
+> cannot set WS headers — which is fine, because humans do not use a token.
 
 ---
 
-## 4. 认证与写入规则
+## 4. Authentication and write rules
 
-| 请求来源 | 判定 | 允许的作者 |
+| Request source | Resolution | Allowed author |
 |---|---|---|
-| 带 `Authorization: Bearer hpc_box_...` | 校验 → 解析 Devbox D | author 必须是 `devbox_id == D.id` 的 agent（否则 403） |
-| 无 token（浏览器 session） | 视为已登录 Human | author 必须是该 Human 自己（否则 403） |
+| Has `Authorization: Bearer hpc_box_...` | validate → resolve Devbox D | must be an agent with `devbox_id == D.id` (else 403) |
+| No token (browser session) | treated as the signed-in human | must be that human (else 403) |
 
-要点：**无 token 的请求不能以 agent 身份说话**；**一个 token 只能扮演它那台 Devbox
-上的 agent** —— 杜绝跨 Devbox 冒充。
+Key points: **a request without a token cannot speak as an agent**, and **a token
+can only act as an agent on its own devbox** — cross-devbox impersonation is
+impossible.
 
 ---
 
-## 5. 核心架构：Structured-first，PTY fallback
+## 5. Core architecture: structured-first, PTY fallback
 
-### 5.1 两条本地执行路径
+### 5.1 Two local execution paths
 
-支持 structured 的 adapter 使用原生 chat 路径：
+Adapters that support structured output use the native chat path:
 
 ```text
 Browser composer
   -> generic input + options
   -> Server opaque relay
   -> Connector RuntimeAdapter / StructuredAgentSession
-  -> 本地 Claude Code 或 Copilot CLI
+  -> local Claude Code or Copilot CLI
   -> canonical events
   -> Server durable relay
   -> Browser semantic reducer/render
 ```
 
-其他 adapter 保留 terminal fallback：
+Other adapters keep the terminal fallback:
 
 ```text
-Browser xterm <-> Server byte relay/recording <-> Connector PTY <-> 本地 CLI
+Browser xterm <-> Server byte relay/recording <-> Connector PTY <-> local CLI
 ```
 
-模型计算、provider 登录态和模型凭证始终留在用户机器。Server 不启动 CLI，也不解释 runtime ID、
-model、effort 或 attachment；它只做身份/RBAC/keyboard lease、opaque frame 转发、可靠记录和协作广播。
+Model computation, provider login state, and model credentials always stay on the
+user's machine. The server never starts a CLI and never interprets runtime ID,
+model, effort, or attachments; it only does identity/RBAC/keyboard lease, opaque
+frame relay, durable recording, and collaboration broadcast.
 
-### 5.2 RuntimeAdapter 与 capability facts
+### 5.2 RuntimeAdapter and capability facts
 
-Connector 的 registry 是扩展边界。每个 adapter 描述：
+The connector's registry is the extension boundary. Each adapter describes:
 
-- runtime ID/label、probe 与本地 command；
-- PTY 或 structured 模式，以及 persistent/per-turn 进程策略；
-- model、permission 和 CLI argv 映射；
-- generic `select` / `file` controls 的 scope、choices、default 与 bounds；
-- persistent structured runtime 的 per-turn option 到 native live `control_request` 的 adapter-local 映射。
+- runtime ID/label, probe, and local command;
+- PTY or structured mode, plus a persistent/per-turn process policy;
+- model, permission, and CLI argv mappings;
+- the scope, choices, default, and bounds of generic `select` / `file` controls;
+- an adapter-local mapping from per-turn options to a persistent runtime's native
+  live `control_request`.
 
-Probe 后 connector 上报 display-safe capability object。稳定 revision 忽略 probe 时间戳；动态发现的 model
-catalogue 会投影到各 surface 的 model control。live discovery 不可用或没有得到 model ID 时，connector
-保留该 family 的 adapter static catalog，并标记 `models.status=partial`、`models.source=adapter`；有 runtime
-结果时标记 `complete/runtime`。只有可靠的非交互 authentication status probe 才能阻断启动，无法安全探测时
-状态为 `unknown`。Server 将 capability 作为 opaque JSON 保存；浏览器仅根据 `features.structured` 选择 chat
-surface，并从 `features.controls` 生成 model/reasoning/file widgets。model choices 按 control 自带 choices、
-surface `features.models`、family `models.items` 依次回退。UI 始终提供 `Runtime default`，且仅在 model control
-声明 `allow_custom=true` 时提供可编辑 model ID combobox。connector-local executable path 不上报，浏览器也没有
-runtime-ID 特判。
+After probing, the connector reports a display-safe capability object. A stable
+revision ignores probe timestamps; a dynamically discovered model catalog is
+projected into each surface's model control. When live discovery is unavailable or
+returns no model ID, the connector keeps that family's static adapter catalog and
+marks `models.status=partial`, `models.source=adapter`; with a runtime result it
+marks `complete/runtime`. Only a reliable non-interactive authentication-status
+probe can block startup; when a safe probe is impossible the status is `unknown`.
+The server stores the capability as opaque JSON. The browser only chooses the chat
+surface from `features.structured` and generates model/reasoning/file widgets from
+`features.controls`. Model choices fall back in order: per-control choices,
+`features.models`, then family `models.items`. The UI always offers a
+`Runtime default`, and shows an editable model-ID combobox only when a model
+control declares `allow_custom=true`. The connector-local executable path is not
+reported, and the browser has no runtime-ID special cases.
 
-扩展原则仍是：**新增 runtime = 一个 connector adapter；Server 和 Browser 不改。**
+The extension principle stays: **a new runtime is one connector adapter; the
+server and browser do not change.**
 
 ### 5.3 Canonical event contract
 
-Structured adapter 只向上游发送统一事件：
+Structured adapters emit only a unified set of events upstream:
 
 - `status`
 - `session.config`
@@ -216,154 +254,220 @@ Structured adapter 只向上游发送统一事件：
 - `turn.end`
 - `error`
 
-事件只包含 UI 和恢复所需的 display-safe 字段，不包含 raw provider payload、chain-of-thought、token、
-模型凭证或工作站路径。每个逻辑 turn 最多记录一个 `turn.end`；同一 `tool_id` 的流式开始与完整快照在
-reducer 中更新同一张工具卡。connector 会抑制 provider 在 delta 之后重复发送的完整文本快照；browser 也只在
-该 turn 没有 assistant message 时把 `turn.end.result` 渲染为 fallback，因此 result 不会复制已流式展示的回复。
-live frame 与 restore JSONL 使用同一个 reducer。
+Events carry only the display-safe fields the UI and restore need — never raw
+provider payloads, chain-of-thought, tokens, model credentials, or workstation
+paths. Each logical turn records at most one `turn.end`; a streaming start and a
+completed snapshot for the same `tool_id` update the same tool card in the reducer.
+The connector suppresses a provider's full-text snapshot resent after deltas, and
+the browser renders `turn.end.result` only as a fallback when the turn produced no
+assistant message, so the result never duplicates an already-streamed reply. Live
+frames and restore JSONL use the same reducer.
 
 ### 5.4 Frame protocol v3
 
-| 方向 | Frame | 语义 |
+| Direction | Frame | Meaning |
 |---|---|---|
-| Browser -> Server -> Connector | `input {data, options, client_input_id}` | PTY bytes 或 structured turn；options 对 Server opaque |
-| Browser -> Server -> Connector | `resize` / `terminate` | terminal resize 或显式结束本地 session；`terminate` 仅接受持有 keyboard lease 的 operator |
-| Server -> Connector | `open` | 幂等确保本地 PTY/structured process 存在 |
-| Connector -> Server | `output {seq, pty_instance_id, kind, data}` | `kind` 为 `output` 或 `event`；durable commit 后 ACK |
-| Server -> Browser | `restore {kind?, data}` | terminal screen bytes，或 `kind:event` 的 canonical-event JSONL |
-| Server -> Browser | `output {kind, data}` | live terminal bytes 或单个 canonical event |
+| Browser → Server → Connector | `input {data, options, client_input_id}` | PTY bytes or a structured turn; options are opaque to the server |
+| Browser → Server → Connector | `resize` / `terminate` | terminal resize, or explicit end of the local session; `terminate` is accepted only from an operator holding the keyboard lease |
+| Server → Connector | `open` | idempotently ensure the local PTY/structured process exists |
+| Connector → Server | `output {seq, pty_instance_id, kind, data}` | `kind` is `output` or `event`; ACK after a durable commit |
+| Server → Browser | `restore {kind?, data}` | terminal screen bytes, or `kind:event` canonical-event JSONL |
+| Server → Browser | `output {kind, data}` | live terminal bytes or a single canonical event |
 
-Structured options 和附件在 connector 按 adapter descriptor 二次验证；Server 不把 capability blob 变成
-业务 schema。输出可靠性仍由 connector spool、单调 seq、Server ACK、带 `expected_seq` 的 `resend`、旧 instance 的
-`fence` 和 payload hash 冲突 fail-closed 提供。
+Structured options and attachments are re-validated in the connector against the
+adapter descriptor; the server does not turn the capability blob into a business
+schema. Output reliability still comes from the connector's spool, monotonic `seq`,
+the server ACK, a `resend` carrying `expected_seq`, a `fence` for an old instance,
+and fail-closed handling of payload-hash conflicts.
 
-### 5.5 恢复与重连
+### 5.5 Restore and reconnect
 
-- Terminal attach：Server 从 pyte/recording 恢复当前 screen，再接 live bytes。
-- Structured attach：Browser 先由 capability 进入 chat；Server 返回最新的、最多 4 MiB 的完整 durable event JSONL
-  tail，再接 live events。该 tail 是当前有界 replay window 的权威快照：browser 先 reset 再逐行 fold；单个坏行不会破坏
-  后续 timeline。lazy chat mount 以 view epoch 隔离旧视图，并以 single-flight 合并 cold-start event burst。
-- Connector WebSocket 使用 30s open timeout、20s ping、60s pong tolerance、5s close timeout 和
-  16 MiB frame bound；异常断线后外层 loop 继续退避重连及 spool 续传。
-- permission/reasoning 等真正的 session-scoped controls 在 session 已配置或出现首个 chat item 后锁定。`New chat`
-  发送 `terminate`、创建空 persisted session 并重新开放 controls；旧历史不删除。
-- Claude structured model 是 turn-scoped；值变化时 connector 先向同一进程发送字符串 `set_model`
-  `control_request`，收到 success 后才发送下一条 prompt，因此首轮后仍可在显式 model 间切换。该协议不支持
-  清空已设置的 model；恢复 `Runtime default` 需要 `New chat`。
+- Terminal attach: the server restores the current screen from pyte/recording, then
+  streams live bytes.
+- Structured attach: the browser first enters chat from capability; the server
+  returns the latest durable event JSONL tail (up to 4 MiB), then streams live
+  events. That tail is an authoritative snapshot of the current bounded replay
+  window: the browser resets, then folds line by line, and a single bad line does
+  not break the later timeline. Lazy chat mount isolates old views by view epoch
+  and coalesces a cold-start event burst with single-flight.
+- The connector WebSocket uses a 30s open timeout, 20s ping, 60s pong tolerance, 5s
+  close timeout, and a 16 MiB frame bound; after an abnormal disconnect the outer
+  loop keeps backing off, reconnecting, and resuming the spool.
+- Genuine session-scoped controls such as permission and reasoning lock once the
+  session is configured or the first chat item appears. `New chat` sends
+  `terminate`, creates an empty persisted session, and reopens the controls; prior
+  history is not deleted.
+- The Claude structured model is turn-scoped; when the value changes the connector
+  first sends a `set_model` `control_request` to the same process and waits for
+  success before sending the next prompt, so explicit models can still be switched
+  after the first turn. The protocol cannot clear an already-set model; returning
+  to `Runtime default` requires `New chat`.
 
-### 5.6 LocalProject 与用户 Skills
+### 5.6 LocalProjects and user skills
 
-- `deepbox project add <path> --name <name>` 将 canonical absolute path 写入 connector-state `state.db`；Windows
-  默认 root 为 `%LOCALAPPDATA%/deepbox`，macOS/Linux 为 `${XDG_STATE_HOME:-~/.local/state}/deepbox`。Server 的
-  `DevboxProject` 只含 ID、name 与非敏感 `runtime_config`。
-- Add-agent 每次打开会刷新 runtime/project inventory，可选择 `local_project_id`。其 **Add a local project**
-  只生成可复制命令，浏览器与 Server 不浏览或修改本机文件系统。
-- Skill root 必须含 UTF-8 `SKILL.md`；YAML frontmatter 用 `yaml.safe_load` 解析，要求 lower-kebab-case `name`
-  与 string `description`，且目录 basename 等于 `name`。tree 上限 256 个 regular files / 10 MiB；traversal、
-  symlink/junction/reparse、读期间变化均拒绝；脚本只标记 `contains_scripts`，Deepbox 从不执行。
-- scope 为 `personal` 或已注册 LocalProject。`--project` 可按 ID、唯一 case-insensitive name、exact normalized
-  path 解析；无值等价 `--project .`，以 `commonpath` 的最长包含项目为准。
-- adapter family 声明 personal/project skill roots；一个 family target 可对应多个 roots。Claude Code 同时绑定
-  `.claude/skills` 与 `.agents/skills` family roots；Copilot/Codex 使用 `.agents/skills`。重发现 roots 时 merge
-  旧 bindings，不留下 orphan。
-- source-of-truth 为 `<connector-state-root>/skills/store/<digest>/<name>/`。安装先双重验证/hash，再 staged
-  atomic replace 全部 destinations；失败 rollback。`list`/`inspect` 先验证 store，再验证 bindings，返回
-  `installed` / `drifted` / `missing`；install/remove 遇 drift 必须显式 `--force`。最后引用移除后 GC store digest。
-- Connector 只上报 `{id,name,description,digest,scope,project_id,targets,contains_scripts,status}`。Server 不接收
-  任何 path；仍有 skill 引用时，本机与 Server report reconciliation 都拒绝删除项目。
+- `deepbox project add <path> --name <name>` writes a canonical absolute path into
+  the connector-state `state.db`. The default root is `%LOCALAPPDATA%/deepbox` on
+  Windows and `${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The
+  server's `DevboxProject` holds only ID, name, and non-sensitive `runtime_config`.
+- Add-agent refreshes the runtime/project inventory each time it opens, and lets
+  you pick a `local_project_id`. Its "Add a local project" action only generates a
+  copyable command; neither the browser nor the server browses or modifies the host
+  filesystem.
+- A skill root must contain a UTF-8 `SKILL.md`. The YAML frontmatter is parsed with
+  `yaml.safe_load` and requires a lower-kebab-case `name` and a string
+  `description`, with the directory basename equal to `name`. The tree is capped at
+  256 regular files / 10 MiB; traversal, symlink/junction/reparse, and any change
+  during reads are rejected. Scripts are only flagged as `contains_scripts`;
+  deepbox never executes them.
+- A skill's scope is `personal` or a registered LocalProject. `--project` resolves
+  by ID, unique case-insensitive name, or exact normalized path; no value is
+  equivalent to `--project .`, resolving to the longest containing project by
+  `commonpath`.
+- An adapter family declares personal/project skill roots, and one family target
+  can map to several roots. Claude Code binds both `.claude/skills` and
+  `.agents/skills`; Copilot/Codex use `.agents/skills`. Re-discovering roots merges
+  old bindings without leaving orphans.
+- The source of truth is
+  `<connector-state-root>/skills/store/<digest>/<name>/`. Install double-validates
+  and hashes, then atomically replaces every destination from a staging area, with
+  rollback on failure. `list`/`inspect` validate the store and then the bindings,
+  returning `installed` / `drifted` / `missing`; install/remove that hits drift
+  requires an explicit `--force`. After the last reference is removed, the store
+  digest is garbage-collected.
+- The connector reports only
+  `{id, name, description, digest, scope, project_id, targets, contains_scripts, status}`.
+  The server accepts no path; while a skill is still referenced, both the local and
+  the server-report reconciliation refuse to delete the project.
 
-## 6. REST API（核心）
+---
 
-| Method | Path | Auth | 说明 |
+## 6. REST API (core)
+
+| Method | Path | Auth | Notes |
 |---|---|---|---|
-| `GET` | `/api/auth/config` | 无 | 返回启用的本地/Microsoft 登录方式 |
-| `POST` | `/api/auth/login` | 无 | `local/hybrid` 的密码登录 |
-| `GET` | `/api/auth/microsoft/start` | 无 | 跳转 `/.auth/login/aad` |
-| `GET` | `/api/auth/microsoft/callback` | Easy Auth headers | tenant+subject upsert，签发 Deepbox cookie |
-| `GET` | `/api/auth/microsoft/logout` | 无 | 清 cookie 并跳转 `/.auth/logout` |
-| `GET` | `/api/me` | Cookie | 当前用户资料 |
-| `GET/POST` | `/api/workspaces` | Cookie | 列出 membership / 创建 workspace（创建者为 owner） |
-| `GET/POST` | `/api/workspaces/{id}/members` | Cookie + workspace role | 列出成员 / 添加已有用户 |
-| `PATCH/DELETE` | `/api/workspaces/{id}/members/{user_id}` | Cookie + admin/owner | 改角色 / 删除成员，保护最后 owner |
-| `GET/POST` | `/api/workspaces/{id}/invitations` | Cookie + admin | 列出 / 创建邮箱绑定邀请；admin 不可授予 admin |
-| `DELETE` | `/api/workspaces/{id}/invitations/{invite_id}` | Cookie + admin | 撤销未领取邀请 |
-| `POST` | `/api/workspace-invitations/preview` | 无 | body 中提交 token，返回 workspace/角色/掩码邮箱 |
-| `POST` | `/api/workspace-invitations/accept` | Cookie | 邮箱严格匹配后原子接受，重复提交幂等 |
-| `GET/POST` | `/api/devboxes` | Cookie + workspace role | 聚合用户所有 workspace 的 Devbox / 在 workspace 创建 |
-| `POST` | `/api/devboxes/{id}/tokens` | Cookie + workspace admin | 签发新 connector token |
-| `DELETE` | `/api/devboxes/{id}/tokens/{token_id}` | Cookie + workspace admin | 撤销 connector token |
-| `GET/POST` | `/api/devboxes/{id}/agents` | Cookie + workspace role | 列出 / 创建 Agent |
-| `GET/POST` | `/api/agents/{id}/sessions` | Cookie + workspace role | 列出 / 创建共享会话 |
-| `GET/POST` | `/api/sessions/{id}/messages` | Cookie + participant/role | 列出 / 发送结构化消息 |
-| `GET/POST` | `/api/sessions/{id}/tasks` | Cookie + participant/role | 列出 / 创建结构化任务 |
-| `POST` | `/api/devboxes/{id}/projects` | Connector Token | 替换 path-free LocalProject metadata；处理 one-cycle legacy migration，并拒绝删除仍被 skill 引用的项目 |
-| `POST` | `/api/devboxes/{id}/skills` | Connector Token | 替换 sanitized skill inventory（最多 256 项，不接收 path） |
+| `GET` | `/api/auth/config` | none | Enabled local/Microsoft sign-in methods |
+| `POST` | `/api/auth/login` | none | Password sign-in for `local/hybrid` |
+| `GET` | `/api/auth/microsoft/start` | none | Redirect to `/.auth/login/aad` |
+| `GET` | `/api/auth/microsoft/callback` | Easy Auth headers | tenant+subject upsert, issue Deepbox cookie |
+| `GET` | `/api/auth/microsoft/logout` | none | Clear cookie, redirect to `/.auth/logout` |
+| `GET` | `/api/me/user` | Cookie | Current user profile and accessible workspaces |
+| `GET` | `/api/me` | Bearer devbox token | Devbox identity, protocol version, projects, and agents |
+| `GET/POST` | `/api/workspaces` | Cookie | List memberships / create a workspace (creator is owner) |
+| `GET/POST` | `/api/workspaces/{id}/members` | Cookie + workspace role | List members / add an existing user |
+| `PATCH/DELETE` | `/api/workspaces/{id}/members/{user_id}` | Cookie + admin/owner | Change role / remove member, protecting the last owner |
+| `GET/POST` | `/api/workspaces/{id}/invitations` | Cookie + admin | List / create an email-bound invitation; an admin cannot grant admin |
+| `DELETE` | `/api/workspaces/{id}/invitations/{invite_id}` | Cookie + admin | Revoke an unclaimed invitation |
+| `POST` | `/api/workspace-invitations/preview` | none | Submit a token in the body; returns workspace/role/masked email |
+| `POST` | `/api/workspace-invitations/accept` | Cookie | Atomic accept after strict email match; repeat submits are idempotent |
+| `GET/POST` | `/api/devboxes` | Cookie + workspace role | Aggregate devboxes across the user's workspaces / create one in a workspace |
+| `POST` | `/api/devboxes/{id}/tokens` | Cookie + workspace admin | Issue a new connector token |
+| `DELETE` | `/api/devboxes/{id}/tokens/{token_id}` | Cookie + workspace admin | Revoke a connector token |
+| `POST` | `/api/devboxes/{id}/agents` | Cookie + workspace admin | Create an agent; agent lists are embedded in `GET /api/devboxes` |
+| `GET/POST` | `/api/agents/{id}/sessions` | Cookie + workspace role | List / create a shared session |
+| `GET` | `/api/sessions/{id}/messages` | Cookie + participant/role | List persisted structured messages; sending uses the session WebSocket |
+| `POST` | `/api/devboxes/{id}/projects` | Connector token | Replace path-free LocalProject metadata; handle one-cycle legacy migration and refuse to delete a project still referenced by a skill |
+| `POST` | `/api/devboxes/{id}/skills` | Connector token | Replace the sanitized skill inventory (up to 256 items, no paths) |
 
-Microsoft 登录的信任边界在 Azure App Service Easy Auth：平台先验证 OAuth/OIDC，再注入 `X-MS-CLIENT-PRINCIPAL*`。应用不接收浏览器 Microsoft bearer token，不存 access/refresh token；非 App Service 或未正确启用 Easy Auth 的部署必须保持 `DEEPBOX_AUTH_MODE=local`。生产环境启用 Microsoft 登录时还必须配置 `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS`，应用会对平台 principal 的 tenant claim 再做一层 allowlist 校验；`microsoft` 模式另要求明确的 owner 邮箱 allowlist 与 `DEEPBOX_PUBLIC_URL`。
+The trust boundary for Microsoft sign-in is Azure App Service Easy Auth: the
+platform verifies OAuth/OIDC and then injects `X-MS-CLIENT-PRINCIPAL*` headers. The
+app never receives a browser Microsoft bearer token and never stores
+access/refresh tokens; deployments that are not on App Service, or that have not
+correctly enabled Easy Auth, must keep `DEEPBOX_AUTH_MODE=local`. When Microsoft
+sign-in is enabled in production, `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS` must be
+set, and the app re-checks the platform principal's tenant claim against that
+allowlist; `microsoft` mode also requires an explicit owner-email allowlist and
+`DEEPBOX_PUBLIC_URL`.
 
-workspace 邀请 token 放在 URL fragment `#workspace-invite=...`，不会随首个 HTTP 请求发送；前端仅为跨 OAuth redirect 暂存到 `sessionStorage`，preview 使用 POST body，避免 token 出现在查询字符串和常规访问日志。
+The workspace invitation token lives in the URL fragment
+`#workspace-invite=...`, so it is not sent with the first HTTP request. The
+frontend stashes it in `sessionStorage` only to survive the OAuth redirect, and
+preview uses a POST body, keeping the token out of query strings and ordinary
+access logs.
 
-## 7. connector 包（`connector/`，Python）
+---
 
-用户自启进程。正式使用先安装一次本地 `deepbox` command；日常启动：
+## 7. Connector package (`connector/`, Python)
+
+A user-launched process. In normal use you install the local `deepbox` command
+once, then start it with:
+
 ```text
 DEEPBOX_SERVER_URL=http://localhost:8077 DEEPBOX_TOKEN=hpc_box_... deepbox connect
-# PowerShell 使用对应的 $env:... 赋值
+# On PowerShell, use the corresponding $env:... assignments
 ```
 
-`deepbox` 的稳定 shim 位于 `~/.deepbox/bin`，从调用者当前目录启动
-`connector.cli`。只有 `deepbox upgrade` 会重新运行 installer 并刷新
-`~/.deepbox/app`；`deepbox connect` 不执行安装逻辑。源码开发仍可直接运行
-`python -m connector`。
+The stable `deepbox` shim lives in `~/.deepbox/bin` and launches `connector.cli`
+from the caller's current directory. Only `deepbox upgrade` re-runs the installer
+and refreshes `~/.deepbox/app`; `deepbox connect` runs no install logic. During
+source development you can still run `python -m connector`.
 
-启动流程：
-1. `GET /api/me` 获取权威 agent 与 path-free project 目录，并拒绝 protocol version mismatch。
-2. 从本机 `state.db` 上报 projects 与 sanitized skills；registry probe runtime family，生成 display-safe
-   capability object 并 `POST /runtimes`。
-3. 启动 inventory watcher；外部 CLI 修改 project/skill 后自动重报 metadata。
-4. 建立带 Bearer token 的 WS，收 `hello`/权威目录。
-5. `open` 时按 adapter 创建 `StructuredAgentSession` 或 `PtySession`；只有 connector 将 `local_project_id`
-   解析为 launch `cwd`。
-6. Structured input 进入 `write_turn(data, options)`；PTY input 写 stdin。两种 output 都先进入本地
-   durable spool，再等 Server commit ACK；断线后精确补发。
-7. 两个 WS entry point 共用 30s open、20s ping、60s pong、5s close 与 16 MiB frame 策略。
+Startup flow:
 
----
-
-## 8. web 客户端（`web/`）
-
-单页 switchboard 提供 Fleet、session/协作、native chat 与 terminal fallback：
-
-- capability 报 `features.structured` 时，在第一帧前进入 chat；canonical event 驱动 reducer/render；
-- generic `select`/`file` descriptors 生成 model、reasoning 和附件 widgets；session lock 后用 `New chat` 重开；
-- Add-agent 刷新 runtime/project inventory，选择 LocalProject，并只生成 copyable `deepbox project add ...`；
-- Skills modal 只展示 path-free inventory 与 connector-local CLI 命令；
-- tab re-attach fold durable event JSONL，再继续 live event；
-- 非 structured runtime 继续由 xterm.js 渲染原始 PTY bytes。
+1. `GET /api/me` fetches the authoritative agent and path-free project directory,
+   and rejects a protocol version mismatch.
+2. Report projects and sanitized skills from the local `state.db`; the registry
+   probes runtime families, builds a display-safe capability object, and
+   `POST`s `/runtimes`.
+3. Start the inventory watcher; when an external CLI changes a project/skill, the
+   connector re-reports the metadata automatically.
+4. Open the WebSocket with the Bearer token and receive `hello` plus the
+   authoritative directory.
+5. On `open`, create a `StructuredAgentSession` or `PtySession` per adapter; only
+   the connector resolves `local_project_id` into a launch `cwd`.
+6. Structured input goes through `write_turn(data, options)`; PTY input writes
+   stdin. Both output kinds enter the local durable spool first, then wait for the
+   server's commit ACK, and resume exactly after a disconnect.
+7. Both WS entry points share the 30s open, 20s ping, 60s pong, 5s close, and
+   16 MiB frame policy.
 
 ---
 
-## 9. Roadmap
+## 8. Web client (`web/`)
 
-- **已完成骨架与可靠性**：本地账号生命周期、Microsoft Easy Auth 身份映射、邮箱绑定 workspace 邀请、
-  Workspace → Devbox → Agent 导航、connector hot registration、Protocol v3 durable spool/ACK/resend/fence、
-  DVR/retention、workspace RBAC/keyboard lease 与 Azure 部署。
-- **当前主线**：headless structured adapters + 自有聊天 UI；capability-driven controls、LocalProject 与
-  connector-managed user skills 已落地，继续补齐附件、真实多机验证和 connector transport 稳定性。PTY/xterm 只做兼容 fallback。
-- **下一阶段**：真实多机 E2E、更多 adapter、可审计的 runtime permission、长任务/通知与生产容量治理。
+The single-page switchboard provides Fleet, sessions/collaboration, native chat,
+and the terminal fallback:
+
+- when a capability reports `features.structured`, it enters chat before the first
+  frame, and canonical events drive the reducer/render;
+- generic `select`/`file` descriptors generate model, reasoning, and attachment
+  widgets; once a session locks, `New chat` reopens them;
+- Add-agent refreshes the runtime/project inventory, picks a LocalProject, and only
+  generates a copyable `deepbox project add ...` command;
+- the Skills modal shows only the path-free inventory and connector-local CLI
+  commands;
+- re-attaching a tab folds durable event JSONL, then continues with live events;
+- non-structured runtimes continue to render raw PTY bytes with xterm.js.
 
 ---
 
-## 10. 一图记住 —— 核心回路
+## 9. Status and roadmap
+
+- **Landed foundation and reliability:** local account lifecycle, Microsoft Easy
+  Auth identity mapping, email-bound workspace invitations, Workspace → Devbox →
+  Agent navigation, connector hot registration, Protocol v3 durable
+  spool/ACK/resend/fence, DVR/retention, workspace RBAC and keyboard lease, and
+  Azure deployment.
+- **Current line:** headless structured adapters plus the native chat UI.
+  Capability-driven controls, LocalProjects, and connector-managed user skills are
+  in place; work continues on attachments, real multi-machine validation, and
+  connector transport stability. PTY/xterm is a compatibility fallback only.
+- **Next:** real multi-machine end-to-end tests, more adapters, auditable runtime
+  permissions, long-running tasks/notifications, and production capacity controls.
+
+---
+
+## 10. The core loop
 
 ```text
 Human input/options
-  -> Server（身份、协作、opaque relay）
-  -> Connector（adapter validation + local model CLI）
-  -> terminal bytes 或 canonical event
+  -> Server (identity, collaboration, opaque relay)
+  -> Connector (adapter validation + local model CLI)
+  -> terminal bytes or canonical event
   -> Connector spool
   -> Server durable commit + ACK + broadcast
-  -> xterm fallback 或 native chat
+  -> xterm fallback or native chat
 ```
 
-Server 永不运行模型、读取模型 key、接收 LocalProject/Skill path、执行 Skill 文件，或解析 capability 中的 model/reasoning 业务含义。
+The server never runs a model, reads a model key, receives a LocalProject/Skill
+path, executes a skill file, or interprets the model/reasoning business meaning
+inside a capability.

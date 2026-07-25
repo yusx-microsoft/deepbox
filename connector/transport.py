@@ -1,7 +1,9 @@
-"""WebSocket transport half of the connector.
+"""WebSocket transport half of the split connector.
 
-The transport never owns a PTY. Protocol v3 output remains in the supervisor's
-spool until the server confirms that the exact output identity is durable.
+The transport never owns a local agent session. Protocol v3 output remains in the
+supervisor's durable spool until the server acknowledges the exact
+``(session_id, pty_instance_id, seq)``. The transport may restart or reconnect
+without restarting local agent processes or dropping output.
 """
 from __future__ import annotations
 
@@ -36,9 +38,9 @@ def ws_url(server_url: str) -> str:
 
 
 class TransportSession:
-    """Bridge one WebSocket to a supervisor without owning its PTYs.
+    """Bridge one WebSocket to a supervisor without owning its sessions.
 
-    Cut 9: sending and durable-ACK handling are decoupled so many output
+    Sending and durable-ACK handling are decoupled so many output
     frames can be in flight to the server at once. ``_channel_to_ws`` sends
     every frame immediately and, for durable output, records its identity in
     the ordered ``_outstanding`` map without blocking. A separate
@@ -127,7 +129,7 @@ class TransportSession:
                 # _process_server_events) is what releases this spool row.
                 continue
             # Controls have no server durability ACK; their local send boundary
-            # retains the Cut 4 behavior — ack immediately after the WS send.
+            # keeps the local-send behavior: acknowledge after the WebSocket send.
             await ws.send(json.dumps(frame))
             await asyncio.shield(self.channel.send({
                 "type": "ipc_delivery_ack",

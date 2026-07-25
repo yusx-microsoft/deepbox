@@ -81,7 +81,7 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
         await self._stop(tasks)
 
     async def test_pipelines_many_frames_before_first_ack(self):
-        # Core Cut 9 property: several output frames leave the transport before
+        # Several output frames leave the transport before
         # any ACK returns, instead of one-frame-per-RTT stop-and-wait.
         supervisor, transport, ws, tasks = await self._start()
         for seq in range(1, 6):

@@ -1,13 +1,10 @@
-/* Deepbox structured chat surface (Cut 10).
+/* DeepBox structured chat surface.
  *
- * Renders the agent-agnostic *canonical event* stream (see
- * connector/agent_session.py) as a chat UI — assistant bubbles with streaming
- * text, tool cards, and a permission prompt — instead of a terminal. Loaded
- * lazily by app.js and used only for agents whose runtime is `structured`.
+ * Renders canonical structured events emitted by headless runtime adapters.
+ * Loaded lazily by app.js so the terminal fallback stays independent.
  *
- * Design: a pure reducer `applyEvent(state, ev)` folds one canonical event into
- * an immutable-ish view model (so it is unit-testable under node --test with no
- * DOM), plus a thin DOM renderer `renderChat(container, state, handlers)`.
+ * `applyEvent(state, ev)` returns a new view model for each canonical event,
+ * so reducer tests do not need a DOM. `renderChat(...)` is the DOM layer.
  */
 (function (global) {
   'use strict';

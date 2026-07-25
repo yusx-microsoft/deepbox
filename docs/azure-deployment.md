@@ -123,9 +123,8 @@ Linux-clean and do not include the Windows-only `pywinpty` (that lives in
 
 ## Security notes
 
-- Registration is disabled by default in production; the route returns HTTP 403.
-- There is **no** auto-seeded `demo/demo` account. `provision_demo.py` is a
-  dev-only helper that calls the public register API; with production's default
-  registration setting, that call is rejected with HTTP 403.
-- Reassess exposing the app publicly vs. keeping it behind Tailscale/Front
-  Door with auth — see risks in the task summary.
+- There is no auto-seeded account. Registration is disabled by default in
+  production, and the registration route returns HTTP 403.
+- Reassess exposing the app publicly versus keeping it behind Tailscale or
+  Front Door with authentication. For a private multi-machine setup, see
+  [remote-deployment.md](remote-deployment.md).

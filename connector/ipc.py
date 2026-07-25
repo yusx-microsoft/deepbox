@@ -1,26 +1,15 @@
-r"""Local IPC abstraction between the session supervisor (sessiond) and the
-WebSocket transport.
+r"""Local IPC between the session supervisor and WebSocket transport.
 
-Cut 4 goal: give the supervisor and transport a seam they can talk across so
-that they can run either in one process or as two separate OS processes. Two
-concrete channels implement the shared Channel contract: LoopbackChannel for
-the single-process default (in-memory queues), and StreamChannel over a real
-OS transport for the two-process split.
+The shared ``Channel`` interface has two implementations:
 
-The two-process transport is implemented; real ConPTY + Windows-service
-validation remains user-gated (see the acceptance gate in
-docs/implementation.md):
+- ``LoopbackChannel`` uses in-memory queues for single-process mode.
+- ``StreamChannel`` uses a Windows named pipe or POSIX Unix socket for split
+  supervisor and transport processes.
 
-- Windows: a named pipe at ``\\.\pipe\deepbox-sessiond-<user>``. The
-  supervisor is the pipe server; each transport instance is a client.
-- POSIX: a Unix domain socket at ``$XDG_RUNTIME_DIR/deepbox/sessiond-<user>.sock``
-  (or ``~/.deepbox/deepbox/sessiond-<user>.sock``) created with 0600 so only the
-  owning user can connect.
-
-Both transports share the same wire contract (encode_frame / decode_frame,
-bounded by MAX_FRAME, never pickle) and a local current-user auth handshake
-keyed on a 0600 per-user secret file. The supervisor and transport depend only
-on the Channel interface.
+Windows uses ``\\.\pipe\deepbox-sessiond-<user>``. POSIX uses
+``$XDG_RUNTIME_DIR/deepbox/sessiond-<user>.sock`` or the
+``~/.deepbox/deepbox`` fallback. Frames are bounded by ``MAX_FRAME`` and never
+use pickle. Connections authenticate with a per-user secret file.
 """
 from __future__ import annotations
 
@@ -40,7 +29,7 @@ IS_WIN = sys.platform == "win32"
 
 # Maximum size (in bytes) of a single encoded frame, including the trailing
 # newline. Frames are never pickled; only length-bounded JSON crosses the wire.
-# 1 MiB comfortably fits PTY output chunks while bounding memory per read.
+# 1 MiB fits agent output chunks while bounding memory per read.
 MAX_FRAME = 1 << 20
 
 # Protocol tag for the local IPC auth handshake.

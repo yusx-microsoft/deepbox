@@ -28,7 +28,7 @@ from . import models
 from .models import (
     User, Devbox, DevboxProject, Token, Agent, Session, Message, BootstrapState,
     Invitation, Organization, Workspace, Membership, WorkspaceInvitation,
-    SessionParticipant, KeyboardLease,
+    SessionParticipant,
     PROTOCOL_VERSION, ROLE_OWNER, ROLE_MEMBER, now,
     WS_ROLE_OWNER, WS_ROLE_ADMIN, WS_ROLE_OPERATOR, WS_ROLE_VIEWER,
     VALID_WS_ROLES,
@@ -47,7 +47,7 @@ from .collaboration import (
     LeaseConflict, LeaseError, PermissionDenied, acquire_keyboard_lease, can_control,
     get_keyboard_lease, get_role, handoff_keyboard_lease, lease_is_expired,
     list_user_workspaces, release_keyboard_lease, renew_keyboard_lease,
-    require_workspace_access, role_at_least,
+    require_workspace_access,
 )
 from .security import (
     SAFE_METHODS, RateLimiter, RateLimitRule, build_security_headers,
@@ -1486,7 +1486,7 @@ async def session_recording(session_id: str, request: Request, s: OrmSession = D
 @app.get("/api/sessions/{session_id}/replay")
 async def session_replay(session_id: str, request: Request,
                          s: OrmSession = Depends(db)):
-    """Owner-scoped structured replay payload for the Cut 6 replay UI.
+    """Owner-scoped structured replay payload for the browser replay UI.
 
     Returns the asciicast header, the ordered durable event list (redacted
     frames are omitted so redacted payload can never leak), and persisted

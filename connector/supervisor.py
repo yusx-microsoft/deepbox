@@ -1,23 +1,20 @@
-"""Session supervisor (``sessiond``): owns PTY/session lifecycle.
+"""Local agent-session supervisor (``sessiond``).
 
-Cut 4 separates *session ownership* from *WebSocket transport*. This module is
-the ownership half: it starts, feeds, resizes and kills PTYs and buffers their
-output. It has **no knowledge of WebSockets or the server**. A transport (see
-:mod:`connector.transport`) attaches over an IPC :class:`~connector.ipc.Channel`
-and relays frames to/from the server.
+The connector can run in one process or split into ``sessiond`` and a transport.
+The supervisor starts, feeds, resizes, and stops terminal or structured sessions.
+It buffers output while no transport is attached.
 
-Key invariant (the whole point of the split):
-    Detaching or restarting the transport MUST NOT kill any PTY. PTYs live and
-    keep producing output into a durable spool; the next transport to attach
-    drains that spool in order.
+Key invariant
+-------------
+    Detaching or restarting the transport MUST NOT stop a local session. Sessions
+    continue buffering until a server ``close`` command arrives or sessiond exits.
 
-Cut 5 makes PTY output durable: each output frame is appended and fsynced to a
-per-user disk spool *before* it is eligible to send, carries a per-PTY sequence
-number, and is removed only after the server's exact durable ACK is persisted.
-Restarting the supervisor replays un-acked output. Ephemeral control frames use
-an in-memory queue and are never written to the durable spool. Unit constructors
-may inject an :class:`~connector.spool.InMemorySpool`; the real CLI runtime
-injects a durable :class:`~connector.spool.DiskSpool`.
+Each transport attachment receives a monotonically increasing generation. Output
+is bound to the generation captured at enqueue time, so frames from an old
+transport cannot leak into a newer attachment. Session output is appended and
+fsynced to a per-user disk spool before it is eligible to send. Each frame carries
+a per-process sequence number and stable process UUID and is deleted only after an
+explicit transport acknowledgement.
 """
 from __future__ import annotations
 
@@ -33,7 +30,7 @@ from .local_store import LocalProjectStore
 from . import runtimes
 from .spool import InMemorySpool, SpoolBase
 
-# Cut 9 pipelining bounds: how many durable output frames (and their bytes) may
+# Pipelining bounds: how many durable output frames (and their bytes) may
 # be in flight to the transport before earlier ACKs return. The disk spool is
 # still the durability source of truth; this only bounds send-ahead so a slow or
 # disconnected server cannot create unbounded WebSocket / memory pressure.
@@ -70,7 +67,7 @@ class _PendingView:
 
 
 class SessionSupervisor:
-    """Owns every PtySession for this devbox, independent of any transport."""
+    """Owns every local agent session, independent of any transport."""
 
     def __init__(self, agents: dict[str, dict] | None = None,
                  spool: SpoolBase | None = None,
@@ -79,11 +76,11 @@ class SessionSupervisor:
         self.agents: dict[str, dict] = {}
         self._project_migrations: dict[str, dict] = {}
         self.replace_agents(agents or {})
-        # key = (agent_id, session_id) -> PtySession and stable process identity.
-        self.ptys: dict[tuple[str, str], PtySession] = {}
+        # ``ptys`` is retained as a compatibility name for terminal and structured sessions.
+        self.ptys: dict[tuple[str, str], PtySession | StructuredAgentSession] = {}
         self.pty_instances: dict[tuple[str, str], str] = {}
         self.pty_surfaces: dict[tuple[str, str], str] = {}
-        # Durable, sequence-numbered store of un-acked PTY output. Unit tests
+        # Durable, sequence-numbered store of unacknowledged session output. Tests
         # may inject an InMemorySpool; the CLI injects a DiskSpool.
         self._spool: SpoolBase = spool if spool is not None else InMemorySpool()
         # Control frames are deliberately ephemeral: stale ready/presence/exit
@@ -95,7 +92,7 @@ class SessionSupervisor:
         # A frame remains queued until the transport confirms WebSocket send.
         # The IPC delivery_id carried to the transport IS the durable seq, so an
         # ACK maps exactly back to the persisted record.
-        # Cut 9: bounded pipelining. Multiple durable frames may be in flight
+        # Bounded pipelining allows multiple durable frames to be in flight
         # to the transport at once instead of one-frame-per-RTT stop-and-wait.
         # ``_inflight_ids`` maps every delivery_id currently handed to the
         # transport but not yet acknowledged (control:N ids and spool ``ord``
@@ -143,7 +140,7 @@ class SessionSupervisor:
     # -- transport attach/detach ------------------------------------------
 
     def attach(self, channel: Channel) -> None:
-        """Bind a transport channel. Existing PTYs are untouched.
+        """Bind a transport channel. Existing sessions are untouched.
 
         Any frames buffered while detached are re-signalled so the transport's
         drain loop resends them in order.
@@ -157,7 +154,7 @@ class SessionSupervisor:
             self.pending_event.set()
 
     def detach(self) -> None:
-        """Unbind the transport. PTYs keep running and buffering output."""
+        """Unbind the transport. Sessions keep running and buffering output."""
         self._channel = None
 
     @property
@@ -169,7 +166,7 @@ class SessionSupervisor:
     def emit(self, frame: dict) -> None:
         """Queue an outbound frame without blocking on WebSocket I/O.
 
-        PTY output is committed to the durable spool first. Control frames are
+        Session output is committed to the durable spool first. Control frames are
         kept only in memory because replaying stale lifecycle state after a
         supervisor restart would be incorrect.
         """
@@ -184,7 +181,7 @@ class SessionSupervisor:
     async def drain_to(self, channel: Channel) -> None:
         """Forward buffered frames to ``channel`` with bounded pipelining.
 
-        Cut 9: instead of one-frame-per-RTT stop-and-wait, up to
+        Instead of one-frame-per-RTT stop-and-wait, up to
         ``MAX_INFLIGHT_FRAMES`` / ``MAX_INFLIGHT_BYTES`` durable frames may be in
         flight to the transport before their ACKs return. Durable outputs carry
         their spool row ``ord`` as ``delivery_id``; ephemeral controls carry a
@@ -449,8 +446,8 @@ class SessionSupervisor:
                        "structured": confirmed == "structured"})
             return
         if existing:
-            # A child can be killed outside the supervisor while the platform PTY
-            # reader is still blocked. Do not advertise that stale handle as ready.
+            # A child can stop outside the supervisor while its reader is blocked.
+            # Do not advertise that stale handle as ready.
             self.ptys.pop(key, None)
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
@@ -541,7 +538,7 @@ class SessionSupervisor:
             self.emit(frame)
 
         async def on_exit(code: int):
-            # A stale reader may finish after open_pty has replaced its dead PTY.
+            # A stale reader may finish after open_pty has replaced its dead session.
             # Only the currently registered instance may close the server session.
             if self.ptys.get(key) is not p:
                 return
@@ -630,7 +627,7 @@ class SessionSupervisor:
         }
 
     def shutdown(self) -> None:
-        """Kill all PTYs. Only used on real supervisor exit, never on detach."""
+        """Stop all sessions on supervisor exit. Never called on detach."""
         for p in list(self.ptys.values()):
             p.kill()
         self.ptys.clear()

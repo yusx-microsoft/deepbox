@@ -19,7 +19,7 @@ from . import runtimes
 IS_WIN = sys.platform == "win32"
 
 # Backward-compatible view of the historical launch table, now derived from the
-# runtime adapter registry (Cut 7). Kept so existing callers/tests that read
+# runtime adapter registry. Kept so existing callers/tests that read
 # ``DEFAULT_CMDS`` keep working; the registry is the source of truth.
 DEFAULT_CMDS = {a.id: list(a.base_argv) for a in runtimes.all_adapters()}
 

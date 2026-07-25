@@ -1,71 +1,77 @@
-# 三机远程部署：Tailscale 私有网络
+# Three-machine remote deployment over a Tailscale private network
 
-> 目标拓扑：电脑 A 用浏览器访问；电脑 B 托管 deepbox Server；电脑 C 运行 connector 和真实
-> Agent。三台电脑不在同一局域网，但加入同一个 Tailscale Tailnet。
+> Target topology: computer A opens the browser; computer B hosts the deepbox
+> server; computer C runs the connector and the real agents. The three
+> computers are not on the same LAN but join the same Tailscale tailnet.
 >
-> 本方案面向当前 Private Alpha。**使用 Tailscale Serve，不使用 Tailscale Funnel，也不把
-> Uvicorn 端口直接暴露到公网。**
+> This guide targets the current private alpha. **Use Tailscale Serve, not
+> Tailscale Funnel, and never expose the Uvicorn port directly to the public
+> internet.**
 
 ---
 
-## 1. 拓扑与信任边界
+## 1. Topology and trust boundary
 
 ```text
-电脑 A — Viewer
+Computer A — Viewer
   Browser
      │ HTTPS / WSS
      ▼
-Tailscale WireGuard 私有网络
+Tailscale WireGuard private network
      │
      ▼
-电脑 B — Server Host
-  Tailscale Serve（TLS 终止）
+Computer B — Server host
+  Tailscale Serve (TLS termination)
      │ http://127.0.0.1:8077
      ▼
-  deepbox Server
-  ├── SQLite 元数据
-  └── Session DVR
+  deepbox server
+  ├── SQLite metadata
+  └── session DVR
      ▲
-     │ HTTPS / WSS（同一 Tailnet）
+     │ HTTPS / WSS (same tailnet)
      │
-电脑 C — Agent Devbox
+Computer C — Agent devbox
   deepbox connector
      │ PTY
      ▼
   Claude Code / Codex / Copilot
 ```
 
-安全边界：
+Security boundary:
 
-- Agent CLI、API key、登录态、代码目录只在电脑 C。
-- Server 只收到终端事件流和非机密配置。
-- Tailscale 提供设备间 WireGuard 加密和私有 DNS。
-- deepbox 登录和 Devbox token 仍是应用层认证。
-- 电脑 B 的 Uvicorn 只监听 `127.0.0.1`，局域网和公网都不能直接访问 8077。
-
----
-
-## 2. 前置条件
-
-三台电脑均完成：
-
-1. 安装 Tailscale：https://tailscale.com/download/windows
-2. 登录同一个 Tailnet。
-3. 在 Windows 命令提示符验证：
-
-```bat
-tailscale status
-```
-
-电脑之间应出现在设备列表中。建议在 Tailscale 管理后台启用 MagicDNS。
-
-> 不要运行 `tailscale funnel`。Funnel 会把服务发布到公开互联网，不适合当前安全阶段。
+- The agent CLI, provider API keys, sign-in state, and code directories stay
+  only on computer C.
+- The server receives only the terminal event stream and non-secret config.
+- Tailscale provides device-to-device WireGuard encryption and private DNS.
+- deepbox sign-in and devbox tokens remain the application-layer authentication.
+- Uvicorn on computer B listens only on `127.0.0.1`; neither the LAN nor the
+  public internet can reach port 8077 directly.
 
 ---
 
-## 3. 电脑 B：部署 Server Host
+## 2. Prerequisites
 
-### 3.1 安装代码和依赖
+On all three computers:
+
+1. Install Tailscale: <https://tailscale.com/download/windows>
+2. Sign in to the same tailnet.
+3. Verify from a Windows command prompt:
+
+   ```bat
+   tailscale status
+   ```
+
+The computers should appear in each other's device list. Enabling MagicDNS in
+the Tailscale admin console is recommended.
+
+> Do not run `tailscale funnel`. Funnel publishes the service to the public
+> internet, which is not appropriate for the current security stage.
+
+---
+
+## 3. Computer B: deploy the server host
+
+### 3.1 Install the code and dependencies
 
 ```bat
 cd /d C:\Code
@@ -75,7 +81,7 @@ py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-如果仓库已经存在：
+If the repository already exists:
 
 ```bat
 cd /d C:\Code\deepbox
@@ -83,30 +89,27 @@ git pull
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-### 3.2 配置 Tailscale Serve
+### 3.2 Configure Tailscale Serve
 
-现代 Tailscale CLI：
+With a current Tailscale CLI:
 
 ```bat
 tailscale serve --bg http://127.0.0.1:8077
 tailscale serve status
 ```
 
-命令会显示一个只在 Tailnet 内可访问的 HTTPS URL，例如：
+The command prints an HTTPS URL that is reachable only inside the tailnet, for
+example:
 
 ```text
 https://server-name.example-tailnet.ts.net
 ```
 
-不同 Tailscale 版本的 Serve CLI 可能略有区别；如命令被拒绝，先运行：
+The Serve CLI differs slightly between Tailscale versions. If the command is
+rejected, run `tailscale serve --help` and use its equivalent "HTTPS proxy to
+`http://127.0.0.1:8077`" form.
 
-```bat
-tailscale serve --help
-```
-
-使用其“HTTPS 代理到 `http://127.0.0.1:8077`”等价形式。
-
-### 3.3 创建 Server 配置
+### 3.3 Create the server configuration
 
 ```bat
 cd /d C:\Code\deepbox
@@ -115,11 +118,11 @@ py -3 -c "import secrets; print(secrets.token_urlsafe(48))"
 notepad .env
 ```
 
-把随机值和 Tailscale HTTPS URL 写入 `.env`：
+Write the random value and the Tailscale HTTPS URL into `.env`:
 
 ```dotenv
 DEEPBOX_ENV=production
-DEEPBOX_SECRET=<刚生成的随机值>
+DEEPBOX_SECRET=<the value you just generated>
 DEEPBOX_DATABASE_URL=sqlite:///C:/deepbox-data/deepbox.db
 DEEPBOX_DATA_DIR=C:/deepbox-data
 DEEPBOX_PUBLIC_URL=https://server-name.example-tailnet.ts.net
@@ -132,81 +135,85 @@ DEEPBOX_PLATFORM=local
 DEEPBOX_REGISTRATION_ENABLED=false
 ```
 
-注意：
+Notes:
 
-- `.env` 已被 gitignore，不能提交。
-- URL 不带末尾 `/`。
-- `DEEPBOX_SECRET` 修改后，已有浏览器登录 cookie 会失效，这是正常行为。
-- SQLite 和 DVR 放在 `C:\deepbox-data`，不要放在 Git 仓库里。
+- `.env` is gitignored and must not be committed.
+- The URL has no trailing `/`.
+- Changing `DEEPBOX_SECRET` invalidates existing browser sign-in cookies. This
+  is expected.
+- Keep SQLite and the DVR under `C:\deepbox-data`, never inside the Git
+  repository.
 
-### 3.4 启动 Server
+### 3.4 Start the server
 
 ```bat
 cd /d C:\Code\deepbox
 scripts\start-server.cmd
 ```
 
-等价命令：
+Equivalent command:
 
 ```bat
 .venv\Scripts\python -m server
 ```
 
-Server 启动时会在 production 模式下强制检查：
+In production mode the server fails closed on startup unless:
 
-- secret 不是开发默认值。
-- allowed origins 非空。
-- secure cookie 已开启。
-- 端口合法。
+- the secret is not a development default,
+- allowed origins are non-empty,
+- secure cookies are enabled, and
+- the port is valid.
 
-### 3.5 验证
+### 3.5 Verify
 
-在电脑 B 或 Tailnet 内任意设备运行：
+From computer B or any device in the tailnet:
 
 ```bat
 curl https://server-name.example-tailnet.ts.net/api/health
 curl https://server-name.example-tailnet.ts.net/api/ready
 ```
 
-预期：
+Expected:
 
 ```json
-{"status":"ok","protocol_version":2}
-{"status":"ready","protocol_version":2}
+{"status":"ok","protocol_version":3}
+{"status":"ready","protocol_version":3}
 ```
 
-`health` 表示进程存活；`ready` 还会检查数据库和 recording 目录。
+`health` confirms the process is alive; `ready` also checks the database and
+the recording directory.
 
 ---
 
-## 4. 电脑 A：浏览器登录
+## 4. Computer A: browser sign-in
 
-电脑 A 只需要 Tailscale 和浏览器，不需要克隆 deepbox。
+Computer A only needs Tailscale and a browser; it does not clone deepbox.
 
-打开：
+Open:
 
 ```text
 https://server-name.example-tailnet.ts.net
 ```
 
-首次使用：
+First use:
 
-1. 注册用户。
-2. 登录。
-3. 创建一台 Devbox（这代表电脑 C）。
-4. 复制完整 `hpc_box_...` token；完整 token 只显示一次。
-5. 在该 Devbox 下创建 Agent：
-   - handle：`claude`
-   - runtime：`claude-code`
-   - cwd：电脑 C 上真实存在的工作目录
+1. Create the first account through the setup panel.
+2. Sign in.
+3. Create a devbox (this represents computer C).
+4. Copy the full `hpc_box_...` token. The complete token is shown only once.
+5. Create an agent under that devbox:
+   - handle: `claude`
+   - runtime: `claude-code`
+   - cwd: a working directory that really exists on computer C
 
-不要在电脑 A 或 B 使用这个 Devbox token 启动 connector；它属于电脑 C。
+Do not use this devbox token to start a connector on computer A or B; it belongs
+to computer C.
 
 ---
 
-## 5. 电脑 C：运行 Agent Devbox
+## 5. Computer C: run the agent devbox
 
-### 5.1 验证本地 Agent
+### 5.1 Verify the local agent
 
 ```bat
 where claude
@@ -214,31 +221,36 @@ claude --version
 claude
 ```
 
-必须先在电脑 C 本地完成 Claude Code 登录。deepbox 不接触 Claude 凭证。
+Complete the Claude Code sign-in locally on computer C first. deepbox never
+touches Claude credentials.
 
-### 5.2 一次安装本地 `deepbox` command
+### 5.2 Install the local `deepbox` command once
 
-在 PowerShell 中运行一次：
+Run once in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
 ```
 
-installer 在当前用户的 `~\.deepbox` 下维护源码、独立 venv 和稳定 command，并把
-`~\.deepbox\bin` 加入用户 PATH。以后连接不再 clone、下载或刷新该目录；只有显式
-`deepbox upgrade` 才会重新运行 installer。
+The installer maintains the connector source, an isolated venv, and a stable
+command under the current user's `~\.deepbox`, and adds `~\.deepbox\bin` to the
+user PATH. It downloads the connector payload from the public `yusx-swapp/deepbox`
+mirror. Later connections never clone, download, or refresh that directory; only
+an explicit `deepbox upgrade` reruns the installer. See
+[install.md](install.md) for details.
 
-### 5.3 验证 Server 可达
+### 5.3 Verify the server is reachable
 
 ```bat
 curl https://server-name.example-tailnet.ts.net/api/health
 ```
 
-必须返回 `status=ok`。如果域名无法解析，先检查 `tailscale status` 和 MagicDNS。
+It must return `status=ok`. If the name does not resolve, check
+`tailscale status` and MagicDNS first.
 
-### 5.4 运行连接诊断
+### 5.4 Run connection diagnostics
 
-先设置从 UI 复制的 token，并运行 doctor：
+Set the token copied from the UI and run doctor:
 
 ```powershell
 $env:DEEPBOX_SERVER_URL = 'https://server-name.example-tailnet.ts.net'
@@ -246,93 +258,115 @@ $env:DEEPBOX_TOKEN = 'hpc_box_...'
 deepbox doctor
 ```
 
-它依次检查 URL/TLS、`/api/health`、protocol version 和 token authentication；不会打印 token。
-全部显示 `[OK]` 后再启动 connector。
+It checks URL/TLS, `/api/health`, protocol version, and token authentication in
+turn, and never prints the token. Start the connector only after every check
+reports `[OK]`.
 
-### 5.5 启动 connector
+### 5.5 Start the connector
 
-保持同一组环境变量，运行：
+Keeping the same environment variables, run:
 
 ```powershell
 deepbox connect
 ```
 
-这个命令从当前工作目录启动已安装的 connector，不会调用 installer 或刷新
-`~\.deepbox\app`。
+This starts the already-installed connector from the current working directory.
+It never invokes the installer or refreshes `~\.deepbox\app`.
 
-connector 会：
+The connector:
 
-1. 通过 HTTPS `GET /api/me` 验证 token。
-2. 检查 Server protocol version。
-3. 探测本机 runtime。
-4. 通过 WSS 建立 `/ws/devbox`。
-5. 上报存活 Session。
-6. 收到用户 New/Resume 后在本机启动或恢复 PTY。
+1. Verifies the token over HTTPS `GET /api/me`.
+2. Checks the server protocol version.
+3. Probes local runtimes.
+4. Establishes `/ws/devbox` over WSS.
+5. Reports live sessions.
+6. Starts or resumes a PTY locally when the user chooses New/Resume.
 
-Token 只通过 `Authorization: Bearer` header 发送；Server 不接受 WS query-string token，避免 token
-进入 URL、代理日志和浏览器历史。
+The token is sent only through the `Authorization: Bearer` header. The server
+does not accept a WS query-string token, keeping tokens out of URLs, proxy logs,
+and browser history.
 
-### 5.6 可选：supervisor / transport 双进程
+### 5.6 Optional: split supervisor / transport processes
 
-默认命令仍是兼容的 all-in-one 模式。若要让网络 transport 独立重启而本地 PTY 继续存活，请在两个终端中使用
-相同的 `DEEPBOX_SERVER_URL` 和 `DEEPBOX_TOKEN` 环境变量。先启动长期驻留的 session supervisor：
+The default command runs the compatible all-in-one mode. To let the network
+transport restart independently while the local PTYs keep running, use the same
+`DEEPBOX_SERVER_URL` and `DEEPBOX_TOKEN` in two terminals. Start the long-lived
+session supervisor first:
 
 ```powershell
 deepbox connect --mode supervisor
 ```
 
-再启动可重启的网络 transport：
+Then start the restartable network transport:
 
 ```powershell
 deepbox connect --mode transport
 ```
 
-两者通过当前用户专属的 Windows named pipe（POSIX 上为 `0600` Unix socket）通信，并使用当前用户本地密钥做
-带 5 秒超时的双向 HMAC 握手；帧是最大 1 MiB 的换行 JSON，不使用 pickle。同一时刻只接受一个 transport。停止或重启
-transport 不会关闭 supervisor 持有的 PTY；停止 supervisor 才会关闭这些 PTY。P2 Cut 5 起 pending 输出由持久磁盘
-spool（`connector/spool.py`）使用 SQLite WAL + `synchronous=FULL`：PTY output 先以 `(session_id, pty_instance_id, seq)` 提交本地 outbox，再经 transport 发送。`ws.send()` 成功不会删除记录；只有 Azure server 把同一输出提交到 `recording_frames` 并返回完全匹配的 Protocol v3 ACK 后，supervisor 才连续推进 `ack_state` 并删除队首。persist 后 ACK 前断线会重发并由 server 幂等 re-ACK；gap 返回精确 resend，冲突 fail closed。spool 按 server URL + token hash 确定性命名但不保存 token，目录尽力设置为用户私有。输入通过持久 `client_input_id` receipt 去重，并在 connector 确认 PTY delivery 后回 browser ACK。
+They communicate over a per-user Windows named pipe (a `0600` Unix socket on
+POSIX) and perform a mutual HMAC handshake with a 5-second timeout using a
+user-local key; frames are newline-delimited JSON up to 1 MiB and never use
+pickle. Only one transport is accepted at a time. Stopping or restarting the
+transport does not close the supervisor's PTYs; only stopping the supervisor
+closes them. Pending PTY output is held in a durable on-disk spool
+(`connector/spool.py`) backed by SQLite WAL with `synchronous=FULL`: output is
+committed to a local outbox keyed by `(session_id, pty_instance_id, seq)` before
+the transport sends it. A successful `ws.send()` does not delete the record; the
+supervisor advances `ack_state` and drops the head only after the server commits
+the same output to `recording_frames` and returns an exactly matching protocol
+v3 ACK. A disconnect after persistence but before ACK triggers a resend that the
+server idempotently re-ACKs; a gap yields a precise resend and a conflict fails
+closed. The spool is named deterministically from the server URL plus a token
+hash without storing the token, and its directory is made user-private on a
+best-effort basis. Input is deduplicated through a durable `client_input_id`
+receipt, and the browser ACK is returned only after the connector confirms PTY
+delivery.
 
 ---
 
-## 6. 端到端验收
+## 6. End-to-end acceptance
 
-在电脑 A：
+On computer A:
 
-1. 刷新 deepbox。
-2. 确认电脑 C 对应的 Devbox 是绿色 online。
-3. 确认 `@claude` 是 online。
-4. 打开/新建 Session。
-5. 看到电脑 C 上真实 Claude Code TUI。
-6. 输入一条测试消息并确认回复。
+1. Refresh deepbox.
+2. Confirm the devbox for computer C shows green/online.
+3. Confirm `@claude` is online.
+4. Open or create a session.
+5. See the real Claude Code TUI running on computer C.
+6. Type a test message and confirm the reply.
 
-然后验证平台价值：
+Then verify the platform value:
 
-1. 关闭电脑 A 浏览器标签。
-2. 等待 Claude 在电脑 C 继续运行。
-3. 重新打开页面，Resume 同一 live Session。
-4. 确认屏幕和上下文仍在。
-5. 在电脑 B 重启 Server，但不要停止电脑 C connector。
-6. 确认 connector 自动重连、Session 恢复。
-
----
-
-## 7. Tailscale ACL 建议
-
-默认 Tailnet 内其他成员可能可以访问 Serve URL。deepbox 仍要求登录，但建议增加网络层最小权限：
-
-- 电脑 A 可以访问电脑 B 的 HTTPS 服务。
-- 电脑 C 可以访问电脑 B 的 HTTPS 服务。
-- 其他设备不能访问电脑 B 的 deepbox 服务。
-- 无设备需要直接访问电脑 C 的 Agent 端口；connector 只做出站连接。
-
-具体 ACL/Grants 语法取决于 Tailnet 管理策略，配置前参考当前 Tailscale 文档。不要为了方便使用
-Funnel 替代 ACL。
+1. Close the browser tab on computer A.
+2. Let Claude keep running on computer C.
+3. Reopen the page and resume the same live session.
+4. Confirm the screen and context are still present.
+5. Restart the server on computer B without stopping the connector on
+   computer C.
+6. Confirm the connector reconnects automatically and the session recovers.
 
 ---
 
-## 8. 常见问题
+## 7. Tailscale ACL recommendation
 
-### 浏览器打不开 URL
+By default other tailnet members may be able to reach the Serve URL. deepbox
+still requires sign-in, but add network-layer least privilege:
+
+- Computer A may reach computer B's HTTPS service.
+- Computer C may reach computer B's HTTPS service.
+- Other devices may not reach computer B's deepbox service.
+- No device needs direct access to agent ports on computer C; the connector
+  makes only outbound connections.
+
+The exact ACL/Grants syntax depends on your tailnet policy; consult current
+Tailscale documentation before applying. Do not substitute Funnel for ACLs out
+of convenience.
+
+---
+
+## 8. Troubleshooting
+
+### The browser cannot open the URL
 
 ```bat
 tailscale status
@@ -340,79 +374,89 @@ tailscale serve status
 curl https://<server>/api/health
 ```
 
-检查电脑 B 上 Server 命令窗口是否仍在运行。
+Check that the server command window on computer B is still running.
 
-### `/api/ready` 返回 503
+### `/api/ready` returns 503
 
-检查：
+Check:
 
-- `DEEPBOX_DATABASE_URL` 目录存在/可创建。
-- `DEEPBOX_DATA_DIR` 可写。
-- 运行 Server 的 Windows 用户有目录权限。
+- The `DEEPBOX_DATABASE_URL` directory exists or can be created.
+- `DEEPBOX_DATA_DIR` is writable.
+- The Windows user running the server has directory permissions.
 
-### 浏览器能登录，但 Terminal WS 被拒绝
+### The browser signs in, but the terminal WebSocket is rejected
 
-检查 `.env`：
+Check `.env`:
 
 ```text
 DEEPBOX_PUBLIC_URL
 DEEPBOX_ALLOWED_ORIGINS
 ```
 
-它们必须与浏览器地址栏里的 origin 完全一致（协议、主机和端口）。修改 `.env` 后重启 Server。
+They must match the origin in the browser address bar exactly (scheme, host,
+and port). Restart the server after changing `.env`.
 
-### Connector 报 protocol mismatch
+### The connector reports a protocol mismatch
 
-Server 和电脑 C 的仓库版本不同。两端都执行 `git pull` 并重新安装依赖。
+The server and computer C are on different repository versions. Run `git pull`
+on both ends and reinstall dependencies (rerun the installer or
+`deepbox upgrade` on computer C).
 
-### Connector 401 / 4001
+### The connector returns 401 / 4001
 
-- token 粘贴错误。
-- token 已吊销。
-- token 属于另一台 Devbox。
-- 环境变量带了多余引号/空格。
+- The token was pasted incorrectly.
+- The token was revoked.
+- The token belongs to a different devbox.
+- The environment variable carries extra quotes or spaces.
 
-在 UI 为电脑 C 对应 Devbox 轮换新 token；不要复用其他 Devbox token。
+Rotate a new token in the UI for the devbox that represents computer C; do not
+reuse another devbox's token.
 
-### Devbox online，但 Agent 启动失败
+### The devbox is online, but the agent fails to start
 
-在电脑 C 本地检查：
+Check locally on computer C:
 
 ```bat
 where claude
 claude --version
 ```
 
-并确认 Agent 配置里的 `cwd` 在电脑 C 上存在。
+Confirm that the agent's configured `cwd` exists on computer C.
 
-### HTTPS 证书问题
+### HTTPS certificate problems
 
-只能使用 Tailscale Serve 输出的 HTTPS 域名，不要把 `https://` 加到裸 Tailscale IP 上。确保电脑 B
-已在 Tailnet 中启用 HTTPS/Serve。
+Use only the HTTPS domain produced by Tailscale Serve. Do not put `https://` in
+front of a bare Tailscale IP. Make sure computer B has HTTPS/Serve enabled in
+the tailnet.
 
 ---
 
-## 9. 停止与回滚
+## 9. Stop and roll back
 
-停止 Server：在电脑 B 的 Server 窗口按 `Ctrl+C`。
+Stop the server: press `Ctrl+C` in the server window on computer B.
 
-停止 connector：在电脑 C 的 connector 窗口按 `Ctrl+C`。注意当前架构下停止 connector 会终止它
-托管的 PTY Session；Session Supervisor 尚未实现。
+Stop the connector: press `Ctrl+C` in the connector window on computer C. In
+all-in-one mode this also terminates the PTY sessions it hosts. To keep PTYs
+alive across a transport restart, run the split supervisor/transport mode in
+[section 5.6](#56-optional-split-supervisor--transport-processes).
 
-关闭 Tailscale Serve：根据当前 CLI 版本运行：
+Turn off Tailscale Serve, using the form for your current CLI:
 
 ```bat
 tailscale serve reset
 ```
 
-这不会删除 deepbox 数据。
+This does not delete deepbox data.
 
 ---
 
-## 10. 当前限制
+## 10. Current limitations
 
-- Server/connector 尚未安装为 Windows Service，需要保持命令窗口运行。
-- connector 使用内存 FIFO；Server 短暂重启可恢复，但 connector 自身退出会丢 PTY。
-- 当前不是公开互联网部署方案。
-- Tailscale 解决网络加密和设备可达性，不代替 deepbox 应用层认证、权限和 recording 隐私。
-- Session Control Center 与完整 Replay UI 属于后续 Cuts；connector 侧 durable seq/ACK 磁盘 spool 已在 P2 Cut 5 落地。
+- The server and connector are not yet installed as Windows services; a command
+  window must stay open.
+- In all-in-one mode, a connector exit drops its PTYs. Use the split
+  supervisor/transport mode to survive transport restarts.
+- This is not a public-internet deployment configuration.
+- Tailscale addresses network encryption and device reachability; it does not
+  replace deepbox application-layer authentication, permissions, and recording
+  privacy.

@@ -1,15 +1,14 @@
 """Structured agent session: drive a coding agent in headless/streaming mode.
 
-Where :class:`connector.pty_session.PtySession`投屏一个全屏 TUI 的原始终端字节流
-(每次重绘、每个按键回显都被迫走网络往返), a :class:`StructuredAgentSession`
-instead runs the agent in its **headless structured** mode and translates its
-native protocol into a small, agent-agnostic *canonical event* stream. The
-browser then renders a real chat UI (message bubbles, tool cards, a permission
-prompt) instead of a terminal, so:
+Unlike :class:`connector.pty_session.PtySession`, which relays the raw byte
+stream of a full-screen TUI, :class:`StructuredAgentSession` runs an agent in
+headless mode and translates its native protocol into a small, agent-agnostic
+event stream. The browser renders messages, tool cards, and permission prompts
+instead of terminal redraws, so:
 
-  * 用户"打完整段话再发送"——输入不再逐键往返;
-  * agent 的真实反应(文本增量、工具调用、结果)以结构化事件流式到达;
-  * 接入新 agent(Copilot CLI、Codex……)只需再写一个 translator。
+  * users send complete messages instead of round-tripping every keystroke;
+  * text increments, tool calls, and results arrive as structured events; and
+  * a new agent runtime needs only an adapter that translates its protocol.
 
 For Claude Code the headless interface is::
 

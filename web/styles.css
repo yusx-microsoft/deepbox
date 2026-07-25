@@ -122,7 +122,6 @@ a:hover{text-decoration:underline}
 }
 
 .muted{color:var(--fg-muted);font-size:12px}
-.faint{color:var(--fg-faint)}
 .row{display:flex;gap:8px;align-items:center}
 .spacer{flex:1}
 .stack>*{margin-bottom:10px}

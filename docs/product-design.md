@@ -1,551 +1,473 @@
-# deepbox 产品设计
+# deepbox Product Design
 
-> 状态：Draft v2（历史 UI foundation）。2026-07-22 起产品主线为 structured-first native chat，PTY/xterm 仅作 fallback；当前事实见 `design.md` §5 与 `implementation.md` §9。
-> 已落地首个 UI foundation（Terminal-first Switchboard），
-> 见 §7.5。
+> deepbox is a **durable session control plane** for AI coding agents. Users connect the
+> agent CLIs already running on their own devbox — Claude Code, Codex CLI, GitHub Copilot
+> CLI — to the platform, then view, drive, resume, and replay those sessions from any
+> browser.
 >
-> deepbox 是一个面向 AI coding agent 的**持久会话控制平面**。用户把自己 Devbox 上的
-> Claude Code、Codex CLI、GitHub Copilot CLI 等 agent 连接到平台，然后可以从浏览器查看、
-> 操作、恢复和回放这些会话。
+> This document is the durable product specification. For technical architecture see
+> [`design.md`](design.md); for the current code state see [`implementation.md`](implementation.md);
+> for delivery sequencing see [`planning.md`](planning.md).
 
 ---
 
-## 1. 产品定义
+## 1. Positioning
 
-### 1.1 一句话定位
+**One-line positioning.** Keep the AI coding agent running on your own devbox alive and
+reachable from any device — the session does not disappear when a browser closes or the
+server restarts.
 
-> 在任何设备上，安全地继续运行在自己 Devbox 上的 AI coding agent，会话不会因为浏览器
-> 关闭或 Server 重启而消失。
+### 1.1 What we provide
 
-### 1.2 我们提供什么
+- A **server** control plane: identity, devbox and agent registry, session lifecycle,
+  presence, routing, recording, and permissions.
+- A **connector** the user runs on their own machine, bridging the local agent CLI and the
+  server.
+- A **web workspace** to browse agents, start and resume sessions, chat with structured
+  runtimes, drive the terminal fallback, and replay history.
 
-- 一个 Server 控制面：身份、Devbox、Agent、Session、presence、路由、录制和权限。
-- 一个用户自启的 connector：连接本地 CLI/PTY 与 Server。
-- 一个 Web 工作台：查看 Agent、恢复 Session、操作真实 TUI、回放历史。
+### 1.2 What we do not provide
 
-### 1.3 我们不提供什么
+- The server never runs models and never holds Claude / OpenAI / GitHub API keys.
+- The server does not install or sign in to agent CLIs on the user's behalf.
+- The server does not read the user's filesystem; only the agent on the user's devbox can
+  reach the working directory.
+- deepbox is not a cloud IDE, code editor, or general SSH replacement.
 
-- Server 不运行模型。
-- Server 不持有 Claude/OpenAI/GitHub API key。
-- Server 不代替用户安装或登录 Agent CLI。
-- Server 不读取本地文件系统；只有用户 Devbox 上的 Agent 能访问其工作目录。
-- 第一阶段不试图做完整 Cloud IDE、代码编辑器或 SSH 替代品。
+### 1.3 Core principle
 
-### 1.4 核心原则
+> **The server is a platform, not an AI product. Intelligence, credentials, and the
+> workspace all stay on the user's devbox.**
 
-> **Server 是平台，不是 AI 产品。智能、凭证和工作区全部留在用户 Devbox 上。**
+### 1.4 Why not a plain web terminal
 
----
+Remote terminals are a solved commodity. deepbox's value is not "show a shell in a browser."
 
-## 2. 为什么不是普通 Web Terminal
-
-远程终端本身是成熟能力。deepbox 的价值不能停留在“浏览器里显示一个 shell”。
-
-| 普通远程终端 | deepbox |
+| Plain web terminal | deepbox |
 |---|---|
-| 管理连接 | 管理 Agent Session 生命周期 |
-| 关闭窗口后依赖 shell/tmux | Session 默认独立于 Viewer 存活 |
-| 不理解 Agent 的存在 | 显式管理 Runtime、Agent、状态和能力 |
-| scrollback 通常是本地临时状态 | Server 保存屏幕状态与 DVR |
-| 单用户终端 | 可扩展到多 Viewer、控制权和审计 |
-| 无任务语义 | 后续提供 waiting/completed/approval/job 语义 |
+| Manages a connection | Manages an agent session lifecycle |
+| Depends on local shell/tmux after the window closes | Sessions live independently of any viewer |
+| Unaware that an agent exists | Explicit runtime, agent, state, and capability model |
+| Scrollback is local, ephemeral | Server persists screen state and a durable recording |
+| Single-user terminal | Multiple viewers, control leases, and audit |
+| No task semantics | Structured runtimes emit canonical agent events |
 
-因此底层是 PTY，但产品核心对象是 **Session**。
-
----
-
-## 3. 目标用户
-
-### 3.1 首要用户
-
-- 同时使用多台开发机、工作站或集群登录节点的开发者。
-- 长时间运行 Claude Code/Codex 等 Agent 的开发者。
-- 需要离开电脑后继续查看 Agent 进度的人。
-- 在 Windows、Linux、远程 GPU/HPC 节点之间切换工作的用户。
-
-### 3.2 后续用户
-
-- 管理多台 Devbox 的小团队。
-- 需要 Agent 工作记录、审计或可复现过程的组织。
-- 需要把 Agent 长任务提升为 Job 的工程团队。
-
-### 3.3 Jobs To Be Done
-
-1. 当 Agent 在办公室 Devbox 上运行时，我想从另一台电脑查看并继续操作。
-2. 当浏览器关闭或网络抖动时，我不想丢掉 Agent 会话和输出。
-3. 当我有多个 Agent/Devbox 时，我想知道哪个在线、哪个正在工作、哪个等待输入。
-4. 当任务结束后，我想回放 Agent 做了什么，而不是只看到最终结果。
-5. 当团队协作时，我想让其他人查看会话，但不能让多人同时无序输入。
+The transport underneath is a PTY, but the core product object is the **session**.
 
 ---
 
-## 4. 产品对象模型
+## 2. Personas
 
-```text
-User / Organization
-  └── Workspace
-       ├── Membership / Role
-       └── Devbox
-            ├── Connector
-            └── Agent
-                 └── Session
-                      ├── Live terminal
-                      ├── Current screen + scrollback
-                      ├── DVR recording
-                      ├── Status / presence
-                      ├── Events / approvals
-                      └── Artifacts
-```
+### 2.1 Primary users
 
-P0 当前实现了简化版：
+- Developers working across multiple machines, workstations, or cluster login nodes.
+- Developers running long-lived agents such as Claude Code or Codex CLI.
+- People who need to check on an agent's progress after leaving their computer.
+- Users switching work between Windows, Linux, and remote GPU/HPC nodes.
 
-```text
-User → Devbox → Agent → Session
-```
+### 2.2 Secondary users
 
-### 4.1 User
+- Small teams managing several devboxes.
+- Organizations that need agent work records, audit trails, or reproducible sessions.
 
-登录平台的人类用户。当前使用 username/password + signed cookie；生产版将支持 Organization、
-Workspace 和更严格的认证。
+### 2.3 Jobs to be done
 
-### 4.2 Devbox
-
-运行 connector 的用户机器，是基础设施和认证单元：
-
-- 一名用户可以拥有多台 Devbox。
-- 一台 Devbox 可以承载多个 Agent。
-- Devbox 使用 `hpc_box_...` bearer token 认证。
-- Devbox 不作为消息作者出现，也不拥有模型凭证的 Server 副本。
-
-### 4.3 Agent
-
-一个可启动的本地 Agent 配置：
-
-```text
-handle
-runtime
-working directory
-launch command
-capabilities
-host devbox
-```
-
-Agent 是模板/入口，Session 才是实际运行实例。
-
-### 4.4 Session
-
-Session 是产品的一等对象，代表“一次持续存在的 Agent 工作上下文”。
-
-它必须拥有：
-
-```text
-id
-agent_id
-owner/workspace
-state
-started_at
-last_activity_at
-ended_at
-exit_code
-terminal dimensions
-recording metadata
-connector instance
-PTY instance
-```
-
-Session 不应因为 Viewer 离开而结束。
-
-### 4.5 Viewer
-
-正在观看 Session 的浏览器连接：
-
-- Viewer 可以随时 attach/detach。
-- Viewer 不是 Session 的生命周期拥有者。
-- 多 Viewer 可以同时观看。
-- 后续只有持有 keyboard control 的 Viewer 可以输入。
+1. When an agent runs on my office devbox, I want to view and keep driving it from another
+   computer.
+2. When a browser closes or the network drops, I do not want to lose the agent session or
+   its output.
+3. With several agents and devboxes, I want to know which is online, which is working, and
+   which is waiting for input.
+4. When a task finishes, I want to replay what the agent did, not only see the final result.
+5. When collaborating, I want others to view a session while preventing several people from
+   typing into it at once.
 
 ---
 
-## 5. Session 生命周期
-
-### 5.1 状态机目标
+## 3. Object model
 
 ```text
-created
-  → starting
-  → live
-  ↔ disconnected
-  → terminating
-  → ended
-
-starting/live/disconnected
-  → failed
+User / Workspace
+  └── Devbox
+       ├── Connector + reported runtime capabilities
+       └── Agent
+            └── Session
+                 ├── Live terminal or structured chat
+                 ├── Viewers + keyboard lease
+                 ├── Structured events / permission prompts
+                 └── Durable recording / replay
 ```
 
-状态定义：
+- **User** — a person who signs in. Local username/password sign-in is supported; Azure
+  deployments can front the app with Entra / Easy Auth against a tenant allowlist.
+- **Workspace** — the collaboration and permission boundary. Every user has a personal
+  workspace and may create more. The left rail is organized **Workspace → Devbox → Agent**.
+- **Devbox** — the user's machine running the connector; the infrastructure and auth unit.
+  A user may own many devboxes; a devbox may host many agents. Devboxes authenticate with a
+  hashed bearer token and are never message authors.
+- **Agent** — a path-free launch profile: handle, runtime adapter, connector-local project
+  ID, non-secret runtime config, and host devbox. Absolute paths, skill contents, model
+  credentials, and CLI login state remain on the connector.
+- **Session** — durable context around an agent-process lifetime. Its database row stores
+  the agent, owner/workspace, title, retention policy, and creation time. APIs add computed
+  live and recording metadata. The process lives on the connector; a viewer leaving does not
+  end it.
+- **Viewer** — a browser attached to a session. Viewers attach and detach freely, do not
+  own session lifecycle, and can be many at once. Only the viewer holding the keyboard lease
+  may send input.
 
-| 状态 | 含义 |
+---
+
+## 4. Session lifecycle
+
+### 4.1 Session state
+
+The session row does not persist a transition state machine.
+`GET /api/agents/{agent_id}/sessions` derives a small presentation state:
+
+- `live` when the hub currently tracks the agent/session pair;
+- `ended` when the in-process live registry observed the process exit;
+- `inactive` otherwise.
+
+A connector or browser disconnect does not delete the session or its recording. The
+connector may retain the process and replay spooled output after reconnect.
+
+### 4.2 Lifecycle actions
+
+| Action | Semantics |
 |---|---|
-| `created` | DB 已创建，尚未要求 connector 启动 |
-| `starting` | Server 已发 open，等待 PTY ready |
-| `live` | PTY 存活，connector 可达 |
-| `disconnected` | PTY 可能仍活着，但 connector/Server 暂时失联 |
-| `terminating` | 用户显式要求结束，等待进程退出 |
-| `ended` | 进程已退出，有明确 exit code 或正常终止 |
-| `failed` | 启动失败或状态不可恢复 |
+| New session / New chat | Create a durable session and start a fresh local process on attach |
+| Open agent | Resume the newest `live` session; create one when none is live |
+| Detach | Close this viewer only; keep the local process running |
+| Terminate | Kill the process; requires operator role and the keyboard lease |
+| Replay | Read a durable recording without starting a process |
 
-### 5.2 生命周期语义
-
-| 用户动作 | 语义 |
-|---|---|
-| New Session | 显式创建新的 PTY/Agent 上下文 |
-| Attach/Resume | 打开现有 Session，不创建新进程 |
-| Detach | Viewer 离开；PTY 继续运行 |
-| Terminate | 显式结束 PTY，Session 转 ended |
-| Archive | 从默认列表隐藏，但不删除 recording |
-| Delete | 删除元数据和 recording，需要二次确认 |
-
-### 5.3 必须避免的行为
-
-- 点击 Agent 时静默创建 Session。
-- Viewer WS 断开时杀掉 PTY。
-- ended Session 被重新 attach 时悄悄启动一个新的 Agent。
-- connector 未确认存活时把 Session 永久标成 ended。
-- 多个 Viewer 同时向同一 PTY 无序输入。
+A WebSocket close is not process death. Multiple viewers may attach, but only the active
+keyboard-lease holder can send input or terminate the process.
 
 ---
 
-## 6. 核心用户流程
+## 5. Structured-first chat and terminal fallback
 
-### 6.1 首次接入 Devbox
+deepbox is structured-first: when an adapter reports a structured capability, the browser
+opens a native chat before the first frame instead of scraping ANSI text.
+
+### 5.1 Two local execution paths
+
+- **Structured runtimes** (headless / JSON) drive the native chat UI. The connector's
+  runtime adapter runs a `StructuredAgentSession`, emits a canonical event stream, and maps
+  per-turn options to native control requests. Capability blobs stay opaque to the server;
+  the browser renders only their generic feature and control schema.
+- **Legacy / TUI runtimes** fall back to `xterm.js` rendering raw PTY bytes, with resize,
+  reconnect, and replay behavior unchanged.
+
+The browser chooses the chat or terminal surface solely from the reported
+`features.structured` capability.
+
+### 5.2 Structured chat controls
+
+- Controls are capability-driven. Generic `select` / `file` descriptors render the model,
+  reasoning, and attachment widgets; the UI always offers a **Runtime default** and only
+  shows an editable model combobox when the adapter allows a custom model ID.
+- When live model discovery is unavailable, the connector falls back to the adapter's static
+  catalog. **Runtime default** sends no `--model`.
+- Session-scoped controls (permission, reasoning) lock once the session is configured or the
+  first chat item appears.
+- For runtimes where the model is a per-turn control (e.g. Claude), later turns can switch
+  models; the protocol cannot clear an already-set model. Returning to **Runtime default**
+  requires **New chat**.
+- **New chat** terminates the current runtime session, creates a fresh persisted session, and
+  reopens the controls without deleting prior history.
+- Terminating a session still requires operator role and the current keyboard lease.
+
+### 5.3 Terminal experience (fallback)
+
+The terminal surface must preserve: native ANSI/truecolor, cursor and resize, mouse and
+shortcuts when the runtime supports them, bounded scrollback restore on attach, a visible
+reconnect state that does not obscure the agent TUI, and a clear live/recording indicator.
+
+---
+
+## 6. Core user flows
+
+### 6.1 First devbox onboarding
 
 ```text
-注册/登录
-→ 创建 Devbox
-→ 平台显示一次性 token 和安装命令
-→ 用户在自己的机器运行 connector
-→ connector 探测 runtime/version/capabilities
-→ Devbox 和 Agent 显示 online
+Register / sign in
+→ create a devbox
+→ platform shows a one-time token and install command
+→ user runs the connector on their own machine
+→ connector probes runtimes/versions/capabilities
+→ devbox, projects, and runtime capabilities appear
+→ user registers an agent
 ```
 
-原则：平台不能替用户预先运行 connector、创建本地进程或接触本地凭证。
+The platform never pre-runs the connector, creates local processes, or touches local
+credentials on the user's behalf. Install once, then reconnect with
+`deepbox connect`; upgrades are the explicit `deepbox upgrade`. See
+[`install.md`](install.md) and [`onboarding.md`](onboarding.md).
 
-### 6.2 创建 Agent
+### 6.2 Create an agent
 
 ```text
-选择 Devbox
-→ 选择探测到的 Runtime
-→ 设置 handle、cwd、可选 launch command
-→ 保存 Agent 配置
+Choose a devbox
+→ pick a probed runtime and an optional connector-reported local project
+→ set the handle
+→ save the path-free agent definition
 ```
 
-任何 secret 只来自 connector 本地环境，不存 Server。
+Any secret comes only from the connector's local environment and is never stored on the
+server.
 
-### 6.3 开始 Session
+### 6.3 Start a session
 
 ```text
-打开 Agent
-→ 查看已有 Sessions
-→ 选择 New Session
-→ Server 创建 Session(starting)
-→ connector 启动 PTY
-→ ready
-→ Session(live)
-→ 浏览器显示真实 TUI
+Open an agent
+→ browser checks for the newest live session
+→ if none exists, server creates a durable session row
+→ browser attaches and connector starts the local process
+→ browser shows native chat or the live terminal
 ```
 
-### 6.4 恢复 Session
+### 6.4 Resume a session
 
 ```text
-打开 live/disconnected Session
-→ Viewer attach
-→ Server 发送 restore（scrollback + viewport + cursor）
-→ connector 确认 PTY 存活
-→ 衔接后续 live output
+Open an agent with a live session
+→ viewer attaches to the same session ID
+→ connector restores buffered structured events or terminal output
+→ live output resumes
 ```
 
-### 6.5 Server 重启
-
-目标流程：
+### 6.5 Server restart
 
 ```text
-Server 停止
-→ connector PTY 继续运行
-→ output 写入本地 durable spool
-→ Server 恢复
-→ connector 重连并上报 surviving sessions
-→ 从 last ACK 补发 output
-→ Viewer 自动重连
-→ restore + live output
+Server stops
+→ connector process keeps running and spools output locally
+→ Server recovers
+→ connector reconnects and reports surviving sessions
+→ output is replayed from the last acknowledged point
+→ viewers reconnect automatically and restore
 ```
 
-当前实现已具备内存 FIFO 和 surviving session 上报，但尚未具备磁盘 spool + ACK，因此仍属于
-“可恢复”而非严格可证明的 durable delivery。
-
-### 6.6 回放历史
+### 6.6 Replay history
 
 ```text
-打开 ended/archived Session
-→ 加载 recording 元数据和 checkpoints
-→ 播放/暂停/调速/seek
-→ 可下载或按权限分享
+Open History for an agent
+→ choose a recorded session
+→ load recording metadata and checkpoints
+→ play / pause / seek / change speed
 ```
 
 ---
 
-## 7. 产品界面结构
+## 7. Information architecture
 
-### 7.1 推荐信息架构
-
-```text
-Global rail
-  ├── Workspace
-  ├── Sessions
-  ├── Devboxes
-  └── Settings
-
-Session workspace
-  ├── 左：Devbox / Agent / Session 导航
-  ├── 中：Terminal / Replay 主区域
-  └── 右：Session 状态、元数据、参与者、Artifacts
-```
-
-### 7.2 Session Control Center
-
-每个 Session 显示：
-
-- 标题
-- Agent / Runtime / Devbox
-- live/disconnected/ended/failed
-- 开始时间、最后活动时间、持续时间
-- working directory
-- recording 大小
-- Viewer 数量
-- Resume / Replay / Terminate / Archive
-
-### 7.3 Terminal 体验
-
-必须保持：
-
-- 原生 ANSI/truecolor
-- 光标与 resize
-- 鼠标和快捷键（Runtime 支持时）
-- 有限 scrollback 恢复
-- reconnect 状态可见但不遮挡 Agent TUI
-- 多 Session tab
-- 明确的 live/recording 指示
-
-### 7.4 多 Viewer 控制权
-
-后续协作模式：
+### 7.1 Layout
 
 ```text
-多人可以观看
-→ 只有一个 Viewer 持有 keyboard lease
-→ 其他人可请求控制权
-→ 当前控制者可移交
-→ 超时/断开后 lease 自动释放
+Topbar (brand, search / ⌘K entry, owner entry, user menu, sign out)
+├── Left: Fleet panel (online/total summary, search, compact devbox → agent list)
+└── Right: Session stage (session header + native chat or xterm main area;
+           empty state with shortcut hints when no agent is selected)
 ```
 
-### 7.5 已实现的 UI foundation（Terminal-first Switchboard）
+A devbox is a compact panel showing name, status text, an opaque capability overview, and
+`+ Agent / Rotate token / Delete` actions. An agent row shows a monogram, handle, runtime
+label, and status text, revealing a History action on hover or selection.
 
-> 本节描述当前 `web/` 中**已经实现**的界面，而非 §7.1–7.4 的长期目标。
-> 未实现的多 Session tab、URL routing、command blocks 等仍属规划，不在此列。
+### 7.2 Session control surface
 
-**设计方向。** 借鉴 Tailscale 的机器清单、Linear 的密度与键盘手感、
-Vercel/Geist 的克制暗色层级，但不复制其品牌。刻意避免紫蓝发光渐变、玻璃拟态、
-AI 星光/机器人意象与营销式 hero。UI 用 sans，终端用 mono；终端永远是视觉主角。
+The stage header shows the agent handle, current surface label, collaboration/keyboard
+state, and connection status. Opening an agent resumes its newest live session or creates
+one when none is live. History lists recorded sessions with their creation time and derived
+state, and provides Replay.
 
-**视觉系统。** `web/styles.css` 是 token 驱动的深色主题（surface/border/text/
-status/accent 全部走 CSS 变量），细边框、单一低饱和青绿 accent、语义状态色。
-它在 `index.html` 内联 reset 之后加载，成为样式的唯一事实来源。所有状态
-（devbox online/offline、agent online/busy/offline、keyboard lease）都是
-「圆点 + 文字」，从不只靠颜色表达。提供清晰的 `:focus-visible`、
-`prefers-reduced-motion` 降级，以及窄屏（≤820px）下 fleet 面板与终端纵向堆叠的
-响应式布局。
+### 7.3 Command palette (⌘K / Ctrl+K)
 
-**主 shell 布局。**
+An overlay (no routing change) to filter and open an agent, open an agent's history, create
+a devbox, or enter the owner console (owner only). `↑` / `↓` move the selection, `Enter`
+executes, `Esc` closes. The Fleet search box filters devboxes and agents in real time.
 
-```text
-topbar（克制品牌 + 搜索/⌘K 入口 + owner 入口 + 用户 + 退出）
-├── 左：Fleet 面板（标题、online/total 汇总、搜索框、紧凑 devbox/agent 清单）
-└── 右：Terminal stage（会话 header + xterm 主区域；未选 agent 时显示空状态与快捷提示）
-```
+### 7.4 Modals and one-time tokens
 
-Devbox 为紧凑 panel，展示名称、状态文字、opaque capability 概览与「+ Agent /
-Rotate token / Delete」操作；agent 行显示 monogram、handle、runtime label 与
-状态文字，hover/选中时露出 History 操作。
-
-**Command palette（⌘K / Ctrl+K）。** 一个 overlay（不引入路由），可筛选并打开
-agent、打开某 agent 的 history、创建 devbox、进入 owner 控制台（仅 owner）。
-Escape 关闭，ArrowUp/ArrowDown 移动选择，Enter 执行。
-
-**模态与一次性 token。** createDevbox / createAgent、删除确认与错误提示都用
-app 内自定义 modal/form，取代浏览器 `prompt/alert/confirm`。一次性 devbox token
-只在内存中渲染进 modal DOM，绝不写入 storage、cookie、URL 或日志；用户可一键复制 raw token
-或完整 Windows connector 命令，避免从换行文本中手工抄录。
-
-**xterm 主题。** 终端配色与 UI token 对齐（青绿光标、语义 ANSI 调色板），
-resize、reconnect、replay/DVR、collaboration lease 行为保持不变。
-
-**纯函数层。** DOM-free 的可测逻辑集中在 UMD 模块 `web/ui.js`（fleet 汇总、
-devbox/agent 过滤、command 生成与筛选、runtime label / initials、状态映射、
-HTML escape），由 `app.js` 用与 replay/collaboration 相同的缓存 Promise 方式
-动态加载，并由 `web/ui.test.js`（node:test）覆盖。
+Create/delete flows, confirmations, and errors use in-app modals rather than the browser's
+`prompt/alert/confirm`. A one-time devbox token is rendered only into the modal DOM in
+memory — never written to storage, cookies, URLs, or logs — and offers one-click copy of the
+raw token or the full connector command.
 
 ---
 
-## 8. 数据与可靠性设计原则
+## 8. Workspaces, collaboration, and permissions
 
-### 8.1 两类数据
+- Resources are scoped by workspace; every user has a personal workspace and may create more.
+- Four roles constrain all resources: `viewer` (read-only), `operator` (can drive and
+  terminate sessions), `admin`, and `owner`.
+- Workspace owners/admins issue single-use, expiring, email-bound invitation links. The
+  deployment owner separately manages local-account invitations, disabling, and re-enabling.
+- Multiple viewers may watch a session, but only one holds the **keyboard lease**. Others can
+  request control; the current holder can hand it off; the lease releases automatically on
+  timeout or disconnect. Lease actions: `Request` / `Take keyboard` / `Release` / `Hand off`
+  (viewers remain read-only).
 
-1. **控制面数据**：User、Devbox、Agent、Session、权限、状态，存关系数据库。
-2. **终端事件流**：input/output/resize/exit，存 append-only recording + checkpoints。
+---
 
-### 8.2 当前屏幕与完整历史分离
+## 9. Projects and skills
 
-- 当前屏幕：`pyte.HistoryScreen`，用于快速 restore，大小有界。
-- 完整历史：asciicast v2 DVR，用于回放和审计，随时间增长。
-- 后续 checkpoint：避免长 recording 每次从头重放。
+Projects and skills are registered on the machine running the connector; absolute paths stay
+in the connector-local state store, and the server only receives stable IDs and display names.
 
-### 8.3 可靠投递目标
+- **LocalProject** — register a project directory locally. The browser's Add-agent flow only
+  produces a copyable `deepbox project add …` command; it never browses the local filesystem.
+- **Skills** — a skill is a directory containing a UTF-8 `SKILL.md`, whose directory name
+  must equal the lower-kebab-case `name` in the YAML frontmatter. Skills install to personal
+  scope by default, or to a registered project scope with `--project`. The connector copies
+  content into its own skill store and each adapter family's skill roots; deepbox never
+  executes skill files, and the server only stores path-free inventory.
 
-协议 v3 应采用：
+Full schema, limits, scope resolution, and drift rules are in
+[`install.md`](install.md#local-projects-and-skills).
+
+---
+
+## 10. Data and reliability
+
+### 10.1 Two kinds of data
+
+1. **Control-plane data** — users, devboxes, agents, sessions, permissions, and state, kept
+   in a relational database.
+2. **Terminal/event stream** — input/output/resize/exit, kept in an append-only recording
+   with checkpoints.
+
+### 10.2 Current screen vs. full history
+
+- Current screen: a bounded in-memory screen model for fast restore.
+- Full history: an asciicast v2 durable recording (DVR) for replay and audit, growing over
+  time.
+- Checkpoints avoid replaying a long recording from the start.
+
+### 10.3 Durable delivery
+
+The frame protocol (v3) targets acknowledged, deduplicated delivery:
 
 ```text
 connector local spool
-→ frame(session_id, seq)
-→ Server fsync/persist
-→ ACK(session_id, seq)
-→ connector 删除本地记录
+→ frame(session_id, pty_instance_id, seq)
+→ server persists
+→ ACK(session_id, pty_instance_id, seq)
+→ connector drops the local record
 ```
 
-Server 对 `(session_id, seq)` 去重，保证重试不会重复记录。
+The server deduplicates on `(session_id, pty_instance_id, seq)` so retries never duplicate records.
 
-### 8.4 Session Source of Truth
+### 10.4 Sources of truth
 
-- 活进程状态源头：Devbox session supervisor。
-- 持久元数据源头：Server DB。
-- 已持久化输出源头：recording store。
-- 浏览器不是任何 Session 状态的源头。
-
----
-
-## 9. Runtime 扩展设计
-
-Runtime 应采用注册表/adapter：
-
-```python
-RuntimeAdapter:
-    id
-    label
-    probe()
-    launch_command()
-    capabilities()
-    normalize_environment()
-```
-
-目标：新增 Runtime 只需一个 adapter 文件和一个注册项，Server/Web 不做 runtime-specific 修改。
-
-首批：
-
-- `claude-code`
-- `codex-cli`
-- `copilot-cli`
-- `mock`（测试）
-
-capability blob 应保持 opaque，由 connector 探测和解释，Server 只存储/转发。
+- Live process state: the devbox session supervisor.
+- Durable metadata: the server database.
+- Persisted output: the recording store.
+- The browser is never a source of truth for any session state.
 
 ---
 
-## 10. 安全与隐私
+## 11. Runtime extensibility
 
-### 10.1 不可违反的边界
-
-- API key、CLI 登录态永不进入 Server。
-- Token 数据库只存 hash。
-- Agent 只能由 host 它的 Devbox 身份发言/输出。
-- Recording 必须经过 Session/Workspace 权限校验。
-- 用户必须知道 Session 正在被录制。
-
-### 10.2 上线前安全基线
-
-- Argon2id 密码哈希
-- 环境变量/secret manager 管理签名密钥
-- HTTPS/WSS
-- Secure/HttpOnly/SameSite cookie
-- CSRF 和 WebSocket Origin 校验
-- 登录、Token 和 API rate limit
-- 审计日志
-- Token 轮换、吊销和连接立即失效
-- Recording retention、删除和加密
-
-### 10.3 Recording 隐私
-
-终端可能包含代码、内部路径、URL、环境信息甚至误打印的 secret。Workspace 必须可配置：
-
-- 是否录制
-- 保存期限
-- 谁可以查看/下载
-- 手动永久删除
-- 后续敏感信息检测/redaction
+Runtimes are declared in the connector registry. Each `RuntimeAdapter` supplies a stable ID
+and label, family and surface, validated launch/model/permission metadata, probe hints,
+generic control definitions, and skill roots. Adding a runtime must not require a
+runtime-specific server or web branch. Built-in adapters are `mock`, `claude-code`,
+`codex-cli`, `copilot-cli`, `claude-code-structured`, and `copilot-cli-structured`.
+Capability blobs stay opaque to the server; the web renders their generic schema.
 
 ---
 
-## 11. 非目标与产品边界
+## 12. Security and privacy
 
-短期不做：
+### 12.1 Non-negotiable boundaries
 
-- Server 侧模型调用或 API key 托管
-- 完整 IDE/代码编辑器
-- 任意远程桌面
-- 自动读取用户代码仓库
-- 在 connector 未授权时运行命令
-- 依靠解析 ANSI 文本猜测所有 Agent 语义
+- API keys and CLI login state never reach the server.
+- Token storage keeps only hashes.
+- An agent can only speak/emit output under the identity of its host devbox.
+- Recording access is always checked against session/workspace permissions.
+- Users must know when a session is being recorded.
 
-Agent-native 状态（waiting/approval/completed）应优先来自 Runtime adapter 的结构化 sideband，
-而不是让 Server 猜终端内容。
+### 12.2 Baseline controls
 
----
+- Argon2id password hashing with transparent upgrade of legacy hashes.
+- Signing secrets from environment/secret manager; HTTPS/WSS transport.
+- Secure/HttpOnly/SameSite cookies; CSRF and WebSocket Origin validation.
+- Production Origin allowlist, layered rate limits, and security headers.
+- Redacted JSON audit logging.
+- Token rotation and revocation that disconnect immediately.
+- Recording retention and secure erase by workspace admins and owners.
 
-## 12. 成功指标
+### 12.3 Recording privacy
 
-### 12.1 可靠性
-
-- Session 非用户显式终止率
-- reconnect 成功率
-- 恢复到可交互状态的 P50/P95 时间
-- output gap / duplicate rate
-- connector crash-free session hours
-
-### 12.2 使用价值
-
-- 每用户连接 Devbox 数
-- 每周 live Sessions 数
-- Resume 而不是重建 Session 的比例
-- 跨设备恢复次数
-- Replay 使用率
-- 长任务完成后通知打开率
-
-### 12.3 产品北极星指标
-
-> **每周被成功恢复并继续使用的 Agent Session 数。**
-
-这个指标直接衡量平台是否提供了本地终端没有的价值。
+Terminal output can contain code, internal paths, URLs, environment details, and even
+accidentally printed secrets. Sessions are durably recorded with a per-session retention
+policy. Workspace members may view recordings according to workspace RBAC; workspace
+admins and owners may change retention or securely erase payloads.
 
 ---
 
-## 13. 当前产品结论
+## 13. Operational and error states
 
-当前 P0 已证明：真实 Claude Code 可以在用户 Devbox 上运行，通过 deepbox 原样交互，并在
-Viewer detach 和 Server 重启后恢复同一 PTY。
+- Devbox `online`/`offline`, agent `online`/`busy`/`offline`, and keyboard lease are all
+  shown as **dot + text**, never color alone.
+- Browser connection state is shown as live/reconnecting/error without inventing a durable
+  session state; the WebSocket reconnect loop restores the active view.
+- Runtime launch and protocol failures surface through connector error frames and visible
+  UI status or error messages.
+- Structured cold-start event bursts are merged (single-flight), and a lazy chat mount
+  isolates stale views by epoch.
+- Operations guidance — structured logs, connection visibility, readiness checks,
+  backup/restore, capacity alerts, and version/smoke checks — is in
+  [`operations.md`](operations.md).
 
-下一阶段不应优先堆更多 Runtime 或做视觉包装，而应依次完成：
+---
 
-1. Session 一等对象和 Control Center。
-2. seq/ACK/磁盘 spool 的严格可靠投递。
-3. Replay 和历史体验。
-4. connector/session supervisor 解耦。
-5. 安全基线、权限和生产部署。
+## 14. Accessibility and responsiveness
 
-详见 [`planning.md`](planning.md)。
+- A token-driven dark theme with fine borders, a single low-saturation accent, and semantic
+  status colors is the single source of truth for styling.
+- Clear `:focus-visible` styles, a `prefers-reduced-motion` fallback, and a responsive
+  narrow-screen layout (≤820px) that stacks the fleet panel and terminal vertically.
+- The UI uses a sans font and the terminal uses mono; the terminal is always the visual lead.
+- DOM-free presentation logic (fleet summary, filtering, command generation, status mapping,
+  HTML escaping) lives in a testable module covered by unit tests.
+
+---
+
+## 15. Success criteria and non-goals
+
+### 15.1 North-star metric
+
+> **Weekly count of agent sessions successfully resumed and kept in use.**
+
+This directly measures whether the platform delivers value a local terminal cannot.
+
+### 15.2 Reliability signals
+
+- Rate of sessions ending without an explicit user action.
+- Reconnect success rate.
+- P50/P95 time to restore an interactive session.
+- Output gap and duplicate rate.
+- Connector crash-free session hours.
+
+### 15.3 Usage-value signals
+
+- Connected devboxes per user.
+- Live sessions per week.
+- Ratio of Resume vs. rebuild.
+- Cross-device resume count.
+- Replay usage rate.
+
+### 15.4 Non-goals
+
+- Server-side model calls or API-key custody.
+- A full IDE or code editor.
+- General remote desktop.
+- Automatic reading of user code repositories.
+- Running commands when the connector has not authorized them.
+- Guessing agent semantics by parsing ANSI text — agent-native states (waiting, approval,
+  completed) should come from a runtime adapter's structured sideband, not screen scraping.
+
+See [`planning.md`](planning.md) for delivery sequencing.

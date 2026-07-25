@@ -20,7 +20,7 @@ The browser reads `GET /api/auth/config` and only shows the sign-in methods enab
 When the database has no bootstrap owner, open the root page. The setup panel asks for a username, display name, and password, then calls:
 
 ```text
-POST /api/bootstrap
+POST /api/auth/bootstrap
 ```
 
 This route works exactly once and creates the first deployment-level owner. It is separate from workspace roles.
@@ -80,8 +80,6 @@ DEEPBOX_ENV=production
 DEEPBOX_REGISTRATION_ENABLED=false
 DEEPBOX_COOKIE_SECURE=true
 DEEPBOX_COOKIE_SAMESITE=lax
-DEEPBOX_INVITATION_TTL_HOURS=72
-DEEPBOX_INVITATION_MAX_USES=1
 DEEPBOX_SESSION_TTL_SECONDS=28800
 DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS=7
 ```

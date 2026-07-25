@@ -1,4 +1,4 @@
-"""Connector-side runtime adapter registry (planning.md Cut 7).
+"""Connector-side runtime adapter registry.
 
 This module replaces the hard-coded ``DEFAULT_CMDS`` table in
 :mod:`connector.pty_session` with a small, scalable registry of
@@ -9,7 +9,7 @@ This module replaces the hard-coded ``DEFAULT_CMDS`` table in
     single *shared* command builder (:func:`build_command`), and
   * describe its capabilities as an opaque JSON blob for the server.
 
-Design goals (see planning.md Cut 7):
+Design goals:
 
   * Adding a new runtime is *localized*: define one adapter and call
     :func:`register`. No edits to the builder, the supervisor, or other
@@ -547,9 +547,8 @@ def attachment_control(runtime_id: str) -> RuntimeControl | None:
 
 
 # ---------------------------------------------------------------------------
-# First-batch adapters (planning.md Cut 7): mock + claude / copilot / codex.
-# Each of these is intentionally self-contained: it is exactly the "one adapter
-# file entry + one registry entry" unit the acceptance criteria call for.
+# Built-in adapters: mock, Claude, Copilot, and Codex.
+# Each adapter is self-contained so adding another runtime stays localized.
 # ---------------------------------------------------------------------------
 
 # The mock runtime launches the *current* interpreter; its argv[0] is an
@@ -633,16 +632,14 @@ register(RuntimeAdapter(
 ))
 
 # ---------------------------------------------------------------------------
-# Structured (headless) runtimes (Cut 10): driven via a JSON protocol on stdio
-# instead of a PTY, so the web UI renders a chat surface with 0-RTT local
-# input and streaming events. Adding one is still a single register() call.
+# Structured runtimes use JSON over stdio instead of a PTY. The web UI
+# renders local text input and streaming events.
 #
 # Claude Code headless:
 #   claude -p --output-format stream-json --input-format stream-json
 #          --include-partial-messages --verbose [--permission-mode ...]
-# The default permission mode ("") accepts edits for this session per the
-# product decision "信任此会话/自动接受编辑"; callers can still request a
-# stricter mode. --verbose is required by Claude when output-format is
+# The default permission mode ("") accepts edits for this session; callers can
+# request a stricter mode. --verbose is required by Claude when output-format is
 # stream-json in -p mode.
 # ---------------------------------------------------------------------------
 register(RuntimeAdapter(
@@ -696,8 +693,8 @@ register(RuntimeAdapter(
     family="copilot-cli", surface="structured", default_surface=True,
     # Copilot's ``-p`` runs one prompt then exits, emitting newline-delimited
     # JSON. Each user turn spawns a fresh process (per_turn=True); the prompt
-    # text is appended after ``prompt_argv``. Context does not currently carry
-    # across turns (stateless v1) — a future cut can share ``--session-id``.
+    # text is appended after ``prompt_argv``. With ``per_turn=True``, context
+    # is not preserved across turns.
     base_argv=(
         "copilot",
         "--output-format", "json",

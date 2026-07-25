@@ -1,4 +1,4 @@
-"""Cut 4 supervisor/transport split tests.
+"""Supervisor and transport split tests.
 
 These verify the central invariant of the split: a transport
 restart/detach must NOT close PTYs, and buffered output survives to the next
@@ -240,7 +240,7 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         sup.attach(sup_end)
         drain = asyncio.create_task(sup.drain_to(sup_end))
         try:
-            # Cut 9: with bounded pipelining all three frames drain without
+            # With bounded pipelining all three frames drain without
             # waiting for ACKs; the forked tail and the fresh output are both
             # sent (the server, not the connector, decides the fork).
             delivered = []
@@ -268,7 +268,7 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(drain, return_exceptions=True)
 
     async def test_pipelines_multiple_frames_before_any_ack(self):
-        # Core Cut 9 property at the supervisor layer: with a bounded window,
+        # With a bounded window at the supervisor layer,
         # many durable frames drain before the first ACK returns.
         sup = SessionSupervisor()
         for i in range(5):

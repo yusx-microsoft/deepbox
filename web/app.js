@@ -1,16 +1,10 @@
-// deepbox SPA — Terminal-first Switchboard.
-// Renders login, first-owner bootstrap, the main shell (topbar + fleet panel +
-// terminal stage), owner console, command palette and modals. API behaviour is
-// unchanged; this file only reshapes the DOM/UX around the existing endpoints.
+/*
+ * DeepBox browser control plane.
+ *
+ * Structured agent sessions are the primary interface. The terminal remains a
+ * fallback for runtimes that do not expose structured events.
+ */
 const app = document.getElementById('app');
-// Inject the external stylesheet without touching index.html. It loads after
-// the inline reset there, so its rules become the source of truth.
-if(!document.querySelector('link[data-deepbox-styles]')){
-  const link = document.createElement('link');
-  link.rel = 'stylesheet'; link.href = '/static/styles.css';
-  link.setAttribute('data-deepbox-styles','');
-  document.head.appendChild(link);
-}
 let me = null, devboxes = [], term = null, fit = null, termWS = null, curSession = null;
 let workspaces = [], activeWorkspaceId = null;
 let authConfig = {mode:'local', password_enabled:true, microsoft_enabled:false};
@@ -21,7 +15,7 @@ let curAgentId = null;   // currently open agent, for active-row highlighting
 let currentSurface = null;
 let fleetQuery = '';     // fleet search text
 let nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock;
-let deriveCollaborationState, canSendInput;
+let deriveCollaborationState, canSendInput, collabHeaderView;
 let collabState = null;  // normalized collaboration view model for curSession
 let keyboardRequester = null;
 let termInputSender = null;
@@ -58,7 +52,7 @@ async function loadCollaborationHelpers(){
   collaborationHelpersPromise = collaborationHelpersPromise ||
     loadScriptOnce('/static/collaboration.js', 'DeepboxCollaboration', 'failed to load collaboration helpers');
   const mod = await collaborationHelpersPromise;
-  ({deriveCollaborationState, canSendInput} = mod);
+  ({deriveCollaborationState, canSendInput, collabHeaderView} = mod);
   return mod;
 }
 
@@ -1028,7 +1022,7 @@ function sendResize(){
     {type:'resize',session_id:curSession,cols:term.cols,rows:term.rows}));
 }
 
-// --- Structured chat surface (Cut 10) -------------------------------------
+// --- Structured chat surface ----------------------------------------------
 function currentAgentCapability(){
   for(const devbox of devboxes){
     const agent = (devbox.agents || []).find(item => item.id === curAgentId);
@@ -1532,37 +1526,19 @@ function renderCollab(){
   const el = document.getElementById('collab');
   if(!el) return;
   const s = collabState;
-  if(term) term.options.disableStdin = !(s && s.isHolder);
-  // No collaboration frame yet (attach in flight, or the connector hasn't
-  // reported keyboard ownership). Never leave a blank label with silently
-  // disabled stdin — show an explicit pending state so the terminal is never
-  // mysteriously untypable.
-  if(!s){
-    el.className = 'collab collab-pending';
-    el.innerHTML = '<span class="collab-dot"></span>' +
-      '<span class="collab-label">connecting\u2026</span>';
-    return;
+  const view = collabHeaderView(s, keyboardRequester);
+  if(term) term.options.disableStdin = !view.canType;
+  let btn = '';
+  if(view.button === 'handoff'){
+    btn = '<button class="ghost" id="collab-handoff">Hand off</button>';
+  } else if(view.button === 'release'){
+    btn = '<button class="ghost" id="collab-release">Release</button>';
+  } else if(view.button === 'request'){
+    const text = s && s.heldByOther ? 'Request' : 'Take keyboard';
+    btn = `<button class="ghost" id="collab-request">${text}</button>`;
   }
-  let label, cls, btn = '';
-  if(s.isViewer){
-    label = 'read-only'; cls = 'collab-viewer';
-  } else if(s.isHolder){
-    label = keyboardRequester
-      ? `${esc(keyboardRequester.username)} requests the keyboard`
-      : 'you have the keyboard';
-    cls = 'collab-holder';
-    btn = keyboardRequester
-      ? '<button class="ghost" id="collab-handoff">Hand off</button>'
-      : '<button class="ghost" id="collab-release">Release</button>';
-  } else if(s.heldByOther){
-    label = `${esc(s.holderUsername || 'someone')} is typing`; cls = 'collab-busy';
-    if(s.canRequest) btn = '<button class="ghost" id="collab-request">Request</button>';
-  } else {
-    label = 'keyboard free'; cls = 'collab-free';
-    if(s.canRequest) btn = '<button class="ghost" id="collab-request">Take keyboard</button>';
-  }
-  el.className = 'collab ' + cls;
-  el.innerHTML = `<span class="collab-dot"></span><span class="collab-label">${label}</span>${btn}`;
+  el.className = 'collab ' + view.cls;
+  el.innerHTML = `<span class="collab-dot"></span><span class="collab-label">${esc(view.label)}</span>${btn}`;
   const rq = document.getElementById('collab-request'); if(rq) rq.onclick = requestKeyboard;
   const rl = document.getElementById('collab-release'); if(rl) rl.onclick = releaseKeyboard;
   const ho = document.getElementById('collab-handoff'); if(ho) ho.onclick = handoffKeyboard;

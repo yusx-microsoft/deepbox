@@ -1,71 +1,114 @@
 # deepbox
 
-一个 **agent 交换机 / 管理面**：把你本地 devbox 里的 agent CLI（Claude Code、
-Copilot CLI、Codex CLI…）连接到 server，然后登录平台，就能像在本地终端里一样和它们交互。
+deepbox is an **agent switchboard / control plane**. You connect the agent CLIs
+already running on your own devbox (Claude Code, Copilot CLI, Codex CLI, and
+similar tools) to the server, sign in to the web UI, and interact with them as if
+you were sitting at the local terminal.
 
-> 我们是平台，不是 AI 产品。Server 永不跑模型、永不持有 key。智能与凭证都留在你的 devbox 上。
+> The server is a control plane, not an AI product. It never runs models and never
+> stores model API keys. Intelligence and credentials stay on your devbox.
 
-详见 [`docs/design.md`](docs/design.md)。
+See [`docs/design.md`](docs/design.md) for the technical architecture.
 
-## 组件
-- `server/` — FastAPI + WebSocket + SQLite。身份 / 频道 / 消息 / presence / 帧中继 /
-  **Protocol v3 durable recording、checkpoint、asciicast 导出与 retention**。
-- `connector/` — 用户自启进程，桥接本地 agent CLI ↔ server；一次安装后通过
-  `deepbox connect` / `doctor` / `status` / `project` / `skill` / `upgrade` 管理，日常连接不会刷新安装目录。
-  connector-only runtime registry 为 Claude Code / Copilot CLI / Codex CLI / mock 统一构造并校验
-  argv，capability 对 Server/Web 保持 opaque。
-- `web/` — 面向远程 devbox / agent 的 **Structured-first Switchboard** web UI：支持 headless/JSON
-  runtime 的原生聊天、capability 驱动的 model/reasoning controls 与 **New chat**；仅在 legacy/TUI
-  runtime 上回退 xterm.js。左侧按 Workspace → Devbox → Agent 展示，Add-agent 会刷新 runtime/project
-  inventory、选择 LocalProject，并生成只供复制的本地 `deepbox project add ...` 命令；Skills 视图只显示
-  connector 上报的 path-free metadata 和本地管理命令。一次性 token 只在内存/DOM 显示；自动重连、
-  structured event 恢复、terminal screen restore 与 Session DVR history 均保留。DOM-free 纯逻辑在
-  UMD 模块 `web/ui.js`，由 `web/ui.test.js`（node:test）覆盖。
-- Workspace collaboration — 每个用户有 personal workspace 且可创建更多空间；左栏按
-  **Workspace → Devbox → Agent** 展示，`viewer / operator / admin / owner` 四级角色约束全部资源。
-- Microsoft / local sign-in — Azure 可由 App Service Easy Auth 接入 tenant-scoped 组织 Entra 账号，
-  Deepbox 再校验 tenant allowlist；本地密码登录保留给开发环境和 hybrid 迁移。
-- Invitations — workspace owner/admin 签发单次、过期、邮箱绑定的加入链接；deployment owner
-  另行管理本地账号邀请、禁用和重新启用。
-- Security baseline — Argon2id + 旧 hash 透明升级、生产 Origin allowlist、分层 rate limit、
-  security headers、脱敏 JSON audit、凭证吊销即时断连、owner-only recording secure erase。
+## Components
 
-## 文档
-- [`docs/product-design.md`](docs/product-design.md) — **产品定位、用户、对象模型、核心流程与设计原则**
-- [`docs/planning.md`](docs/planning.md) — **从当前 P0 到 MVP、Internal Beta 和团队产品的实施计划**
-- [`docs/remote-deployment.md`](docs/remote-deployment.md) — **三台 Windows 电脑通过 Tailscale 远程连接**
-- [`docs/azure-deployment.md`](docs/azure-deployment.md) — **Azure App Service (Linux) 部署与无密钥 Entra / Easy Auth 登录**
-- [`docs/install.md`](docs/install.md) — `deepbox` 命令的一次安装、日常连接、显式升级与 Windows 安全刷新
-- [`docs/design.md`](docs/design.md) — 整体技术架构
-- [`docs/implementation.md`](docs/implementation.md) — 当前代码实现说明
-- [`docs/onboarding.md`](docs/onboarding.md) — **首个 owner 引导、角色、邀请与成员生命周期（P1 Cut 1）**
-- [`docs/operations.md`](docs/operations.md) — **运维手册：结构化日志、连接可见性、就绪检查、备份/恢复、容量告警、版本与冒烟检查（P1 Cut 3）**
-- [`docs/persistence.md`](docs/persistence.md) — 会话持久化设计（平台的立身之本）
+- `server/` — FastAPI + WebSocket + SQLite. Provides identity, workspaces,
+  channels/sessions, presence, and opaque frame relay. It also owns the Protocol
+  v3 durable recording pipeline (frames, checkpoints, asciicast export, and
+  retention). The server never runs models, never holds model keys, and never
+  interprets runtime/model strings.
+- `connector/` — A user-launched process that bridges local agent CLIs to the
+  server. Installed once, then managed with `deepbox connect` / `doctor` /
+  `status` / `project` / `skill` / `upgrade`; routine connects never refresh the
+  install directory. A connector-only runtime registry builds and validates the
+  argv for Claude Code / Copilot CLI / Codex CLI / mock, and reports capabilities
+  that stay opaque to the server and web UI.
+- `web/` — A single-page **structured-first switchboard**. For runtimes that
+  support headless/JSON output it renders a native chat surface with
+  capability-driven model and reasoning controls plus **New chat**; it falls back
+  to xterm.js only for legacy/TUI runtimes. The left navigation is organized as
+  Workspace → Devbox → Agent. Adding an agent refreshes the runtime/project
+  inventory and lets you pick a LocalProject; the "add a local project" action
+  only produces a copyable `deepbox project add ...` command and never browses the
+  host filesystem. The Skills view shows only the path-free metadata the connector
+  reports plus local management commands. One-time tokens appear only in
+  memory/DOM. Auto-reconnect, structured-event restore, terminal screen restore,
+  and durable session history are all preserved. The DOM-free logic lives in the
+  UMD module `web/ui.js`, covered by `web/ui.test.js` (`node:test`).
 
-## 连接用户机器：安装一次，随时连接
+## Collaboration and access control
 
-先从浏览器或 [`docs/install.md`](docs/install.md) 复制对应平台的一次性安装命令。安装完成后，
-每次只需设置浏览器签发的 server URL / devbox token，再运行：
+- **Workspaces** — Every user gets a personal workspace and can create more. The
+  left navigation groups resources as Workspace → Devbox → Agent, and the
+  `viewer / operator / admin / owner` roles gate every resource under a workspace.
+- **Sign-in** — Local password sign-in is available for development and hybrid
+  migration. In Azure, App Service Easy Auth can front tenant-scoped Microsoft
+  Entra accounts; deepbox additionally checks a tenant allowlist.
+- **Invitations** — Workspace owners and admins issue single-use, expiring,
+  email-bound join links. The deployment owner separately manages local account
+  invitations, disabling, and re-enabling.
+
+## Security baseline
+
+- Argon2id password hashing with transparent upgrade of older hashes.
+- Production Origin allowlist, tiered rate limiting, and security headers.
+- Redacted JSON audit logging.
+- Immediate disconnect on credential revocation.
+- Secure erase of durable recordings for workspace admins and owners.
+
+See [`docs/design.md`](docs/design.md) for how the durable recording pipeline
+(frames, checkpoints, replay, and retention) works.
+
+## Other documentation
+
+- [`docs/product-design.md`](docs/product-design.md) — Product positioning, users,
+  object model, core flows, and design principles.
+- [`docs/planning.md`](docs/planning.md) — Current v1 implementation status,
+  architectural invariants, remaining risks, and validation commands.
+- [`docs/remote-deployment.md`](docs/remote-deployment.md) — Connecting Windows
+  machines over Tailscale.
+- [`docs/azure-deployment.md`](docs/azure-deployment.md) — Azure App Service
+  (Linux) deployment with keyless Entra / Easy Auth sign-in.
+- [`docs/install.md`](docs/install.md) — Installing the `deepbox` command once,
+  routine connects, explicit upgrades, and safe refresh on Windows.
+- [`docs/implementation.md`](docs/implementation.md) — Notes on the current code.
+- [`docs/onboarding.md`](docs/onboarding.md) — First owner setup, roles,
+  invitations, and the member lifecycle.
+- [`docs/operations.md`](docs/operations.md) — Operations handbook: structured
+  logging, connection visibility, readiness checks, backup/restore, capacity
+  alerts, and version/smoke checks.
+- [`docs/persistence.md`](docs/persistence.md) — Session persistence design.
+
+## Connecting a machine: install once, connect anytime
+
+Copy the one-time install command for your platform from the browser or from
+[`docs/install.md`](docs/install.md). After installing, set the server URL and
+devbox token issued by the browser and run:
 
 ```text
 deepbox connect
 ```
 
-升级是显式操作：`deepbox upgrade`。只有安装/升级会刷新 `~/.deepbox/app`；
-`deepbox connect` 不下载、不重装，也不会触碰正在使用的安装目录。
+Upgrading is explicit: `deepbox upgrade`. Only install/upgrade refreshes
+`~/.deepbox/app`; `deepbox connect` never downloads, reinstalls, or touches the
+install directory in use.
 
-## LocalProject 与用户 Skills
+## LocalProjects and user skills
 
-在运行 connector 的机器上注册项目；绝对路径只保存在 connector-local `state.db`，Server 只收到稳定 ID、
-显示名和非敏感 runtime config。浏览器 Add-agent 的项目操作只生成可复制命令，不会浏览本机目录。
+Register projects on the machine running the connector. Absolute paths are stored
+only in the connector-local `state.db`; the server receives only a stable project ID
+and display name. The browser's project actions only
+generate copyable commands and never browse the host filesystem.
 
 ```text
 deepbox project add "C:\Code\my-project" --name "My project"
 deepbox project list
 ```
 
-Skill 是含 UTF-8 `SKILL.md` 的目录，目录名必须等于 YAML frontmatter 中 lower-kebab-case 的 `name`。
-默认安装到 personal scope；指定 `--project` 后安装到已注册项目 scope：
+A skill is a directory containing a UTF-8 `SKILL.md` whose directory name equals
+the lower-kebab-case `name` in the YAML frontmatter. Skills install to the
+personal scope by default; add `--project` to install into a registered project
+scope:
 
 ```text
 deepbox skill install "C:\Skills\review-pr"
@@ -75,48 +118,57 @@ deepbox skill inspect review-pr
 deepbox skill remove review-pr
 ```
 
-project scope 的 `list` / `inspect` / `remove` 同样追加 `--project "My project"`。Connector 会校验边界、
-拒绝 link/reparse/超限或读取中变化的 tree，把内容复制到 `<connector-state-root>/skills/store/<digest>/<name>/`
-及各 adapter family 声明的 skill roots；Deepbox 从不执行 skill 文件，Server 也只保存 path-free inventory。
-完整 schema、上限、scope 解析与 drift/`--force` 规则见 [`docs/install.md`](docs/install.md#local-projects-and-skills)。
+The project-scoped `list` / `inspect` / `remove` commands take the same
+`--project "My project"` argument. The connector validates boundaries; rejects
+symlink/reparse targets, over-limit trees, and trees that change during reads;
+copies content into `<connector-state-root>/skills/store/<digest>/<name>/` and
+into the skill roots each adapter family declares. deepbox never executes skill
+files, and the server stores only a path-free inventory. See
+[`docs/install.md`](docs/install.md#local-projects-and-skills) for the full
+schema, limits, scope resolution, and drift/`--force` rules.
 
 ## Structured chat controls
 
-live model discovery 不可用或没有返回 model ID 时，connector 会保留 adapter static catalog 作为
-`partial/adapter` fallback；UI 按 control choices → surface model facts → family model catalogue 回退，始终提供
-**Runtime default**，仅在 adapter 允许 custom model ID 时渲染可编辑 model combobox。当前 Claude Code catalog
-使用 CLI 的稳定别名 `sonnet|opus|haiku`；Copilot catalog 为 `claude-sonnet-5`、`claude-sonnet-4.6`、
-`claude-sonnet-4.5`、`claude-haiku-4.5`、`claude-opus-4.8`、`claude-opus-4.7`、
-`claude-opus-4.6`、`claude-opus-4.5`、`gpt-5.6-sol`，且仍允许输入 CLI 接受的 custom ID。
-**Runtime default** 不传 `--model`。Claude structured 的 model 是 per-turn control：后续 turn 会先向同一进程发送
-`set_model`，因此首轮后仍可在显式 model 间切换；
-协议不支持把已设置的 model 清空，回到 **Runtime default** 需 **New chat**。真正的 session-scoped controls
-才会在配置完成或出现首个 chat item 后锁定。**New chat** 终止当前 runtime session、
-创建空的 persisted session 并重新开放 controls，不删除旧历史。
-terminate 仍要求 operator role 和当前 keyboard lease。
+When live model discovery is unavailable or returns no model ID, the connector
+keeps the adapter's static catalog as a `partial/adapter` fallback. The UI falls
+back in order: control choices → surface model facts → family model catalog. It
+always offers **Runtime default**, and renders an editable model combobox only
+when the adapter allows custom model IDs. **Runtime default** sends no `--model`.
 
-## 快速开始（P0，mock agent 端到端）
+For Claude structured runtimes the model is a per-turn control: before a later
+turn the connector sends `set_model` to the same process, so you can still switch
+between explicit models after the first turn. The protocol cannot clear an
+already-set model, so returning to **Runtime default** requires **New chat**.
+True session-scoped controls (such as permission and reasoning) lock once the
+session is configured or the first chat item appears. **New chat** terminates the
+current runtime session, creates an empty persisted session, and reopens the
+controls without deleting prior history. Terminating a session still requires the
+operator role and the current keyboard lease.
+
+## Quick start (mock agent, end to end)
+
 ```bat
 cd C:\Code\deepbox
 py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
-:: connector 机器另装（含 Windows-only pywinpty）：
+:: On a connector machine, also install (includes Windows-only pywinpty):
 ::   .venv\Scripts\python -m pip install -r requirements-connector.txt
-:: 1) 启动本地开发 server（默认 127.0.0.1:8077）
+:: 1) Start the local dev server (defaults to 127.0.0.1:8077)
 .venv\Scripts\python -m server
-:: 2) 浏览器打开 http://localhost:8077，注册/登录，创建 Devbox 并复制一次性 token
-:: 3) 启动 connector（新终端）；它会探测并上报本机可用 runtime
+:: 2) Open http://localhost:8077, sign in, create a Devbox, copy its one-time token
+:: 3) Start the connector in a new terminal; it probes and reports local runtimes
 set DEEPBOX_SERVER_URL=http://localhost:8077
 set DEEPBOX_TOKEN=hpc_box_...
 .venv\Scripts\python -m connector
-:: 4) 回到 Fleet 添加 Agent，从下拉框选择 mock，再打开终端交互
-::    Agent 可直接删除；在线 connector 会立即同步新增和删除，无需重连
+:: 4) Back in Fleet, add an Agent, pick "mock" from the dropdown, then open it
+::    Agents can be deleted; an online connector syncs adds/removes without a reconnect
 ```
 
-## Web UI 快捷键
-- `Ctrl/Cmd + K` — 打开 command palette（筛选打开 agent、打开 history、创建
-  devbox、进入 owner）。
-- palette 内 `↑` / `↓` 移动选择，`Enter` 执行，`Esc` 关闭。
-- Fleet 搜索框实时过滤 devbox 与 agent。
-- 会话内 keyboard lease：`Request` / `Take keyboard` / `Release` / `Hand off`
-  （Viewer 永远只读）。
+## Web UI keyboard shortcuts
+
+- `Ctrl/Cmd + K` — Open the command palette (filter to open an agent, open
+  history, create a devbox, or go to owner).
+- Inside the palette, `↑` / `↓` move the selection, `Enter` runs it, `Esc` closes.
+- The Fleet search box filters devboxes and agents live.
+- Keyboard lease within a session: `Request` / `Take keyboard` / `Release` /
+  `Hand off` (a viewer is always read-only).

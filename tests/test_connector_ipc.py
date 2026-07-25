@@ -1,7 +1,6 @@
-"""Cut 4 unit tests: IPC framing and the LoopbackChannel seam."""
+"""Unit tests for IPC framing and the LoopbackChannel seam."""
 import asyncio
 import os
-import sys
 import tempfile
 import unittest
 from unittest import mock

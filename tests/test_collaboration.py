@@ -6,7 +6,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from server.app import collaboration as collab
-from server.app import models
 from server.app.models import (
     Base,
     KeyboardLease,
@@ -92,6 +91,12 @@ class KeyboardLeaseTests(unittest.TestCase):
     def setUp(self):
         self.db = _mkdb()
         self.t0 = dt.datetime(2024, 1, 1, 12, 0, 0)
+
+    def test_default_clock_is_naive_utc_for_sqlite(self):
+        value = collab._now(None)
+        utc_now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        self.assertIsNone(value.tzinfo)
+        self.assertLess(abs(utc_now - value), dt.timedelta(seconds=5))
 
     def test_expiration_compares_sqlite_naive_to_aware_utc(self):
         lease = KeyboardLease(

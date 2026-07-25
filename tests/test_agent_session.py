@@ -1,4 +1,4 @@
-"""Offline tests for the structured agent session (Cut 10).
+"""Offline tests for structured agent sessions.
 
 No real ``claude`` process and no token spend: we feed synthetic Claude
 ``stream-json`` transcripts through the pure translator and through a fake
@@ -6,8 +6,6 @@ subprocess to exercise :class:`connector.agent_session.StructuredAgentSession`.
 """
 import asyncio
 import json
-
-import pytest
 
 from connector import agent_session as A
 

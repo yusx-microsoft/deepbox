@@ -1,11 +1,11 @@
-"""deepbox connector - connects a devbox to the server and bridges each agent's
-interactive CLI (via PTY) to the platform.
+"""deepbox connector - connects a devbox to the server and bridges local
+agent runtimes through structured events or a terminal fallback.
 
-Cut 4 splits the connector into two halves:
+The connector has two halves:
 
-  - :class:`~connector.supervisor.SessionSupervisor` (``sessiond``) owns PTY
-    lifecycle. It never touches the network. Losing the transport does not kill
-    PTYs.
+  - :class:`~connector.supervisor.SessionSupervisor` (``sessiond``) owns local
+    session processes. It never touches the network. Losing the transport does
+    not kill active sessions.
   - :class:`~connector.transport.TransportSession` owns the WebSocket. It relays
     frames between the server and the supervisor over an IPC channel.
 
@@ -16,8 +16,8 @@ single-process API intact. The same seam also supports a real two-process split
 over a Unix socket / Windows named pipe:
 
   - ``--mode supervisor`` (a.k.a. ``sessiond``) runs a long-lived process that
-    owns the PTYs and serves the local IPC endpoint, accepting transport
-    reconnects. Restarting the transport never kills a PTY.
+    owns local sessions and serves the IPC endpoint, accepting transport
+    reconnects. Restarting the transport never kills an active session.
   - ``--mode transport`` runs a process that owns the HTTP/WS side and connects
     to the local supervisor. It can restart independently.
 
@@ -27,7 +27,7 @@ Run after one-time installation:
     set DEEPBOX_SERVER_URL=http://localhost:8077
     set DEEPBOX_TOKEN=hpc_box_...
     deepbox connect                         # all-in-one (default)
-    deepbox connect --mode supervisor       # long-lived PTY owner (sessiond)
+    deepbox connect --mode supervisor       # long-lived session owner (sessiond)
     deepbox connect --mode transport        # WS owner, reconnects to sessiond
 
 From a source checkout, ``python -m connector`` remains the equivalent developer
@@ -141,7 +141,7 @@ class Connector:
         return self.supervisor.pending_event
 
     async def send(self, frame: dict):
-        """Queue a frame without coupling PTY readers to WS availability."""
+        """Queue a frame without coupling session readers to WS availability."""
         self.supervisor.emit(frame)
 
     async def _sender(self, ws):
@@ -260,7 +260,7 @@ class Connector:
         print(f"[connector] opening WebSocket {ws_url(self.server_url)}")
 
         # New loopback channel per WS connection. Attaching/detaching the
-        # transport never disturbs the supervisor's PTYs (Cut 4 invariant).
+        # transport never disturbs the supervisor's local sessions.
         sup_end, tx_end = LoopbackChannel.pair()
         self.supervisor.attach(sup_end)
         drain = asyncio.create_task(self.supervisor.drain_to(sup_end))
@@ -310,11 +310,11 @@ class Connector:
 
 
 class SupervisorService:
-    """Long-lived ``sessiond``: owns PTYs and serves the local IPC endpoint.
+    """Long-lived ``sessiond``: owns agent sessions and serves local IPC.
 
-    Accepts one transport connection at a time. When a transport disconnects the
-    PTYs keep running and buffering; the next transport to connect drains the
-    buffer in order. Only :meth:`shutdown` (process exit) kills PTYs.
+    A transport can attach, detach, or crash without stopping local sessions.
+    During detachment, sessions keep running and buffering; the next transport
+    drains the buffer in order. Only :meth:`shutdown` stops local sessions.
     """
 
     def __init__(self, agents: dict[str, dict] | None = None,
@@ -457,11 +457,12 @@ async def run_supervisor(server_url: str, token: str,
 
 async def run_transport(server_url: str, token: str,
                         endpoint: str | None = None) -> None:
-    """Run a standalone transport that connects to a local sessiond.
+    """Short-lived WebSocket transport process.
 
-    Owns the HTTP/WS side and reconnects to both the server and the supervisor
-    without ever killing PTYs. Restarting this process leaves sessiond's PTYs
-    untouched.
+    It authenticates to the already-running sessiond over local IPC, relays
+    frames to and from the server, then reconnects with exponential backoff
+    without stopping local sessions. Restarting this process leaves sessiond's
+    sessions untouched.
     """
     server_url = server_url.rstrip("/")
     address = endpoint or default_endpoint()
@@ -655,7 +656,7 @@ async def main(argv: list[str] | None = None):
     ap.add_argument("--mode", choices=["all-in-one", "supervisor", "transport"],
                     default=os.environ.get("DEEPBOX_MODE", "all-in-one"),
                     help="all-in-one (default): supervisor+transport in one process; "
-                         "supervisor: long-lived sessiond owning PTYs; "
+                         "supervisor: long-lived sessiond owning sessions; "
                          "transport: WS owner that reconnects to a local sessiond")
     ap.add_argument("--endpoint", default=os.environ.get("DEEPBOX_IPC_ENDPOINT"),
                     help="override the local IPC endpoint (advanced)")
@@ -697,7 +698,7 @@ async def main(argv: list[str] | None = None):
 
     mode_label = {
         "all-in-one": "all-in-one (supervisor+transport via loopback)",
-        "supervisor": "supervisor (sessiond; owns PTYs, serves IPC)",
+        "supervisor": "supervisor (sessiond; owns sessions, serves IPC)",
         "transport": "transport (owns WS; connects to sessiond)",
     }[args.mode]
 

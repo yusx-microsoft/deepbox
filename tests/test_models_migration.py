@@ -4,7 +4,6 @@ import os
 import sqlite3
 import tempfile
 import unittest
-import uuid
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError

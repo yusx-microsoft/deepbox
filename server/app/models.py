@@ -16,7 +16,7 @@ ROLE_OWNER = "owner"
 ROLE_MEMBER = "member"
 VALID_ROLES = {ROLE_OWNER, ROLE_MEMBER}
 
-# Collaboration membership roles (Cut 8), ordered least->most privileged.
+# Collaboration membership roles, ordered from least to most privileged.
 WS_ROLE_VIEWER = "viewer"
 WS_ROLE_OPERATOR = "operator"
 WS_ROLE_ADMIN = "admin"

@@ -7,13 +7,14 @@ logging. This module builds on :mod:`server.app.logging` conventions --
 one JSON object per line, structured ``extra=`` fields, never raise from
 logging -- and adds two audit-specific guarantees:
 
-* **Redaction.** Audit events routinely carry request metadata (headers,
-  bodies, query parameters). Those payloads frequently contain secrets.
-  :func:`audit_event` walks the supplied metadata recursively and replaces
-  the value of any field whose name looks like a secret (``password``,
-  ``token``, ``secret``, ``cookie``, ``authorization``, ``api_key``, ...)
-  with a fixed placeholder. Redaction is best-effort but defensive: it
-  matches on substrings so ``x-api-key`` and ``refreshToken`` are caught.
+* **Minimal request data and redaction.** Starlette request objects contribute
+  only method, path, and client IP; headers, cookies, query strings, and bodies
+  are never inspected. :func:`audit_event` also walks explicitly supplied
+  metadata recursively and replaces the value of any field whose name looks
+  like a secret (``password``, ``token``, ``secret``, ``cookie``,
+  ``authorization``, ``api_key``, ...) with a fixed placeholder. Redaction is
+  best-effort but defensive: it matches on substrings so ``x-api-key`` and
+  ``refreshToken`` are caught.
 
 * **Never throw into request handling.** Emitting an audit event must never
   break the operation being audited. Every public entry point swallows and
@@ -36,7 +37,9 @@ The canonical event shape is::
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
+
+from starlette.requests import Request
 
 from .logging import log_event
 
@@ -141,13 +144,42 @@ def _clean(value: Any) -> Any | None:
     return redacted
 
 
+def _request_metadata(request: Any) -> Mapping[str, Any] | None:
+    """Extract safe request metadata without reading headers or query strings."""
+
+    if request is None:
+        return None
+    if isinstance(request, Mapping) and not isinstance(request, Request):
+        return request
+
+    try:
+        details: dict[str, Any] = {}
+        method = getattr(request, "method", None)
+        if isinstance(method, str):
+            details["method"] = method
+
+        url = getattr(request, "url", None)
+        path = getattr(url, "path", None) if url is not None else None
+        if isinstance(path, str):
+            details["path"] = path
+
+        client = getattr(request, "client", None)
+        client_ip = getattr(client, "host", None) if client is not None else None
+        if isinstance(client_ip, str):
+            details["client_ip"] = client_ip
+
+        return details or {"type": type(request).__name__}
+    except Exception:
+        return {"type": type(request).__name__}
+
+
 def audit_event(
     event: str,
     *,
     actor: Any | None = None,
     target: Any | None = None,
     outcome: str | None = None,
-    request: Mapping[str, Any] | None = None,
+    request: Any = None,
     logger: logging.Logger | None = None,
     level: int = logging.INFO,
     **fields: Any,
@@ -166,9 +198,9 @@ def audit_event(
     outcome:
         Result of the action, e.g. ``"success"``, ``"failure"``, ``"denied"``.
     request:
-        Request metadata (method, path, headers, query, ...). Redacted
-        recursively, so ``Authorization`` headers and ``password`` bodies are
-        never written to the log.
+        A Starlette request or an explicit metadata mapping. Request objects
+        contribute only method, path, and client IP. Explicit mappings are
+        redacted recursively before logging.
     logger:
         Optional logger override (defaults to the dedicated audit logger).
     level:
@@ -184,7 +216,7 @@ def audit_event(
             "actor": _clean(actor),
             "target": _clean(target),
             "outcome": outcome,
-            "request": _clean(request),
+            "request": _clean(_request_metadata(request)),
         }
         for key, value in fields.items():
             payload[key] = _clean(value)
@@ -195,25 +227,3 @@ def audit_event(
             _LOGGER.exception("audit.emit_failed", extra={"event": event, "audit": True})
         except Exception:  # noqa: BLE001
             pass
-
-
-def redact_headers(headers: Iterable[tuple[str, Any]] | Mapping[str, Any]) -> dict[str, Any]:
-    """Convenience helper: redact an HTTP header collection into a plain dict.
-
-    Accepts either a mapping or an iterable of ``(name, value)`` pairs (as
-    exposed by many ASGI/WSGI frameworks). Never raises; returns ``{}`` on
-    unexpected input.
-    """
-
-    try:
-        if isinstance(headers, Mapping):
-            items = headers.items()
-        else:
-            items = headers
-        result: dict[str, Any] = {}
-        for name, value in items:
-            key = str(name)
-            result[key] = REDACTED if _is_secret_key(key) else value
-        return result
-    except Exception:  # noqa: BLE001
-        return {}

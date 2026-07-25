@@ -1,8 +1,8 @@
-"""Cut 8 collaboration: pure authorization / lease service.
+"""Workspace authorization and keyboard-lease operations.
 
-This module contains no HTTP or transport concerns. It operates on a
-SQLAlchemy ``Session`` passed in by the caller so it is trivially testable and
-reusable from the hub/router layers.
+This module has no HTTP or WebSocket dependencies. Each function accepts a
+SQLAlchemy ``Session``, keeping the rules testable and reusable by route and
+transport code.
 """
 from __future__ import annotations
 
@@ -45,7 +45,8 @@ class PermissionDenied(LeaseError):
 
 
 def _now(now: dt.datetime | None) -> dt.datetime:
-    return now if now is not None else dt.datetime.utcnow()
+    # SQLite DateTime columns store naive values, so generate naive UTC here.
+    return now if now is not None else dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
 
 def _utc_naive(value: dt.datetime) -> dt.datetime:

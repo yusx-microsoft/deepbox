@@ -1,164 +1,238 @@
-# 会话持久化设计（Session Persistence）— 平台的立身之本
+# Session Persistence
 
-> 本文档专门设计 deepbox 的**会话持久化 / 重连 / 回放**能力。
->
-> **为什么这一步决定成败**：用户在本地开终端用 agent，关掉窗口，一切归零。
-> 如果我们的平台只是"网页版终端"，那和本地没区别。**平台的全部价值在于：
-> 会话活在 devbox 上、被服务器忠实记录、随时随地无损重连、还能回放历史。**
-> 这份设计就是把这句话变成机制。
+This document describes how DeepBox keeps agent sessions alive across disconnects,
+how it records them for replay, and where every piece of state actually lives.
+It reflects the current implementation; see
+[`implementation.md`](implementation.md) for the wider architecture.
 
----
+## 1. What persistence buys us
 
-## 1. 本地 vs 平台：我们要兑现的 5 个差异
+A local terminal session dies with its window. DeepBox separates the session's
+*execution*, its *durable record*, and its *viewers* so that:
 
-| 能力 | 本地终端 | deepbox 平台（本设计交付） |
+- The agent process lives on the connector (the user's own machine) and keeps
+  running when the browser tab closes.
+- The server keeps a durable, replayable record of the session.
+- A browser can detach and re-attach — from another tab, device, or after a
+  network drop — and immediately see the current screen (terminal) or the
+  reconstructed timeline (structured chat).
+
+The design distinguishes two needs:
+
+1. **"What does the screen look like now?"** — needed on re-attach. Handled by a
+   headless terminal emulator (pyte) on the server that keeps the current screen
+   state and serializes a small redraw. Bounded by screen size, independent of
+   session length.
+2. **"What happened over the whole session?"** — needed for replay/audit.
+   Handled by durable recording rows in the server database, exportable as
+   asciicast v2 or as an events/checkpoints replay stream.
+
+## 2. Ownership: who stores what
+
+| State | Owner | Storage |
 |---|---|---|
-| **会话生命周期** | 绑定终端窗口，关了就没 | 会话活在 devbox 的 PTY 里，**独立于任何观看者** |
-| **断线恢复** | 网络抖动可能丢工作 | **零丢失重连**：自动重连 + 立即还原当前画面 |
-| **跨设备** | 不可能 | 关笔记本 → 手机/另一台机器打开，**同一个 live 会话** |
-| **历史** | 只有内存 scrollback，关了即失 | **完整 DVR 录制**，可回放、审计、（未来）搜索 |
-| **协作** | 单人 | **多观看者**同时看同一 live 会话（天然支持） |
+| Live agent process (PTY or structured CLI) | Connector | In-memory / OS process |
+| Un-acknowledged output frames | Connector | Local SQLite spool (`connector/spool.py`) |
+| Input dedup receipts | Connector | Same spool (`input_receipts` table) |
+| Local project metadata, skills | Connector | Local SQLite state DB (`connector/local_store.py`) |
+| Users, workspaces, devboxes, agents, sessions | Server | Server SQLite (`server/app/models.py`) |
+| Durable recording frames + checkpoints | Server | Server SQLite (`recording_frame`, `recording_checkpoint`) |
+| Current terminal screen / structured tail | Server | In-memory live registry (rebuilt from durable rows) |
 
----
+Model intelligence and API keys never leave the connector machine. The server
+stores terminal bytes / canonical event JSON and non-secret metadata only; it
+never holds model credentials.
 
-## 2. 核心难点：终端是"屏幕"不是"日志"
+## 3. Connector-side persistence
 
-终端输出流里混着光标移动、清屏、颜色、以及 **alt-screen**（Claude/vim 这类全屏 TUI
-会切到备用屏并不断重绘）。因此：
+### 3.1 Durable output spool (`connector/spool.py`)
 
-- ❌ **不能**"从会话开始重播所有字节"——长会话里 99% 是 TUI 的中间重绘帧，又慢又大。
-- ✅ 必须区分两个需求，用两种机制：
-  1. **"现在屏幕长什么样"**（重连时要立刻看到）→ 用**服务端无头终端模拟器**维护当前屏幕状态，
-     序列化成一小段"重绘字节"发过去。**有界**（只和屏幕尺寸有关），对 TUI 完美。
-  2. **"这个会话从头到尾发生了什么"**（回放/审计）→ 用 server SQLite 中的 Protocol v3
-     **durable `RecordingFrame`** 记录；API 可导出 asciicast v2，也可返回 events + checkpoints 做随机 seek。
+Output frames are made durable *before* they are sent. `DiskSpool` uses the
+standard-library `sqlite3` module in WAL mode with `synchronous=FULL`, so a
+committed row survives power loss. Three tables:
 
----
+- **`outbox`** — one row per emitted output/event frame that has not yet been
+  acknowledged. The per-`(session_id, pty_instance_id)` sequence number (`seq`)
+  is assigned inside the same `BEGIN IMMEDIATE` transaction that inserts the row,
+  as `max(last_acked_seq, max(existing outbox seq)) + 1`. It is always positive,
+  monotonic per stream, and never reused across ACK or restart. A separate
+  autoincrementing `ord` column records global insertion order so pending frames
+  replay in exactly the order emitted, even across interleaved sessions.
+- **`ack_state`** — the high-water `last_acked_seq` per
+  `(session_id, pty_instance_id)`. ACK is strict, contiguous FIFO: only the
+  current smallest pending seq — which must equal `last_acked_seq + 1` — can
+  advance. Any stale, future, or unknown seq is rejected without mutating state.
+- **`input_receipts`** — deduplication ledger for inbound `client_input_id`
+  values so a given input is applied at most once, even across a restart.
 
-## 3. 三层架构：Local Agent / Recorder / Viewer 解耦
+Frames are serialized as canonical compact JSON with the assigned `seq` injected
+before serialization, so the persisted payload is exactly what is emitted.
 
-本地 session 的活进程始终在 connector：它可以是 `PtySession`，也可以是
-`StructuredAgentSession`。Server 的 `LiveSession`/durable recording 负责可靠接收、持久化和广播；
-多个浏览器只负责渲染，可随时 attach/detach。
+**Isolation and secrecy.** `spool_namespace()` derives a deterministic, opaque
+directory/file identity from the canonicalized server URL plus a SHA-256 of the
+token. The raw token is never written. Different URLs or tokens map to different
+databases; equivalent URLs canonicalize to the same one.
 
-**三条铁律：**
+**Ownership.** Exactly one live process may own a spool. A sibling lock file is
+acquired non-blocking (`fcntl` on POSIX, `msvcrt` on Windows); a second opener
+raises `SpoolInUseError`.
 
-1. **本地 agent process 是 live execution 的唯一源头**：住在 connector，不随浏览器关闭；只在
-   connector/session supervisor 退出或用户显式 terminate 时结束。
-2. **Server 是 opaque 持久化与广播层**：`kind: output` 的 terminal bytes 进入 pyte screen；
-   `kind: event` 的 canonical JSON 保持 opaque。两者都先 durable commit 再 ACK/广播。
-3. **Viewer 可随意来去**：terminal attach 收 screen restore；structured attach 收 bounded event JSONL
-   restore。之后两者都继续接 live frame。
+**Failure handling.** A file that is not a valid SQLite database raises
+`SpoolCorruptionError` rather than being silently reset (fail-closed).
 
----
+The disk spool is only opened in real CLI mode via `open_spool(server_url,
+token)`. A plain `SessionSupervisor(...)` / `Connector(...)` constructed in tests
+or as a library defaults to an in-memory spool and never creates user files.
 
-## 4. 生命周期语义：detach != terminate
+### 3.2 Local project and skill state (`connector/local_store.py`)
 
-| 动作 | 触发 | 对本地 agent process 的影响 | 用途 |
-|---|---|---|---|
-| **attach** | 浏览器打开会话 | 幂等确保 PTY/structured session 存在 | 开始观看 |
-| **detach** | 浏览器关闭/离开 | **无**，本地 process 继续活 | 换 tab/设备或暂时离开 |
-| **terminate** | 用户显式结束 | 结束 CLI process | 真正关闭会话 |
-| connector/supervisor 退出 | devbox 重启等 | 托管 process 消失，会话离线/结束 | 当前进程边界 |
+`LocalProjectStore` uses a connector-state SQLite database (`state.db`). The
+state root is `%LOCALAPPDATA%/deepbox` on Windows and
+`${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The DB is opened
+with WAL, `synchronous=NORMAL`, and a 5-second `busy_timeout`; cross-process
+mutations are serialized with a sibling `.lock` file, and on Unix the directory
+and DB are created `0700`/`0600` where possible.
 
-会话状态仍是 `starting -> live -> (detach/attach 任意多次) -> ended`。
+- `local_project(id, name, path, created_at, updated_at)` — project paths are
+  canonicalized and de-duplicated locally. Only `{id, name}` (plus a legacy
+  migration mapping) is reported to the server; **paths never leave the
+  connector.**
+- `local_skill` — records local source/store/binding paths. Skill content lives
+  only on the connector; the server keeps at most a sanitized inventory and
+  never receives paths.
 
----
+## 4. Server-side persistence (`server/app/`)
 
-## 5. Server 端：LiveSession、Recorder 与两种 restore
+### 4.1 Schema and engine (`models.py`)
 
-每个 `session_id` 对应内存 `LiveSession`，持久事实源是 SQLite `RecordingFrame`。connector frame
-先按 `(session_id, pty_instance_id, seq)` durable commit，Server 才发送 ACK；相同 seq + payload hash
-可安全 re-ACK，不同 payload fail closed。
+SQLAlchemy Core models cover users, organizations, workspaces/memberships,
+workspace invitations, devboxes, agents, sessions, participants, keyboard
+leases, recording frames/checkpoints, structured messages, tasks, and path-free
+local-project metadata.
 
-- **Terminal restore**：`kind: output` 更新 pyte；attach 时 `serialize_screen()` 返回清屏、SGR 重绘和
-  光标定位 bytes。Server 重启后从 durable output 重建 screen。
-- **Structured restore**：`kind: event` 不进入 pyte。`LiveRegistry.event_restore()` 从 durable rows
-  反向选择最新的、最多 4 MiB 的完整 JSON-object event，恢复原顺序后组成 JSONL；浏览器把该有界 replay
-  window 当作权威快照，先 reset state 再逐行 fold 进 canonical reducer。坏 durable row 被隔离，不影响后续有效事件。
-- **可靠续传**：connector 本地 spool 精确补发 Server 尚未 ACK 的 seq；transport 重连不结束已托管
-  process。`pty_instance_id` 在 structured path 中是沿用的协议 identity，不表示存在真实 PTY。
+For SQLite URLs, `init_db()` registers a per-connection PRAGMA listener setting
+`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`,
+and `wal_autocheckpoint=1000`. On a networked disk (for example Azure App
+Service `/home`), the SQLite default (`journal_mode=DELETE` +
+`synchronous=FULL`) forces multiple fsync round-trips per commit; WAL collapses
+each commit into a single sequential append and defers sync to checkpoint. This
+remains crash-safe: under WAL + `NORMAL` only the last few committed
+transactions may be lost on power loss, and those frames are re-sent from the
+connector's durable spool on reconnect, so nothing is permanently lost.
+`tests/test_db_pragmas.py` asserts the PRAGMAs actually take effect.
 
-DVR API 继续从 durable rows 导出 recording/replay；terminal checkpoint/seek 只消费 `kind: output`。
-Retention/secure erase 对两种 frame payload 使用同一策略。
+### 4.2 Recording model (`recording.py`)
 
-### 5.1 Cut 8 workspace 与协作状态
+Durable recording lives in two tables:
 
-- `organization(id, name, is_personal, owner_user_id, created_at)`：workspace 的组织容器；personal organization
-  通过 owner 关联用户。
-- `workspace(id, org_id, name, is_personal, created_at)` 与
-  `membership(id, workspace_id, user_id, role, created_at)`：Membership 对 `(workspace_id,user_id)` 唯一，角色为
-  `viewer/operator/admin/owner`。Devbox 与 Session 各增加 nullable `workspace_id`；nullable 只用于无损迁移窗口，
-  登录后的 workspace bootstrap 会把旧 Devbox 和其 Session 回填到 owner 的 personal workspace。
-- `session_participant(id, session_id, user_id, role, joined_at, last_seen_at)`：对 `(session_id,user_id)` 唯一，
-  attach 时 upsert，用于展示参与者；WebSocket 是否在线仍以进程内 Hub 为准。
-- `keyboard_lease(session_id, holder_user_id, acquired_at, expires_at, version)`：每个 Session 至多一行。
-  acquire/renew/release/handoff 在事务中检查 workspace role、TTL 和 version；过期行可被下一位 controller 原子接管。
-  这是短期协作控制状态，不进入 recording 内容，也不改变 Server 不持有模型凭证的边界。
+- **`recording_frame(session_id, pty_instance_id, seq, kind, data, payload_hash,
+  elapsed, timestamp, redacted_at, ...)`** — one row per output/event frame.
+  `kind="output"` carries terminal bytes; `kind="event"` carries a canonical
+  event JSON object. The `(session_id, pty_instance_id, seq)` identity plus
+  `payload_hash` is the Protocol v3 dedup ledger.
+- **`recording_checkpoint`** — periodic full terminal-screen snapshots that bound
+  how much output must be replayed to seek to a point in time.
 
-`_migrate()` 仅做 additive nullable columns/new tables，并调用幂等 personal workspace backfill；不重写
-recording ledger 或 connector spool。SQLite 文件备份因此同时包含 workspace 元数据和 lease 状态。
+Persistence is split into a pure in-memory `classify_output()` (reads the ledger
+and returns NEW / DUPLICATE / GAP / CONFLICT / INVALID, building an uncommitted
+`RecordingFrame` for NEW) and a durable `commit_new()` (`db.add` + `db.commit`,
+which is the ACK boundary). This lets the server broadcast a NEW frame to
+browsers before the disk commit completes, then commit and only then ACK the
+connector.
 
----
+Structured re-attach uses `LiveRegistry.event_restore()`, which selects the most
+recent complete `kind="event"` rows up to 4 MiB, reconstructs original order into
+JSONL, and hands the browser a bounded, authoritative replay window. A corrupt
+row is isolated and does not swallow later valid events.
 
-## 6. 帧协议（browser attach + connector protocol v3）
+### 4.3 Migrations (`_migrate()`)
 
-浏览器 -> Server：
-- `attach {session_id}`（原 `open`）
-- `input {session_id, data, options?, client_input_id}`；`options` 对 Server opaque
-- `resize {session_id, cols, rows}`
-- `detach {session_id}`（原 `close`，不结束本地 process）
-- `terminate {session_id}`（显式结束；要求有效 keyboard holder）
-- `keyboard_acquire / keyboard_renew / keyboard_release / keyboard_handoff`
+Migrations are additive only. `_migrate()` runs idempotent `ALTER TABLE ... ADD
+COLUMN` statements for new nullable columns, separately creates tables/unique
+indexes that SQLite cannot add via `ALTER`, and calls `_backfill_workspaces()` to
+give existing users a personal workspace, backfill `Devbox.workspace_id` /
+`Session.workspace_id`, and guarantee an owner membership. Nullable
+`workspace_id` columns exist only to make that backfill lossless. Migrations
+never rewrite the recording ledger or the connector spool. Two example columns
+added this way: `session.retention` and `recording_frame.redacted_at`.
 
-Server -> 浏览器：
-- `restore {session_id, data}`：terminal screen bytes
-- `restore {session_id, kind: "event", data}`：structured canonical-event JSONL tail
-- `output {session_id, kind, data}`：live `output` bytes 或一个 `event`
-- `status` / `exit` / `collaboration` / `keyboard_request`
+## 5. Delivery guarantees (end to end)
 
-Server <-> connector：
-- `open`：幂等确保本地 PTY/structured session 存在
-- `output {session_id, pty_instance_id, seq, kind, data}`：durable commit 后 `ack`
-- gap -> `resend {expected_seq}`；旧 `pty_instance_id` -> `fence`；相同 seq/hash -> duplicate re-ACK；
-  不同 payload -> fail closed
-- `input {client_input_id, data, options?}`：connector 去重并返回 `input_ack`
-- `resize` / `terminate`；detach 不下发给 connector
+Output moves through three durability points, each strictly ordered:
 
----
+1. **Spool first, then send.** The supervisor commits a frame to the connector
+   spool before it can be sent.
+2. **Persist, then ACK.** The server durably commits (`commit_new`) before it
+   ACKs the connector. Live broadcast to browsers happens before the disk commit,
+   so on-screen echo never waits on a network-disk fsync, but the ACK itself
+   means "server has persisted".
+3. **ACK, then drop.** The connector removes a spooled frame only after a precise
+   `seq` ACK for that stream.
 
-## 7. 浏览器端：自动重连与 surface-aware restore
+Recovery cases:
 
-- WS 断开后指数退避重连并自动 attach。
-- Structured agent 在任何 output 到达前就根据 capability 进入 native chat，避免 tab 切回时停留在
-  terminal 的 “resumed live session”；event restore 与 live event 走同一个 reducer。
-- Terminal agent 继续使用 pyte screen restore、有限 scrollback 和 xterm live bytes。
-- 打开 agent 时优先复用 connector 仍存活的最新 live session，不静默新建重复 session。
-- Server 离线期间的两类 output 都由 connector spool 在重连后补发；ended session 仍可查看最终状态/DVR。
+- **Duplicate ACK** — same `(session_id, pty_instance_id, seq)` and identical
+  payload is an idempotent re-ACK; nothing is rewritten.
+- **Gap** — a missing seq yields `resend(expected_seq)`; no ACK is advanced.
+- **Fork (fence, not error)** — a matching triple with a conflicting payload
+  (CONFLICT), or a seq below the persisted frontier with no matching row
+  (INVALID "below persisted frontier"), maps to a recoverable `fence`. The
+  connector clears that stream's outstanding rows and continues from the newer
+  local session instance; it does not tear down the transport.
+- **Genuine error** — only truly malformed frames or writes targeting a devbox
+  the connection does not own remain terminal errors. The server enforces
+  devbox/agent ownership; a connection cannot write another machine's history.
 
----
+Because each hop is durable and idempotent, a transport crash before ACK, a
+WebSocket drop after persist but before ACK, or a full machine restart all leave
+the spool rows in place; on reconnect they replay by `ord` and the server
+de-duplicates precisely.
 
-## 8. 有界性与成本
+## 6. Retention and secure erase
 
-- **terminal restore 有界**：只和屏幕尺寸有关（~几十 KB），与会话时长无关。
-- **structured restore 有界**：只返回最多 4 MiB 的完整 canonical-event JSONL tail。
-- **pyte 内存有界**：只用于 terminal 的屏幕 + 有限 scrollback。
-- **durable recording**：SQLite rows 随时长线性增长，且位于 ACK 路径以提供 delivery 语义；
-  默认 30d retention，也可选 none/7d/permanent。清理 payload 不删除 dedup identity row。
-- checkpoint interval 有界 seek 重放量；checkpoint 含完整屏幕，因此 retention 清理同步删除相关 checkpoint。
-- Owner 可调用 `DELETE /api/sessions/{id}/recording` 执行 secure erase：每个 durable frame
-  保留 `(session_id, pty_instance_id, seq)`、kind、原 `payload_hash` 与时间戳以维持 Protocol v3
-  dedup/hash 账本，但 `data` 被固定 redaction marker 替换并写入 `redacted_at`；所有 checkpoint
-  被物理删除。操作幂等，非 owner/跨租户目标返回 opaque 404。
+Retention is per session (`session.retention`), one of `none | 7d | 30d |
+permanent` (default `30d`). Enforcement lives in `RecordingStore`:
 
----
+- `redact_expired()` walks each session and, for frames older than the policy
+  window (`none` = redact immediately; `permanent` = never), blanks `data` to a
+  fixed placeholder and stamps `redacted_at`. The seq/hash **identity row is
+  preserved**, so a duplicate ACK after data loss can still be safely re-ACKed.
+  Checkpoints capturing now-redacted content are deleted.
+- `set_retention()` updates the policy and immediately runs `redact_expired()`.
+  Under `none`, subsequent output is redacted eagerly as it is persisted.
+- Secure erase (`DELETE /api/sessions/{id}/recording`, workspace admin/owner)
+  blanks every frame payload for a session and stamps `redacted_at`, keeping the
+  identity ledger, and deletes checkpoints. It is idempotent (a second call
+  redacts nothing new), and unauthorized / cross-workspace targets get an opaque
+  404.
 
-## 9. 验收标准（这一步做没做好，就看这几条）
+Redacted payloads never leak: replay/export queries exclude redacted rows unless
+an internal `include_redacted` flag is set.
 
-1. Structured agent 切到其他 tab 再回来 → 立即回到 native chat，durable timeline 恢复后继续 live，
-   不停在 “resumed live session”。
-2. Terminal agent 关闭 tab 再打开 → 立刻看到此前完整 screen，并可继续对话。
-3. 拔网/刷新或 connector abnormal close → 自动重连，已 ACK output 不重复、未 ACK output 从 spool 补发。
-4. 两个浏览器窗口同开一个会话 → 一个窗口输入，另一个实时看到；keyboard lease 仍只有一个 holder。
-5. 结束会话后仍可读最终 recording/DVR；retention 与 secure erase 同时适用于 output/event frame。
-6. 全程 Server 不运行模型、不持有 key、不解释 runtime options，只做规则、记录与广播。
+## 7. Backup and restore (`server/ops/backup.py`)
+
+The server database can be backed up and restored with a small operator tool:
+
+- **Backup** uses SQLite's online backup API for a consistent snapshot even under
+  concurrent writes, runs `PRAGMA integrity_check`, and removes the copy if the
+  check fails. Files are written as `deepbox-backup-<timestamp>.db`.
+- **Restore** validates the backup (SQLite header + integrity check), refuses to
+  overwrite a database that appears to be in use unless `--force` is given,
+  preserves the current database as a `.pre-restore` sidecar, and atomically
+  swaps the new file into place with `os.replace`.
+
+The connector spool and local state DB are per-machine and are not part of the
+server backup. Retained spool rows replay after reconnect; back up `state.db`
+separately if local project and skill configuration must survive machine loss.
+
+## 8. Bounds and limitations
+
+- Terminal re-attach cost is bounded by screen size (tens of KB), not session
+  length; structured re-attach returns at most 4 MiB of the latest events.
+- pyte memory is bounded (current screen plus limited scrollback).
+- Durable recording rows grow linearly with session length and sit on the ACK
+  path to provide delivery semantics; retention keeps this bounded over time.
+- The live registry and keyboard-lease coordination assume one server process;
+  horizontal scale-out is not supported today.
+- New password hashes use Argon2id. Legacy salted-SHA-256 hashes remain readable
+  only so a successful sign-in can replace them with Argon2id.

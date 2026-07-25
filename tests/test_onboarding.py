@@ -1,4 +1,4 @@
-"""Route-level tests for P1 Cut 1: bootstrap, roles, invitations, lifecycle.
+"""Route-level tests for bootstrap, roles, invitations, and lifecycle.
 
 All tests run against an isolated file-backed SQLite DB and the FastAPI
 TestClient. They never touch live Azure or user resources.

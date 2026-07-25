@@ -1,4 +1,4 @@
-"""Unit tests for the connector runtime adapter registry (planning.md Cut 7).
+"""Unit tests for the connector runtime adapter registry.
 
 These tests are connector-only and require no real CLI to be installed.
 """

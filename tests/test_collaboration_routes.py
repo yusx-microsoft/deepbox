@@ -1,8 +1,7 @@
-"""Route-level coverage for Cut 8 workspaces and collaboration authorization."""
+"""Route-level coverage for workspaces and collaboration authorization."""
 import importlib
 import os
 import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
