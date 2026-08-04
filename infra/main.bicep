@@ -8,6 +8,11 @@
 // Secrets are NEVER hardcoded here. DEEPBOX_SECRET is passed as a secure
 // parameter (generate at deploy time or source from Key Vault) and stored as
 // an app setting. Nothing in this file is committed with a real secret value.
+//
+// Inbound access is restricted to Microsoft corporate network service tags.
+// The site is not reachable from the public internet: the default action is
+// Deny and SCM/Kudu inherits the same rules. This satisfies the corp-tenant
+// "no internet-exposed web apps" requirement enforced by Azure Policy.
 
 @description('Globally-unique web app name (also the default *.azurewebsites.net host).')
 param webAppName string
@@ -37,7 +42,29 @@ param dataDir string = '/home/deepbox'
 @description('Source Git commit embedded in this deployment for build provenance.')
 param gitCommit string = 'unknown'
 
+@description('Service tags allowed to reach the site. Public internet is always denied.')
+param allowedServiceTags array = [
+  'CorpNetPublic'
+  'CorpNetSAW'
+]
+
 var linuxFxVersion = 'PYTHON|3.12'
+
+// One Allow rule per approved service tag, then an explicit catch-all Deny.
+var ipRules = [for (tag, i) in allowedServiceTags: {
+  ipAddress: tag
+  action: 'Allow'
+  tag: 'ServiceTag'
+  priority: 100 + (i * 10)
+  name: 'Allow-${tag}'
+}]
+
+var denyAllRule = {
+  ipAddress: 'Any'
+  action: 'Deny'
+  priority: 2147483647
+  name: 'Deny-all'
+}
 
 resource plan 'Microsoft.Web/serverfarms@2023-12-01' = {
   name: appServicePlanName
@@ -69,6 +96,11 @@ resource site 'Microsoft.Web/sites@2023-12-01' = {
       webSocketsEnabled: true
       numberOfWorkers: 1
       healthCheckPath: '/api/ready'
+      publicNetworkAccess: 'Enabled'
+      ipSecurityRestrictions: concat(ipRules, [denyAllRule])
+      ipSecurityRestrictionsDefaultAction: 'Deny'
+      scmIpSecurityRestrictionsUseMain: true
+      scmIpSecurityRestrictionsDefaultAction: 'Deny'
       // Oryx build during zip deploy installs the root requirements.txt.
       appCommandLine: 'bash $(ls -t /tmp/*/azure-startup.sh | head -n 1)'
       appSettings: [
