@@ -141,6 +141,30 @@ class LegacyBackfillTests(unittest.TestCase):
         conn.commit()
         conn.close()
 
+    def test_session_surface_migration_is_nullable_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "legacy.db")
+            self._legacy_db(path)
+            engine = models.init_db(f"sqlite:///{path}")
+            with models.SessionLocal() as db:
+                sess = db.get(models.Session, "s1")
+                self.assertIsNone(sess.surface)
+                sess.surface = "terminal"
+                db.commit()
+            models._migrate(engine)
+            models._migrate(engine)
+            with models.SessionLocal() as db:
+                self.assertEqual(db.get(models.Session, "s1").surface, "terminal")
+            conn = sqlite3.connect(path)
+            try:
+                surface = [row for row in conn.execute("PRAGMA table_info(session)")
+                           if row[1] == "surface"]
+                self.assertEqual(len(surface), 1)
+                self.assertEqual(surface[0][3], 0)  # nullable; no legacy backfill guess
+            finally:
+                conn.close()
+            engine.dispose()
+
     def test_backfill(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "legacy.db")

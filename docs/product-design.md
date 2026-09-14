@@ -109,12 +109,12 @@ User / Workspace
   ID, non-secret runtime config, and host devbox. Absolute paths, skill contents, model
   credentials, and CLI login state remain on the connector.
 - **Session** — durable context around an agent-process lifetime. Its database row stores
-  the agent, owner/workspace, title, retention policy, and creation time. APIs add computed
+  the agent, owner/workspace, surface, title, retention policy, and creation time. APIs add computed
   live and recording metadata. The process lives on the connector; a viewer leaving does not
   end it.
 - **Viewer** — a browser attached to a session. Viewers attach and detach freely, do not
-  own session lifecycle, and can be many at once. Only the viewer holding the keyboard lease
-  may send input.
+  own session lifecycle, and can be many at once. Terminal input needs the keyboard
+  lease. Structured messages need Operator/Admin/Owner, independently of that lease.
 
 ---
 
@@ -137,13 +137,14 @@ connector may retain the process and replay spooled output after reconnect.
 | Action | Semantics |
 |---|---|
 | New session / New chat | Create a durable session and start a fresh local process on attach |
-| Open agent | Resume the newest `live` session; create one when none is live |
+| Open agent | Resume a live session matching the chosen surface; create one when none matches |
 | Detach | Close this viewer only; keep the local process running |
-| Terminate | Kill the process; requires operator role and the keyboard lease |
+| Terminate | Explicitly kill the process; requires the keyboard holder or workspace Admin/Owner |
 | Replay | Read a durable recording without starting a process |
 
-A WebSocket close is not process death. Multiple viewers may attach, but only the active
-keyboard-lease holder can send input or terminate the process.
+A WebSocket close is not process death. Multiple viewers may attach. A terminal has
+one active keyboard holder; a structured chat can accept messages from every Operator
+or above. Read-only Viewer grants never gain input access.
 
 ---
 
@@ -161,8 +162,8 @@ opens a native chat before the first frame instead of scraping ANSI text.
 - **Legacy / TUI runtimes** fall back to `xterm.js` rendering raw PTY bytes, with resize,
   reconnect, and replay behavior unchanged.
 
-The browser chooses the chat or terminal surface solely from the reported
-`features.structured` capability.
+The browser uses the session's explicit `surface` and generic reported capabilities,
+not runtime names. Choosing **Terminal** never reuses a Chat or unknown-surface session.
 
 ### 5.2 Structured chat controls
 
@@ -176,9 +177,13 @@ The browser chooses the chat or terminal surface solely from the reported
 - For runtimes where the model is a per-turn control (e.g. Claude), later turns can switch
   models; the protocol cannot clear an already-set model. Returning to **Runtime default**
   requires **New chat**.
-- **New chat** terminates the current runtime session, creates a fresh persisted session, and
-  reopens the controls without deleting prior history.
-- Terminating a session still requires operator role and the current keyboard lease.
+- **New chat** creates a fresh persisted session and reopens the controls without
+  terminating a session other collaborators may still use or deleting prior history.
+- Operator/Admin/Owner may send chat messages without acquiring the terminal keyboard.
+  Viewer remains read-only. New invitation forms explicitly select Operator; the API
+  default is still Viewer, and existing Viewer grants are never automatically promoted.
+- **End session** is a separate confirmed action. The keyboard holder or an Admin/Owner
+  can terminate the runtime; shared chat access alone does not grant termination rights.
 
 ### 5.3 Terminal experience (fallback)
 
@@ -300,14 +305,16 @@ raw token or the full connector command.
 ## 8. Workspaces, collaboration, and permissions
 
 - Resources are scoped by workspace; every user has a personal workspace and may create more.
-- Four roles constrain all resources: `viewer` (read-only), `operator` (can drive and
-  terminate sessions), `admin`, and `owner`.
+- Four roles constrain all resources: `viewer` (read-only), `operator` (can chat and
+  drive a terminal while holding its keyboard), `admin`, and `owner`.
 - Workspace owners/admins issue single-use, expiring, email-bound invitation links. The
   deployment owner separately manages local-account invitations, disabling, and re-enabling.
-- Multiple viewers may watch a session, but only one holds the **keyboard lease**. Others can
+- Multiple viewers may watch a terminal, but only one holds the **keyboard lease**. Others can
   request control; the current holder can hand it off; the lease releases automatically on
   timeout or disconnect. Lease actions: `Request` / `Take keyboard` / `Release` / `Hand off`
   (viewers remain read-only).
+- Structured conversations do not acquire or renew a keyboard lease. Operator/Admin/Owner
+  can send messages and permission replies without taking control from another collaborator.
 
 ---
 

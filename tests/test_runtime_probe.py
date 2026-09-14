@@ -33,6 +33,29 @@ def _adapter(**overrides):
     return runtimes.RuntimeAdapter(**values)
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("2.1.42 (Claude Code)", "2.1.42"),
+    ("Test CLI v2.4 token=do-not-publish", "2.4"),
+    ("token=do-not-publish", None),
+    ("C:/private/path/cli-2.1.42", None),
+    ("warning: local credentials unavailable\n2.1.42", None),
+])
+def test_probe_version_only_publishes_a_version_not_raw_cli_output(raw, expected):
+    assert runtime_probe._safe_version(raw) == expected
+
+
+def test_probe_output_is_bounded_before_it_is_loaded_into_memory(monkeypatch):
+    def run(argv, *, stdout, **kwargs):
+        assert stdout is not runtime_probe.subprocess.PIPE
+        stdout.write(b"x" * (128 * 1024))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runtime_probe.subprocess, "run", run)
+    result = runtime_probe.run_probe(("fake-cli", "--version"), 1)
+    assert result.returncode == 0
+    assert len(result.stdout) == 64 * 1024
+
+
 def test_revision_ignores_probe_timestamps_but_tracks_capability_changes():
     first = _with_revision({
         "id": "test-cli",
@@ -128,7 +151,7 @@ def test_probe_discovers_models_and_normalizes_auth_and_version(monkeypatch):
     capability = probe_family("test-cli", runner=runner)
 
     assert capability["installation"]["status"] == "installed"
-    assert capability["installation"]["version"] == "Test CLI 2.4"
+    assert capability["installation"]["version"] == "2.4"
     assert capability["compatibility"]["status"] == "compatible"
     assert capability["authentication"]["status"] == "authenticated"
     assert capability["models"]["status"] == "complete"

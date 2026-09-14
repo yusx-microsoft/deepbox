@@ -198,9 +198,9 @@ def test_resolve_cmd_defaults_preserved():
     assert resolve_cmd("claude-code", None) == ["claude"]
 
 
-def test_resolve_cmd_unknown_runtime_falls_back_to_mock():
-    assert resolve_cmd("bogus", None) == [
-        sys.executable, "-u", "-m", "connector.mockcli"]
+def test_resolve_cmd_unknown_runtime_raises_instead_of_launching_mock():
+    with pytest.raises(runtimes.UnknownRuntimeError):
+        resolve_cmd("bogus", None)
 
 
 def test_resolve_cmd_explicit_launch_cmd_wins_and_is_validated():
@@ -208,6 +208,11 @@ def test_resolve_cmd_explicit_launch_cmd_wins_and_is_validated():
         "claude", "--model", "opus"]
     with pytest.raises(runtimes.InvalidCommandError):
         resolve_cmd("claude-code", "claude; rm -rf /")
+    # Explicit, validated overrides do not require a registered runtime id.
+    assert resolve_cmd("custom-runtime", "native-agent --safe") == [
+        "native-agent", "--safe"]
+    with pytest.raises(runtimes.InvalidCommandError):
+        resolve_cmd("custom-runtime", "native-agent | other")
 
 
 def test_resolve_cmd_passes_model_and_permission():

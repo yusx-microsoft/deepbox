@@ -43,7 +43,7 @@ import os
 import httpx
 import websockets
 
-from .diagnostics import explain_connection_error, run_doctor
+from .diagnostics import checked_server_url, explain_connection_error, run_doctor
 from .ipc import (
     AuthError,
     LoopbackChannel,
@@ -54,7 +54,6 @@ from .ipc import (
     read_secret,
     serve_channel,
 )
-from .pty_session import DEFAULT_CMDS
 from .local_store import LocalProject, LocalProjectStore, open_local_store
 from .runtime_probe import RuntimeProbeCache
 from .runtimes import all_adapters
@@ -66,26 +65,10 @@ from .skills import (
 from .supervisor import SessionSupervisor
 from .spool import open_spool
 from .transport import (
-    HEARTBEAT_INTERVAL,
     PROTOCOL_VERSION,
     TransportSession,
-    heartbeat_loop,
     ws_url,
 )
-
-__all__ = [
-    "Connector",
-    "heartbeat_loop",
-    "ws_url",
-    "PROTOCOL_VERSION",
-    "HEARTBEAT_INTERVAL",
-    "SupervisorService",
-    "run_supervisor",
-    "run_transport",
-    "websocket_connect_options",
-    "main",
-]
-
 
 def websocket_connect_options() -> dict:
     """Keep both connector transports on the same conservative WS policy."""
@@ -108,7 +91,7 @@ class Connector:
 
     def __init__(self, server_url: str, token: str, spool=None,
                  local_store: LocalProjectStore | None = None):
-        self.server_url = server_url.rstrip("/")
+        self.server_url = checked_server_url(server_url)
         self.token = token
         self.local_store = local_store
         self.supervisor = SessionSupervisor(
@@ -117,68 +100,6 @@ class Connector:
         self.connect_count = 0
         self.last_heartbeat_ack = None
         self.runtime_probe_cache = RuntimeProbeCache()
-
-    # -- compatibility shims (used by tests and older call sites) ---------
-
-    @property
-    def agents(self) -> dict[str, dict]:
-        return self.supervisor.agents
-
-    @agents.setter
-    def agents(self, value: dict[str, dict]) -> None:
-        self.supervisor.replace_agents(value)
-
-    @property
-    def ptys(self):
-        return self.supervisor.ptys
-
-    @property
-    def pending(self):
-        return self.supervisor.pending
-
-    @property
-    def pending_event(self):
-        return self.supervisor.pending_event
-
-    async def send(self, frame: dict):
-        """Queue a frame without coupling session readers to WS availability."""
-        self.supervisor.emit(frame)
-
-    async def _sender(self, ws):
-        """Drain buffered frames straight to a websocket (legacy test seam).
-
-        Control frames retain their send-boundary ACK. Protocol-v3 output cannot
-        be released by this sender-only compatibility seam because it has no
-        websocket receive path; runtime connections use ``TransportSession``.
-        """
-        while True:
-            records = self.supervisor._spool.pending_records()
-            if self.supervisor._controls:
-                delivery_id, frame = self.supervisor._controls[0]
-            elif records:
-                delivery_id, frame = records[0]
-            else:
-                self.pending_event.clear()
-                if (self.supervisor._controls or
-                        self.supervisor._spool.pending_records()):
-                    continue
-                await self.pending_event.wait()
-                continue
-            await ws.send(json.dumps(frame))
-            if frame.get("type") == "output":
-                # Only an exact server durability ACK may release this row.
-                await asyncio.Future()
-            if (self.supervisor._controls and
-                    self.supervisor._controls[0][0] == delivery_id):
-                self.supervisor._controls.popleft()
-
-    async def handle(self, raw: str):
-        await self.supervisor.handle_control(json.loads(raw))
-
-    async def open_pty(self, agent_id, session_id, cols=120, rows=30,
-                       surface=None):
-        await self.supervisor.open_pty(
-            agent_id, session_id, cols, rows, surface=surface)
 
     # -- HTTP bootstrap ----------------------------------------------------
 
@@ -442,7 +363,7 @@ async def run_supervisor(server_url: str, token: str,
             if cleanup_stale_endpoint(endpoint=address):
                 print(f"[sessiond] removed stale endpoint state for {address}")
         service = SupervisorService(
-            dict(bootstrap.agents), endpoint=address,
+            dict(bootstrap.supervisor.agents), endpoint=address,
             spool=open_spool(server_url, token), local_store=local_store)
         project_watcher = asyncio.create_task(
             _watch_project_inventory(bootstrap, me["devbox_id"]))
@@ -727,6 +648,10 @@ async def main(argv: list[str] | None = None):
 
     if not args.token:
         raise SystemExit("Set DEEPBOX_TOKEN or pass --token")
+    try:
+        args.server_url = checked_server_url(args.server_url)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
     if args.mode == "supervisor":
         await run_supervisor(

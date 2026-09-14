@@ -26,7 +26,9 @@ See [`docs/design.md`](docs/design.md) for the technical architecture.
 - `web/` — A single-page **structured-first switchboard**. For runtimes that
   support headless/JSON output it renders a native chat surface with
   capability-driven model and reasoning controls plus **New chat**; it falls back
-  to xterm.js only for legacy/TUI runtimes. The left navigation is organized as
+  to xterm.js for TUI runtimes. Explicit **Terminal** always opens/resumes a
+  terminal session, never an existing Chat; **New session** keeps that choice.
+  The left navigation is organized as
   Workspace → Devbox → Agent. Adding an agent refreshes the runtime/project
   inventory and lets you pick a LocalProject; the "add a local project" action
   only produces a copyable `deepbox project add ...` command and never browses the
@@ -41,11 +43,18 @@ See [`docs/design.md`](docs/design.md) for the technical architecture.
 - **Workspaces** — Every user gets a personal workspace and can create more. The
   left navigation groups resources as Workspace → Devbox → Agent, and the
   `viewer / operator / admin / owner` roles gate every resource under a workspace.
+- **Shared chat** — Operators, admins, and owners can send messages without
+  taking a keyboard lease. Viewers remain read-only. Interactive terminals retain
+  a single keyboard holder; this does not restrict structured conversations.
 - **Sign-in** — Local password sign-in is available for development and hybrid
   migration. In Azure, App Service Easy Auth can front tenant-scoped Microsoft
   Entra accounts; deepbox additionally checks a tenant allowlist.
 - **Invitations** — Workspace owners and admins issue single-use, expiring,
-  email-bound join links. The deployment owner separately manages local account
+  email-bound join links. The UI explicitly selects **Operator** (can send messages)
+  for new invitations; the API still defaults to Viewer. Existing Viewer members
+  are never promoted automatically—an owner/admin can change a colleague's role
+  in **Members & invitations**, then explicitly click **Save**.
+  The deployment owner separately manages local account
   invitations, disabling, and re-enabling.
 
 ## Security baseline
@@ -61,6 +70,8 @@ See [`docs/design.md`](docs/design.md) for how the durable recording pipeline
 
 ## Other documentation
 
+- [`docs/review.md`](docs/review.md) — Approved maintenance review:
+  fixes, simplifications, verification, and deliberate limitations.
 - [`docs/product-design.md`](docs/product-design.md) — Product positioning, users,
   object model, core flows, and design principles.
 - [`docs/planning.md`](docs/planning.md) — Current v1 implementation status,
@@ -140,10 +151,10 @@ turn the connector sends `set_model` to the same process, so you can still switc
 between explicit models after the first turn. The protocol cannot clear an
 already-set model, so returning to **Runtime default** requires **New chat**.
 True session-scoped controls (such as permission and reasoning) lock once the
-session is configured or the first chat item appears. **New chat** terminates the
-current runtime session, creates an empty persisted session, and reopens the
-controls without deleting prior history. Terminating a session still requires the
-operator role and the current keyboard lease.
+session is configured or the first chat item appears. **New chat** creates an
+empty persisted session and reopens the controls without stopping other viewers'
+session or deleting prior history. **End session** is a separate confirmed action
+for the keyboard holder or a workspace Admin/Owner.
 
 ## Quick start (mock agent, end to end)
 

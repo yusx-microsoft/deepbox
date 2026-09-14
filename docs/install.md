@@ -206,9 +206,28 @@ prompt. Explicit models can therefore be switched live; because the protocol can
 clear an applied model, returning to **Runtime default** requires **New chat**. True
 session-scoped controls remain editable until the session is configured
 or contains its first chat item. They then lock with a prompt to start **New chat**.
-That action sends the structured `terminate` frame, creates a blank persisted session,
-and re-enables those controls without deleting saved history. The server forwards
-termination only for an operator who holds the keyboard lease.
+That action creates a blank persisted session and re-enables those controls without
+stopping another collaborator's session or deleting saved history. **End session**
+is a separate confirmed action for the keyboard holder or a workspace Admin/Owner.
+
+### Terminal and shared-chat checks
+
+- Explicit **Terminal** never resumes a structured Chat. **New session** retains
+  that surface. If xterm assets could not load, the page shows an actionable error
+  before creating a session; rendering a Chat does not initialize xterm.
+- On Windows, use the installed CLI's direct argv or a correctly quoted explicit
+  command. PTY startup failures are surfaced instead of falling back to a fake
+  runtime. The connector also cleans up failed starts and exited PTYs.
+- Shared users need **Operator** or above to send chat messages. **Viewer** means
+  read-only, including existing invitations and memberships. An owner/admin must
+  explicitly change that role in **Members & invitations → role → Save**;
+  connecting again does not promote a Viewer. A failed Save leaves the old grant
+  unchanged and keeps the selected role available for retry.
+- Structured chat does not need a keyboard lease. Interactive terminals still
+  have a single keyboard holder, so another operator must request control first.
+- Connector server URLs require HTTPS outside loopback and cannot contain
+  credentials, a query string or a fragment. Diagnostics report safe error classes
+  rather than echoing raw exception text or credential-bearing URLs.
 
 ## Upgrade explicitly
 

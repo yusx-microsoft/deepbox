@@ -303,7 +303,7 @@ class RecordingStore:
         row._expected_seq = expected  # type: ignore[attr-defined]
         return PersistResult(NEW, frame=row)
 
-    def commit_new(self, db, row, _retried=False) -> PersistResult:
+    def commit_new(self, db, row) -> PersistResult:
         """Durably commit a NEW row produced by :meth:`classify_output`.
 
         This is the ACK boundary: the caller must only ACK the frame after

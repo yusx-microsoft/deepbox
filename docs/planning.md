@@ -32,8 +32,9 @@ validated, and the remaining known work. For deeper detail see
   many devboxes, one devbox hosts many agents.
 - Realtime hub (`hub.py`) and live registry that route human (browser) and devbox
   (connector) WebSocket connections and relay frames.
-- Multi-viewer broadcast with a single 60-second keyboard lease per session;
+- Multi-viewer broadcast with a single 60-second keyboard lease per terminal session;
   operator-and-above can request or hand off control, viewers stay read-only.
+  Structured chat uses Operator/Admin/Owner permission, not a keyboard lease.
 - Protocol v3 durable recording: `recording_frames` are committed before ACK with
   ownership, unique-key, and content-hash checks. DVR history exposes `/recording`
   and `/replay`, checkpoints use a durable `frame_id` cursor, and asciicast v2
@@ -119,11 +120,17 @@ validated, and the remaining known work. For deeper detail see
 - Structured state is preferred over parsing ANSI text to infer agent semantics.
   The raw terminal stream is retained only as a generic fallback.
 - Authorization is role-based across every shared resource; viewers are always
-  read-only and a session has at most one keyboard lease at a time.
+  read-only. A terminal has at most one keyboard lease at a time; structured chat
+  requires Operator/Admin/Owner without taking a lease.
 
 ---
 
 ## 3. Validation status
+
+The maintenance pass has passed user review and is approved for release. See
+[`review.md`](review.md) for changed behavior, regression evidence, and verification
+limits. Verify Azure rollout status and `/api/version` separately; a Git push or
+local test run does not imply a deployment or a live-machine upgrade.
 
 Automated coverage lives in `tests/` (server, connector, security, persistence,
 recording) and in the browser `*.test.js` node:test suites. It is organized into a

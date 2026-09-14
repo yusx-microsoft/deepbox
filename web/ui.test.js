@@ -266,12 +266,15 @@ test('terminal input sender forwards each xterm event synchronously', () => {
 
 test('terminal input sender survives lease transitions but closes with its socket', () => {
   const sent = [];
-  const sender = ui.createTerminalInputSender(sent.push.bind(sent));
+  let allowed = true;
+  const sender = ui.createTerminalInputSender(data=>allowed ? sent.push(data) : false);
   sender.push('before');
-  sender.discard();
+  allowed = false;
+  assert.equal(sender.push('not the holder'), false);
+  allowed = true;
   sender.push('after reacquire');
   sender.close();
-  sender.push('stale socket');
+  assert.equal(sender.push('stale socket'), false);
   assert.deepEqual(sent, ['before', 'after reacquire']);
 });
 
@@ -369,4 +372,31 @@ test('runtime inventory retains missing families for setup guidance', () => {
     compatibility: 'unknown', authentication: 'unknown',
     guidance: {command: 'install copilot'},
   }]);
+});
+
+test('runtime helpers accept the capability report object sent by the server', () => {
+  const capability = {runtime: 'claude-code', installed: true};
+  const report = {runtimes: [capability], projects: [], skills: []};
+  assert.deepEqual(ui.runtimeOptions(report), ['claude-code']);
+  assert.equal(ui.findRuntimeCapability(report, 'claude-code'), capability);
+  assert.equal(ui.runtimeInventory(report)[0].id, 'claude-code');
+});
+
+test('explicit Terminal never resumes a Chat session or an unknown legacy surface', () => {
+  const chat = {id: 'chat', state: 'live', surface: 'structured'};
+  const unknown = {id: 'legacy', state: 'live'};
+  const terminal = {id: 'terminal', state: 'live', surface: 'terminal'};
+  const sessions = [chat, unknown, terminal];
+  assert.equal(ui.resumableSession(sessions, 'terminal'), terminal);
+  assert.equal(ui.resumableSession(sessions, 'structured'), chat);
+  assert.equal(ui.resumableSession(sessions), chat);
+  assert.equal(ui.resumableSession([chat, unknown], 'terminal'), undefined);
+  assert.equal(ui.resumableSession([{...terminal, state: 'inactive'}], 'terminal'), undefined);
+  assert.equal(ui.resumableSession([{...terminal, state: 'ended'}], 'terminal'), undefined);
+});
+
+test('an explicit terminal capability never inherits structured controls', () => {
+  const capability = {features: {structured: true, controls: [{key: 'model'}]}};
+  assert.equal(ui.supportsStructuredChat(capability, 'terminal'), false);
+  assert.equal(ui.supportsStructuredChat(capability, 'structured'), true);
 });

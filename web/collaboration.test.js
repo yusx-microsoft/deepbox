@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {deriveCollaborationState, canSendInput, collabHeaderView} = require('./collaboration.js');
+const {deriveCollaborationState, canSendInput, canSendMessage, collabHeaderView} = require('./collaboration.js');
 
 function frame(role, keyboard, sessionId){
   return {type:'collaboration', session_id: sessionId || 's1', role, keyboard: keyboard || {}};
@@ -122,4 +122,23 @@ test('collabHeaderView reflects busy/free/viewer and never lets non-holders type
   assert.equal(collabHeaderView(viewer).cls, 'collab-viewer');
   assert.equal(collabHeaderView(viewer).button, null);
   assert.equal(collabHeaderView(viewer).canType, false);
+});
+
+test('chat collaborators can send messages without stealing the terminal keyboard', () => {
+  for(const role of ['operator', 'admin', 'owner']){
+    const state = deriveCollaborationState(
+      frame(role, {holder_user_id: 5, is_holder: false}), {id: 9});
+    assert.equal(canSendInput(state), false);
+    assert.equal(canSendMessage(state), true);
+    assert.deepEqual(collabHeaderView(state, null, 'structured'), {
+      cls: 'collab-holder', label: 'shared chat', button: null, canType: true,
+    });
+  }
+  for(const role of ['viewer', 'unknown']){
+    const state = deriveCollaborationState(frame(role, {is_holder: true}), {id: 9});
+    assert.equal(canSendInput(state), false);
+    assert.equal(canSendMessage(state), false);
+    assert.equal(collabHeaderView(state, null, 'structured').button, null);
+  }
+  assert.equal(canSendMessage(null), false);
 });

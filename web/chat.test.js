@@ -159,23 +159,6 @@ test('restore payload replaces live transcript instead of duplicating it', () =>
   ]);
 });
 
-test('single-flight gate coalesces a cold burst and resets after settlement', async () => {
-  const runOnce = C.createSingleFlight();
-  let release;
-  const blocked = new Promise(resolve => { release = resolve; });
-  let calls = 0;
-  const first = runOnce(async () => { calls += 1; await blocked; return 'mounted'; });
-  const second = runOnce(async () => { calls += 1; return 'duplicate'; });
-  assert.strictEqual(first, second);
-  await Promise.resolve();
-  assert.equal(calls, 1);
-  release();
-  assert.equal(await second, 'mounted');
-  assert.equal(await runOnce(async () => { calls += 1; return 'next'; }), 'next');
-  assert.equal(calls, 2);
-});
-
-
 test('capability v2 uses discovered models and permits an explicit custom model', () => {
   const controls = C.controlsFromCapability({
     schema_version: 2, models: {items: [{id: 'dynamic-model'}], allow_custom: true},

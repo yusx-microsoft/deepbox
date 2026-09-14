@@ -29,7 +29,6 @@ VENV="${ROOT}/venv"
 BIN="${ROOT}/bin"
 COMMAND="${BIN}/deepbox"
 LAUNCHER="${ROOT}/deepbox-connect.sh"  # legacy compatibility
-INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh"
 
 say "Installing into ${ROOT}"
 mkdir -p "${ROOT}"

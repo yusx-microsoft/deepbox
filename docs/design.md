@@ -268,7 +268,7 @@ frames and restore JSONL use the same reducer.
 | Direction | Frame | Meaning |
 |---|---|---|
 | Browser → Server → Connector | `input {data, options, client_input_id}` | PTY bytes or a structured turn; options are opaque to the server |
-| Browser → Server → Connector | `resize` / `terminate` | terminal resize, or explicit end of the local session; `terminate` is accepted only from an operator holding the keyboard lease |
+| Browser → Server → Connector | `resize` / `terminate` | terminal resize requires the keyboard lease; termination requires the holder or workspace Admin/Owner |
 | Server → Connector | `open` | idempotently ensure the local PTY/structured process exists |
 | Connector → Server | `output {seq, pty_instance_id, kind, data}` | `kind` is `output` or `event`; ACK after a durable commit |
 | Server → Browser | `restore {kind?, data}` | terminal screen bytes, or `kind:event` canonical-event JSONL |
@@ -288,14 +288,15 @@ and fail-closed handling of payload-hash conflicts.
   returns the latest durable event JSONL tail (up to 4 MiB), then streams live
   events. That tail is an authoritative snapshot of the current bounded replay
   window: the browser resets, then folds line by line, and a single bad line does
-  not break the later timeline. Lazy chat mount isolates old views by view epoch
-  and coalesces a cold-start event burst with single-flight.
+  not break the later timeline. Helpers load before the app, and chat mounts
+  synchronously. View and socket guards discard late results from old views.
 - The connector WebSocket uses a 30s open timeout, 20s ping, 60s pong tolerance, 5s
   close timeout, and a 16 MiB frame bound; after an abnormal disconnect the outer
   loop keeps backing off, reconnecting, and resuming the spool.
 - Genuine session-scoped controls such as permission and reasoning lock once the
-  session is configured or the first chat item appears. `New chat` sends
-  `terminate`, creates an empty persisted session, and reopens the controls; prior
+  session is configured or the first chat item appears. `New chat` creates an
+  empty persisted session and reopens the controls without terminating another
+  collaborator's conversation. `End session` is explicit and confirmed; prior
   history is not deleted.
 - The Claude structured model is turn-scoped; when the value changes the connector
   first sends a `set_model` `control_request` to the same process and waits for

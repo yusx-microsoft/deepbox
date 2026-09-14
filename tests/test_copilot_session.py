@@ -415,3 +415,125 @@ async def _co_attachment_cleanup_waits_for_readers_and_retries():
 
 def test_attachment_cleanup_waits_for_readers_and_retries():
     asyncio.run(_co_attachment_cleanup_waits_for_readers_and_retries())
+
+
+def test_concurrent_per_turn_messages_are_fifo_not_silently_dropped():
+    async def run():
+        got, prompts, procs = [], [], []
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def on_output(raw):
+            got.append(json.loads(raw))
+
+        async def spawn(prompt):
+            prompts.append(prompt)
+            proc = _FakeProc(_turn_transcript(prompt))
+            procs.append(proc)
+            if len(prompts) == 1:
+                entered.set()
+                await release.wait()
+            return proc
+
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, on_output, _noop,
+            spawn=spawn, translate=A.translate_copilot_event,
+            per_turn=True, prompt_argv=("-p",))
+        await sess.start()
+        assert sess.write_turn("first", {}) is True
+        await asyncio.wait_for(entered.wait(), 1)
+        assert sess.write("second") is True
+        assert sess.write_turn("third", {}) is True
+        assert prompts == ["first"]
+        release.set()
+        await asyncio.wait_for(sess._turn_task, 2)
+        assert prompts == ["first", "second", "third"]
+        assert [e["text"] for e in got if e["ev"] == A.EV_USER_ECHO] == prompts
+        assert sum(e["ev"] == A.EV_TURN_END for e in got) == 3
+        assert all(p.returncode == 0 for p in procs)
+        assert sess._proc is None and sess._turn_task is None
+        assert sess.is_alive()
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_per_turn_queue_is_bounded_and_overflow_emits_explicit_error(monkeypatch):
+    monkeypatch.setattr(A, "MAX_QUEUED_TURNS", 2)
+
+    async def run():
+        got, prompts = [], []
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def on_output(raw):
+            got.append(json.loads(raw))
+
+        async def spawn(prompt):
+            prompts.append(prompt)
+            entered.set()
+            await release.wait()
+            return _FakeProc(_turn_transcript(prompt))
+
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, on_output, _noop,
+            spawn=spawn, translate=A.translate_copilot_event,
+            per_turn=True, prompt_argv=("-p",))
+        await sess.start()
+        assert sess.write("active")
+        await asyncio.wait_for(entered.wait(), 1)
+        assert sess.write("queued one")
+        assert sess.write("queued two")
+        assert not sess.can_accept_turn()
+        assert sess.write("rejected") is False
+        await asyncio.wait_for(sess._queue_notice_task, 1)
+        errors = [e for e in got if e["ev"] == A.EV_ERROR]
+        assert len(errors) == 1 and errors[0]["code"] == "input.queue_full"
+        assert "resend" in errors[0]["message"]
+        release.set()
+        await asyncio.wait_for(sess._turn_task, 2)
+        assert prompts == ["active", "queued one", "queued two"]
+        assert not sess._turn_queue and sess.can_accept_turn()
+        assert not any(e.get("text") == "rejected" for e in got)
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_kill_discards_queued_turns_and_reaps_inflight_spawn():
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        prompts, waited = [], []
+        proc = _FakeProc([])
+
+        async def spawn(prompt):
+            prompts.append(prompt)
+            entered.set()
+            await release.wait()
+            return proc
+
+        async def wait():
+            waited.append(True)
+            return proc.returncode
+
+        proc.wait = wait
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, _noop, _noop,
+            spawn=spawn, per_turn=True, prompt_argv=("-p",))
+        await sess.start()
+        sess.write("first")
+        await asyncio.wait_for(entered.wait(), 1)
+        sess.write("must not spawn")
+        worker = sess._turn_task
+        sess.kill()
+        release.set()
+        await asyncio.wait_for(worker, 1)
+        assert prompts == ["first"]
+        assert proc.returncode == -9 and waited
+        assert not sess.is_alive() and sess._proc is None
+        assert sess._turn_task is None and not sess._turn_queue
+        assert not proc.stdin.buf
+
+    asyncio.run(run())
+
+
+async def _noop(_value):
+    pass

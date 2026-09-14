@@ -43,6 +43,12 @@ Model intelligence and API keys never leave the connector machine. The server
 stores terminal bytes / canonical event JSON and non-secret metadata only; it
 never holds model credentials.
 
+`sessions.surface` is an additive nullable column. New explicit choices are stored;
+validated ready/snapshot frames establish the resolved `terminal` or `structured`
+surface. Existing rows are not guessed from runtime names. Attaching or reconnecting
+does not silently switch a known surface, and the browser never reuses an unknown
+legacy session for an explicit Terminal choice.
+
 ## 3. Connector-side persistence
 
 ### 3.1 Durable output spool (`connector/spool.py`)
@@ -64,6 +70,11 @@ committed row survives power loss. Three tables:
   advance. Any stale, future, or unknown seq is rejected without mutating state.
 - **`input_receipts`** — deduplication ledger for inbound `client_input_id`
   values so a given input is applied at most once, even across a restart.
+
+Server-side pending input is recorded only after `input_ack(status="delivered")`.
+`status="rejected"` clears the pending input without recording it; an unknown status
+is not treated as delivery. The connector's `TransportSession` is the only sender
+path; the obsolete sender facade and its duplicate queue view have been removed.
 
 Frames are serialized as canonical compact JSON with the assigned `seq` injected
 before serialization, so the persisted payload is exactly what is emitted.

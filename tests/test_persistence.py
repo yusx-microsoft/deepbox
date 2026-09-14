@@ -5,13 +5,8 @@ import uuid
 
 import pyte
 
-from connector.client import Connector, heartbeat_loop
+from connector.transport import heartbeat_loop
 from server.app.live import LiveSession, serialize_screen
-
-
-class FailingWebSocket:
-    async def send(self, _data):
-        raise ConnectionError("server restarted")
 
 
 class RecordingWebSocket:
@@ -22,32 +17,7 @@ class RecordingWebSocket:
         self.frames.append(data)
 
 
-class ConnectorBufferTests(unittest.IsolatedAsyncioTestCase):
-    async def test_failed_ws_send_keeps_frame_for_next_connection(self):
-        connector = Connector("http://unused", "token")
-        frame = {"type": "output", "session_id": "s1",
-                 "pty_instance_id": "p1", "data": "important"}
-        await connector.send(frame)
-
-        with self.assertRaises(ConnectionError):
-            await connector._sender(FailingWebSocket())
-        pending = list(connector.pending)
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["data"], "important")
-        self.assertEqual(pending[0]["seq"], 1)
-
-        healthy = RecordingWebSocket()
-        task = asyncio.create_task(connector._sender(healthy))
-        for _ in range(20):
-            if healthy.frames:
-                break
-            await asyncio.sleep(0)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-
-        self.assertEqual(len(healthy.frames), 1)
-        self.assertEqual(len(connector.pending), 1)
-
+class HeartbeatTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_connection_emits_protocol_heartbeat(self):
         socket = RecordingWebSocket()
         task = asyncio.create_task(heartbeat_loop(socket, interval=0.001))
@@ -95,6 +65,12 @@ class ScreenRestoreTests(unittest.TestCase):
 
             self.assertTrue(live.acknowledge_input("input-1"))
             self.assertFalse(live.acknowledge_input("input-1"))
+            live.queue_input("rejected", "must not be recorded")
+            self.assertFalse(live.acknowledge_input("rejected", "received"))
+            self.assertIn("rejected", live.pending_inputs)
+            self.assertFalse(live.acknowledge_input("rejected", "rejected"))
+            self.assertNotIn("rejected", live.pending_inputs)
+            self.assertFalse(live.acknowledge_input("rejected", "delivered"))
             after = live.cast_path.read_text(encoding="utf-8")
             input_events = [
                 json.loads(line) for line in after.splitlines()[1:]

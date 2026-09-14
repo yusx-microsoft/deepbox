@@ -39,7 +39,7 @@ from .util import (
 from .hub import hub, DevboxConn, HumanConn
 from .config import settings
 from .live import live_registry
-from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, INVALID, output_ack_response
+from .recording import RecordingStore, NEW, DUPLICATE, GAP, CONFLICT, output_ack_response
 from .logging import configure_logging, log_event
 from .capacity import collect_capacity, transition_event
 from .audit import audit_event
@@ -1222,6 +1222,9 @@ def _devbox_role(s: OrmSession, user_id: str, d: Devbox,
 
 def _session_role(s: OrmSession, user_id: str, sess: Session,
                   minimum: str = WS_ROLE_VIEWER) -> str:
+    user = s.get(User, user_id, populate_existing=True) if isinstance(user_id, str) else None
+    if not user or user.disabled_at is not None:
+        raise HTTPException(403, "user is disabled or unavailable")
     if sess.workspace_id:
         return _require_workspace(s, user_id, sess.workspace_id, minimum)
     if sess.user_id == user_id:
@@ -1230,15 +1233,18 @@ def _session_role(s: OrmSession, user_id: str, sess: Session,
 
 
 def _lease_json(s: OrmSession, sess: Session, user_id: str, role: str) -> dict:
-    lease = get_keyboard_lease(s, sess.id)
+    required = sess.surface != "structured"
+    lease = get_keyboard_lease(s, sess.id) if required else None
     active = bool(lease and not lease_is_expired(lease, now()))
     holder = s.get(User, lease.holder_user_id) if active else None
     return {"type": "collaboration", "session_id": sess.id, "role": role,
-            "keyboard": {"holder_user_id": lease.holder_user_id if active else None,
+            "surface": sess.surface,
+            "keyboard": {"required": required,
+                         "holder_user_id": lease.holder_user_id if active else None,
                          "holder_username": holder.username if holder else None,
                          "expires_at": lease.expires_at.isoformat() if active else None,
                          "is_holder": bool(active and lease.holder_user_id == user_id),
-                         "can_request": can_control(role)}}
+                         "can_request": required and can_control(role)}}
 
 
 def _devbox_json(d: Devbox) -> dict:
@@ -1406,6 +1412,32 @@ async def delete_agent(agent_id: str, request: Request, s: OrmSession = Depends(
 
 
 # ---------------------------------------------------------------- sessions
+def _surface_hint(body: dict) -> str | None:
+    surface = body.get("surface")
+    if surface not in (None, "terminal", "structured"):
+        raise HTTPException(400, "surface must be terminal or structured")
+    return surface
+
+
+async def _session_body(request: Request) -> dict:
+    try:
+        body = await request.json() if await request.body() else {}
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, "expected a JSON object") from None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "expected a JSON object")
+    return body
+
+
+def _session_json(sess: Session) -> dict:
+    ls = live_registry.get(sess.id)
+    state = ("live" if hub.is_session_active(sess.agent_id, sess.id)
+             else "ended" if ls and ls.ended else "inactive")
+    return {"id": sess.id, "agent_id": sess.agent_id, "title": sess.title,
+            "surface": sess.surface, "created_at": sess.created_at.isoformat(),
+            "state": state}
+
+
 @app.get("/api/agents/{agent_id}/sessions")
 async def list_agent_sessions(agent_id: str, request: Request,
                               s: OrmSession = Depends(db)):
@@ -1419,16 +1451,7 @@ async def list_agent_sessions(agent_id: str, request: Request,
     rows = s.scalars(select(Session).where(
         Session.agent_id == agent_id
     ).order_by(Session.created_at.desc())).all()
-    result = []
-    for sess in rows:
-        ls = live_registry.get(sess.id)
-        state = ("live" if hub.is_session_active(agent_id, sess.id)
-                 else "ended" if ls and ls.ended else "inactive")
-        result.append({
-            "id": sess.id, "agent_id": sess.agent_id, "title": sess.title,
-            "created_at": sess.created_at.isoformat(), "state": state,
-        })
-    return result
+    return [_session_json(sess) for sess in rows]
 
 
 @app.post("/api/agents/{agent_id}/sessions")
@@ -1438,11 +1461,48 @@ async def create_session(agent_id: str, request: Request, s: OrmSession = Depend
     if not a:
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, a.devbox, WS_ROLE_OPERATOR)
+    surface = _surface_hint(await _session_body(request))
     sess = Session(id=new_id(), user_id=u.id, agent_id=a.id,
-                   workspace_id=a.devbox.workspace_id, title=f"{a.display_name} session")
+                   workspace_id=a.devbox.workspace_id, title=f"{a.display_name} session",
+                   surface=surface)
     s.add(sess)
     s.commit()
-    return {"id": sess.id, "agent_id": a.id, "title": sess.title}
+    return _session_json(sess)
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str, request: Request, s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess:
+        raise HTTPException(404, "not found")
+    _session_role(s, u.id, sess)
+    return _session_json(sess)
+
+
+def _require_terminal_keyboard(sess: Session) -> None:
+    if sess.surface == "structured":
+        raise HTTPException(400, "structured sessions do not use a keyboard lease")
+
+
+@app.post("/api/sessions/{session_id}/keyboard")
+async def session_keyboard(session_id: str, request: Request,
+                           s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess:
+        raise HTTPException(404, "not found")
+    role = _session_role(s, u.id, sess, WS_ROLE_OPERATOR)
+    _require_terminal_keyboard(sess)
+    body = await _session_body(request)
+    try:
+        _change_keyboard(s, sess, u.id, role, body.get("action", "acquire"),
+                         body.get("target_user_id"))
+    except (PermissionDenied, LeaseError) as exc:
+        s.rollback()
+        raise HTTPException(409 if isinstance(exc, LeaseConflict) else 403, str(exc)) from None
+    await _broadcast_collaboration(s, sess)
+    return _lease_json(s, sess, u.id, role)
 
 
 @app.get("/api/sessions/{session_id}/messages")
@@ -1773,6 +1833,35 @@ async def report_skills(devbox_id: str, request: Request,
 
 
 # ---------------------------------------------------------------- WS: devbox (connector)
+def _connector_session(s: OrmSession, conn: DevboxConn, frame: dict) -> Session:
+    """Authenticate the DB session→agent→devbox chain, never a claimed agent ID."""
+    sid = frame.get("session_id")
+    sess = s.get(Session, sid) if isinstance(sid, str) and sid else None
+    agent = s.get(Agent, sess.agent_id) if sess else None
+    if (not agent or agent.devbox_id != conn.devbox_id
+            or ("agent_id" in frame and frame["agent_id"] != sess.agent_id)):
+        raise HTTPException(403, "session is not owned by this connector")
+    return sess
+
+
+def _resolved_session_ready(s: OrmSession, conn: DevboxConn,
+                             sess: Session, frame: dict) -> dict:
+    """Apply authenticated generic surface facts; never infer from runtime names."""
+    surface = _surface_hint(frame)
+    if surface is not None:
+        sess.surface = surface
+    if sess.surface == "structured":
+        lease = get_keyboard_lease(s, sess.id)
+        if lease:
+            s.delete(lease)
+    conn.active_session_ids.add(sess.id)
+    instance = frame.get("pty_instance_id")
+    if isinstance(instance, str) and instance:
+        conn.session_instances[sess.id] = instance
+    return {**frame, "type": "session.ready", "agent_id": sess.agent_id,
+            "session_id": sess.id, "surface": sess.surface}
+
+
 @app.websocket("/ws/devbox")
 async def ws_devbox(ws: WebSocket):
     token = ws.headers.get("authorization", "")
@@ -1814,9 +1903,42 @@ async def ws_devbox(ws: WebSocket):
         # Reconcile from a fresh committed snapshot after every transport
         # connect, closing the fetch_me -> WebSocket mutation race.
         await _push_agent_directory(d.id)
+        token_id = tok.id
         while True:
-            frame = await ws.receive_json()
+            frame = await _receive_ws_object(ws, send_connector)
+            if not hub.is_current_devbox(conn):
+                break
+            if frame is None:
+                continue
+            s.rollback()
+            # Recheck revocation and disabled owners on long-lived connections.
+            tok = s.get(Token, token_id)
+            devbox = s.get(Devbox, conn.devbox_id)
+            owner = s.get(User, devbox.owner_user_id) if devbox else None
+            if (not tok or tok.revoked_at is not None or tok.devbox_id != conn.devbox_id
+                    or not owner or owner.disabled_at is not None):
+                await ws.close(code=4001)
+                break
             t = frame.get("type")
+            sid = frame.get("session_id")
+            sess = None
+            session_frame = t in ("output", "input_ack", "exit", "ready", "session.ready",
+                                  "runtime.unavailable", "runtime_unavailable")
+            session_frame = session_frame or (t == "presence" and "session_id" in frame)
+            session_frame = session_frame or (t == "process_snapshot" and "sessions" not in frame)
+            if session_frame:
+                try:
+                    sess = _connector_session(s, conn, frame)
+                except HTTPException:
+                    await send_connector({"type": "error", "code": "invalid_session",
+                                          "message": "session is not owned by this connector"})
+                    continue
+                instance = frame.get("pty_instance_id")
+                if (t not in ("output", "ready", "session.ready", "process_snapshot")
+                        and instance and conn.session_instances.get(sid, instance) != instance):
+                    await send_connector({"type": "error", "code": "stale_instance",
+                                          "message": "session instance is no longer current"})
+                    continue
             if t == "heartbeat":
                 # Liveness ping from the connector. Refresh last_seen and echo an
                 # ack so the connector can measure round-trip health.
@@ -1857,6 +1979,8 @@ async def ws_devbox(ws: WebSocket):
                         # used concurrently while this thread runs.
                         commit = await asyncio.to_thread(
                             recording_store.commit_new, s, pending_row)
+                        if not hub.is_current_devbox(conn):
+                            break
                         if commit.outcome == NEW:
                             await send_connector({
                                 "type": "ack", "session_id": sid,
@@ -1916,6 +2040,10 @@ async def ws_devbox(ws: WebSocket):
                 elif sid:
                     # Legacy (< v3) blind output path.
                     data = frame.get("data", "")
+                    if not isinstance(data, str):
+                        await send_connector({"type": "error", "code": "invalid_frame",
+                                              "message": "output data must be a string"})
+                        continue
                     ls = live_registry.get_or_create(sid)
                     ls.feed_output(data)          # update screen + DVR record
                     await hub.to_session_humans(sid, frame)  # live broadcast
@@ -1923,15 +2051,18 @@ async def ws_devbox(ws: WebSocket):
             elif t == "input_ack":
                 sid = frame.get("session_id")
                 client_input_id = frame.get("client_input_id")
-                sess = s.get(Session, sid) if sid else None
+                if not isinstance(client_input_id, str) or not isinstance(frame.get("status"), str):
+                    await send_connector({"type": "error", "code": "invalid_frame",
+                                          "message": "input acknowledgement requires string id and status"})
+                    continue
                 try:
                     client_input_id = str(UUID(str(client_input_id)))
                 except (TypeError, ValueError, AttributeError):
                     continue
-                if sess and sess.agent_id in conn.agent_ids:
+                if sess:
                     ls = live_registry.get(sid)
-                    if ls and frame.get("status") == "delivered":
-                        ls.acknowledge_input(client_input_id)
+                    if ls:
+                        ls.acknowledge_input(client_input_id, frame["status"])
                     frame["client_input_id"] = client_input_id
                     await hub.to_session_humans(sid, frame)
             elif t == "exit":
@@ -1942,24 +2073,33 @@ async def ws_devbox(ws: WebSocket):
                     if ls:
                         ls.mark_ended(frame.get("code"))
                     await hub.to_session_humans(sid, frame)
-            elif t in ("ready", "presence"):
-                sid = frame.get("session_id")
-                if sid:
-                    outbound = frame
-                    if t == "ready":
-                        conn.active_session_ids.add(sid)
-                        outbound = {
-                            **frame,
-                            "type": "session.ready",
-                            "surface": frame.get("surface", "terminal"),
-                        }
-                    await hub.to_session_humans(sid, outbound)
-                if t == "presence":
-                    a = s.get(Agent, frame.get("agent_id"))
-                    if a:
-                        a.presence = frame.get("state", "online")
-                        s.commit()
-            elif t == "runtime.unavailable":
+            elif t in ("ready", "session.ready", "process_snapshot") and "sessions" not in frame:
+                try:
+                    ready = _resolved_session_ready(s, conn, sess, frame)
+                except HTTPException as exc:
+                    await send_connector({"type": "error", "code": "invalid_surface",
+                                          "message": exc.detail})
+                    continue
+                s.commit()
+                await hub.to_session_humans(sess.id, ready)
+                await _broadcast_collaboration(s, sess)
+            elif t == "presence":
+                aid = sess.agent_id if sess else frame.get("agent_id")
+                agent = s.get(Agent, aid) if isinstance(aid, str) else None
+                if not agent or agent.devbox_id != conn.devbox_id:
+                    await send_connector({"type": "error", "code": "invalid_session",
+                                          "message": "agent is not owned by this connector"})
+                    continue
+                state = frame.get("state", "online")
+                if not isinstance(state, str):
+                    await send_connector({"type": "error", "code": "invalid_frame",
+                                          "message": "presence state must be a string"})
+                    continue
+                agent.presence = state
+                s.commit()
+                if sess:
+                    await hub.to_session_humans(sess.id, frame)
+            elif t in ("runtime.unavailable", "runtime_unavailable"):
                 sid = frame.get("session_id")
                 if sid:
                     await hub.to_session_humans(sid, {
@@ -1973,15 +2113,41 @@ async def ws_devbox(ws: WebSocket):
                         "authentication": frame.get("authentication"),
                         "available_surfaces": frame.get("available_surfaces"),
                     })
-            elif t == "sessions":
-                conn.active_session_ids = {
-                    item["session_id"] for item in frame.get("sessions", [])
-                    if item.get("agent_id") in conn.agent_ids and item.get("session_id")
-                }
+            elif t in ("sessions", "process_snapshot"):
+                items = frame.get("sessions")
+                if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                    await send_connector({"type": "error", "code": "invalid_frame",
+                                          "message": "sessions must be a list of objects"})
+                    continue
+                # Validate the entire snapshot before changing any live/DB state.
+                resolved = []
+                try:
+                    for item in items:
+                        sess = _connector_session(s, conn, item)
+                        if "agent_id" in frame and frame["agent_id"] != sess.agent_id:
+                            raise HTTPException(403, "session is not owned by this connector")
+                        _surface_hint(item)
+                        resolved.append((sess, item))
+                except HTTPException as exc:
+                    await send_connector({"type": "error",
+                                          "code": "invalid_surface" if exc.status_code == 400 else "invalid_session",
+                                          "message": exc.detail})
+                    continue
+                conn.active_session_ids.clear()
+                conn.session_instances.clear()
+                ready_frames = [(sess, _resolved_session_ready(s, conn, sess, item))
+                                for sess, item in resolved]
+                s.commit()
+                for sess, ready in ready_frames:
+                    await hub.to_session_humans(sess.id, ready)
+                    await _broadcast_collaboration(s, sess)
             elif t == "runtimes":
                 d2 = s.get(Devbox, d.id)
                 d2.capabilities = frame.get("capabilities")
                 s.commit()
+            else:
+                await send_connector({"type": "error", "code": "invalid_frame",
+                                      "message": "unknown command type"})
     except (WebSocketDisconnect, RuntimeError, OSError):
         pass
     finally:
@@ -1996,15 +2162,122 @@ async def ws_devbox(ws: WebSocket):
         s.close()
 
 
+async def _receive_ws_object(ws: WebSocket, send) -> dict | None:
+    """Reject malformed frames without echoing auth material or user payloads."""
+    try:
+        frame = await ws.receive_json()
+    except (ValueError, TypeError, KeyError):
+        frame = None
+    if not isinstance(frame, dict) or not isinstance(frame.get("type"), str):
+        await send({"type": "error", "code": "invalid_frame",
+                    "message": "expected a JSON object with a string type"})
+        return None
+    return frame
+
+
+def _attached_session(s: OrmSession, conn: HumanConn, frame: dict,
+                      minimum: str = WS_ROLE_OPERATOR) -> tuple[Session, str]:
+    sid = frame.get("session_id")
+    agent_id = conn.sessions.get(sid) if isinstance(sid, str) else None
+    sess = s.get(Session, sid) if agent_id else None
+    if (not sess or sess.agent_id != agent_id
+            or ("agent_id" in frame and frame["agent_id"] != agent_id)):
+        raise HTTPException(403, "session is not attached to this agent")
+    return sess, _session_role(s, conn.user_id, sess, minimum)
+
+
+def _change_keyboard(s: OrmSession, sess: Session, user_id: str, role: str,
+                     action: str, target_user_id: str | None = None) -> None:
+    """Shared REST/WS lease mutations; callers authorize the current operator."""
+    _require_terminal_keyboard(sess)
+    details = None
+    if action == "acquire":
+        acquire_keyboard_lease(s, sess.id, user_id, role)
+        event = "keyboard.acquired"
+        details = {"reason": "requested"}
+    elif action == "renew":
+        renew_keyboard_lease(s, sess.id, user_id)
+        event = None
+    elif action == "release":
+        event = "keyboard.released" if release_keyboard_lease(s, sess.id, user_id) else None
+    elif action == "handoff":
+        if not isinstance(target_user_id, str) or not target_user_id:
+            raise HTTPException(400, "target_user_id is required")
+        target_role = _session_role(s, target_user_id, sess, WS_ROLE_OPERATOR)
+        handoff_keyboard_lease(s, sess.id, user_id, target_user_id, target_role)
+        event = "keyboard.handed_off"
+        details = {"from_user_id": user_id, "to_user_id": target_user_id}
+    else:
+        raise HTTPException(400, "unknown keyboard action")
+    s.commit()
+    if event:
+        audit_event(event, actor_user_id=user_id, resource_type="session",
+                    resource_id=sess.id, details=details)
+
+
+async def _forward_session_command(s: OrmSession, conn: HumanConn, frame: dict) -> None:
+    """One authorization boundary for input/control, with surface-specific leases."""
+    ws = conn.ws
+    try:
+        sess, _ = _attached_session(s, conn, frame)
+    except HTTPException:
+        await ws.send_json({"type": "error", "code": "read_only",
+                            "message": "session control requires current operator access and attachment"})
+        return
+    sid, agent_id, kind = sess.id, sess.agent_id, frame["type"]
+    if sess.surface == "structured" and kind == "resize":
+        await ws.send_json({"type": "error", "code": "surface_not_supported",
+                            "message": "structured sessions do not use terminal resize"})
+        return
+    if sess.surface != "structured":
+        lease = get_keyboard_lease(s, sid)
+        if not lease or lease.holder_user_id != conn.user_id or lease_is_expired(lease, now()):
+            await ws.send_json({"type": "error", "code": "keyboard_lease_required",
+                                "message": "request keyboard control before sending input or control"})
+            await _broadcast_collaboration(s, sess)
+            return
+    outbound = {**frame, "agent_id": agent_id}
+    ls = live_registry.get(sid)
+    if kind in ("stdin", "input"):
+        try:
+            client_input_id = str(UUID(str(frame.get("client_input_id") or uuid4())))
+        except (TypeError, ValueError, AttributeError):
+            await ws.send_json({"type": "error", "message": "invalid client_input_id"})
+            return
+        data = frame.get("data", "")
+        if not isinstance(data, str):
+            await ws.send_json({"type": "error", "message": "invalid input data"})
+            return
+        if ls:
+            ls.queue_input(client_input_id, data)
+        outbound.update(client_input_id=client_input_id, data=data)
+    elif kind == "resize":
+        cols, rows = frame.get("cols", 120), frame.get("rows", 30)
+        if any(type(value) is not int or not 1 <= value <= 1000 for value in (cols, rows)):
+            await ws.send_json({"type": "error", "message": "invalid terminal dimensions"})
+            return
+        if ls:
+            ls.resize(cols, rows)
+        outbound.update(cols=cols, rows=rows)
+    elif kind == "terminate":
+        outbound = {"type": "terminate", "agent_id": agent_id, "session_id": sid}
+    await hub.to_devbox(agent_id, outbound)
+    if kind == "terminate":
+        audit_event("session.terminated", actor_user_id=conn.user_id,
+                    resource_type="session", resource_id=sid)
+
+
 async def _broadcast_collaboration(s: OrmSession, sess: Session) -> None:
     for watcher in list(hub.session_watchers.get(sess.id, set())):
-        role = get_role(s, sess.workspace_id, watcher.user_id) if sess.workspace_id else (
-            WS_ROLE_OWNER if sess.user_id == watcher.user_id else None)
-        if role:
-            try:
-                await watcher.ws.send_json(_lease_json(s, sess, watcher.user_id, role))
-            except Exception:
-                pass
+        try:
+            role = _session_role(s, watcher.user_id, sess)
+        except HTTPException:
+            hub.unwatch(watcher, sess.id)
+            continue
+        try:
+            await watcher.ws.send_json(_lease_json(s, sess, watcher.user_id, role))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- WS: human (terminal)
@@ -2038,16 +2311,47 @@ async def ws_term(ws: WebSocket):
     s = models.SessionLocal()
     try:
         while True:
-            frame = await ws.receive_json()
+            frame = await _receive_ws_object(ws, ws.send_json)
+            if frame is None:
+                continue
+            # A long-lived socket must re-read current user, membership and
+            # session rows rather than authorize from its identity-map cache.
+            s.rollback()
+            user = s.get(User, uid, populate_existing=True)
+            if not user or user.disabled_at is not None:
+                await ws.send_json({"type": "error", "code": "read_only",
+                                    "message": "user is disabled or unavailable"})
+                await ws.close(code=4001)
+                break
             t = frame.get("type")
             if t in ("attach", "open"):  # 'open' kept for back-compat
-                sess = s.get(Session, frame["session_id"])
+                sid = frame.get("session_id")
+                sess = s.get(Session, sid) if isinstance(sid, str) else None
                 try:
                     role = _session_role(s, uid, sess) if sess else None
                 except HTTPException:
                     role = None
                 if not sess or not role:
                     await ws.send_json({"type": "error", "message": "no such session"})
+                    continue
+                if "agent_id" in frame and frame["agent_id"] != sess.agent_id:
+                    await ws.send_json({"type": "error", "message": "session does not belong to agent"})
+                    continue
+                try:
+                    requested_surface = _surface_hint(frame)
+                except HTTPException as exc:
+                    await ws.send_json({"type": "error", "code": "invalid_surface",
+                                        "message": exc.detail})
+                    continue
+                if sess.surface and requested_surface and requested_surface != sess.surface:
+                    await ws.send_json({"type": "error", "code": "surface_mismatch",
+                                        "message": "requested surface does not match the stored session surface",
+                                        "surface": sess.surface})
+                    continue
+                surface = sess.surface or requested_surface
+                cols, rows = frame.get("cols", 120), frame.get("rows", 30)
+                if any(type(value) is not int or not 1 <= value <= 1000 for value in (cols, rows)):
+                    await ws.send_json({"type": "error", "message": "invalid terminal dimensions"})
                     continue
                 participant = s.scalar(select(SessionParticipant).where(
                     SessionParticipant.session_id == sess.id,
@@ -2059,23 +2363,15 @@ async def ws_term(ws: WebSocket):
                     s.add(SessionParticipant(id=new_id(), session_id=sess.id,
                                              user_id=uid, role=role))
                 lease = get_keyboard_lease(s, sess.id)
-                if can_control(role) and (not lease or lease_is_expired(lease, now())):
+                if (sess.surface != "structured" and can_control(role)
+                        and (not lease or lease_is_expired(lease, now()))):
                     acquire_keyboard_lease(s, sess.id, uid, role)
                     audit_event("keyboard.acquired", actor_user_id=uid,
                                 resource_type="session", resource_id=sess.id,
                                 details={"reason": "initial_attach"})
                 s.commit()
-                cols = frame.get("cols", 120)
-                rows = frame.get("rows", 30)
-                surface = frame.get("surface")
-                if surface not in (None, "structured", "terminal"):
-                    await ws.send_json({"type": "error",
-                                        "code": "invalid_surface",
-                                        "message": "invalid session surface"})
-                    continue
                 # ensure a LiveSession exists (rebuilds screen from .cast if server restarted)
                 ls = live_registry.get_or_create(sess.id, cols, rows)
-                ls.subscribers.add(conn)
                 hub.watch(conn, sess.id, sess.agent_id)
                 await _broadcast_collaboration(s, sess)
                 # 1) Restore terminal pixels or the structured event timeline.
@@ -2096,21 +2392,18 @@ async def ws_term(ws: WebSocket):
                     "session_id": sess.id, "cols": cols, "rows": rows,
                     "surface": surface})
                 await ws.send_json({"type": "status", "session_id": sess.id,
-                                    "state": "live" if ok else "offline"})
-            elif t == "keyboard_acquire":
+                                    "state": "live" if ok else "offline",
+                                    "surface": sess.surface})
+            elif t in ("keyboard_acquire", "keyboard_renew", "keyboard_release", "keyboard_handoff"):
                 sid = frame.get("session_id")
-                sess = s.get(Session, sid)
                 try:
-                    role = _session_role(s, uid, sess, WS_ROLE_OPERATOR) if sess else None
-                    acquire_keyboard_lease(s, sid, uid, role)
-                    s.commit()
-                    audit_event("keyboard.acquired", actor_user_id=uid,
-                                resource_type="session", resource_id=sid,
-                                details={"reason": "requested"})
+                    sess, role = _attached_session(s, conn, frame)
+                    _change_keyboard(s, sess, uid, role, t.removeprefix("keyboard_"),
+                                     frame.get("target_user_id"))
                     await _broadcast_collaboration(s, sess)
-                except (HTTPException, PermissionDenied, LeaseConflict) as exc:
+                except (HTTPException, PermissionDenied, LeaseError) as exc:
                     s.rollback()
-                    if isinstance(exc, LeaseConflict) and sess:
+                    if isinstance(exc, LeaseConflict):
                         requester = s.get(User, uid)
                         await hub.to_session_humans(sid, {
                             "type": "keyboard_request", "session_id": sid,
@@ -2119,129 +2412,23 @@ async def ws_term(ws: WebSocket):
                         })
                         audit_event("keyboard.requested", actor_user_id=uid,
                                     resource_type="session", resource_id=sid)
-                    await ws.send_json({"type": "error", "code": "keyboard_busy",
+                    code = "keyboard_busy" if t == "keyboard_acquire" else f"{t}_failed"
+                    if isinstance(exc, HTTPException) and exc.status_code == 400:
+                        code = "keyboard_not_supported"
+                    await ws.send_json({"type": "error", "code": code,
                                         "message": str(getattr(exc, "detail", exc))})
-            elif t == "keyboard_renew":
-                sid = frame.get("session_id", "")
-                sess = s.get(Session, sid)
-                try:
-                    if not sess:
-                        raise PermissionDenied("unknown session")
-                    _session_role(s, uid, sess, WS_ROLE_OPERATOR)
-                    renew_keyboard_lease(s, sid, uid)
-                    await _broadcast_collaboration(s, sess)
-                except (HTTPException, LeaseError, PermissionDenied) as exc:
-                    s.rollback()
-                    await ws.send_json({"type": "error", "code": "keyboard_renew_failed",
-                                        "message": str(getattr(exc, "detail", exc))})
-            elif t == "keyboard_release":
-                sid = frame.get("session_id")
-                sess = s.get(Session, sid)
-                released = release_keyboard_lease(s, sid, uid) if sess else False
-                s.commit()
-                if released:
-                    audit_event("keyboard.released", actor_user_id=uid,
-                                resource_type="session", resource_id=sid)
-                    await _broadcast_collaboration(s, sess)
-            elif t == "keyboard_handoff":
-                sid = frame.get("session_id")
-                target_user_id = frame.get("target_user_id")
-                sess = s.get(Session, sid)
-                try:
-                    if not sess:
-                        raise PermissionDenied("unknown session")
-                    target_role = _session_role(s, target_user_id, sess, WS_ROLE_OPERATOR)
-                    handoff_keyboard_lease(s, sid, uid, target_user_id, target_role)
-                    audit_event("keyboard.handed_off", actor_user_id=uid,
-                                resource_type="session", resource_id=sid,
-                                details={"from_user_id": uid, "to_user_id": target_user_id})
-                    await _broadcast_collaboration(s, sess)
-                except (HTTPException, LeaseError, PermissionDenied) as exc:
-                    s.rollback()
-                    await ws.send_json({"type": "error", "code": "keyboard_handoff_failed",
-                                        "message": str(getattr(exc, "detail", exc))})
-            elif t == "input":
-                sid = frame.get("session_id")
-                agent_id = conn.sessions.get(sid)
-                if agent_id:
-                    sess = s.get(Session, sid)
-                    try:
-                        role = _session_role(s, uid, sess, WS_ROLE_OPERATOR)
-                    except HTTPException:
-                        await ws.send_json({"type": "error", "code": "read_only",
-                                            "message": "viewer access is read-only"})
-                        continue
-                    lease = get_keyboard_lease(s, sid)
-                    if not lease or lease.holder_user_id != uid or lease_is_expired(lease, now()):
-                        await ws.send_json({"type": "error", "code": "keyboard_lease_required",
-                                            "message": "request keyboard control before typing"})
-                        if sess:
-                            await _broadcast_collaboration(s, sess)
-                        continue
-                    # Avoid a SQLite write/commit for every keystroke. The browser
-                    # renews independently every 20 seconds; the read above still
-                    # rejects expired or foreign leases before forwarding input.
-                    raw_input_id = frame.get("client_input_id") or str(uuid4())
-                    try:
-                        client_input_id = str(UUID(str(raw_input_id)))
-                    except (TypeError, ValueError, AttributeError):
-                        await ws.send_json({"type": "error", "message": "invalid client_input_id"})
-                        continue
-                    data = frame.get("data", "")
-                    if not isinstance(data, str):
-                        await ws.send_json({"type": "error", "message": "invalid input data"})
-                        continue
-                    ls = live_registry.get(sid)
-                    if ls:
-                        ls.queue_input(client_input_id, data)
-                    frame["agent_id"] = agent_id
-                    frame["client_input_id"] = client_input_id
-                    frame["data"] = data
-                    await hub.to_devbox(agent_id, frame)
-            elif t == "resize":
-                sid = frame.get("session_id")
-                agent_id = conn.sessions.get(sid)
-                if agent_id:
-                    lease = get_keyboard_lease(s, sid)
-                    if not lease or lease.holder_user_id != uid or lease_is_expired(lease, now()):
-                        continue
-                    ls = live_registry.get(sid)
-                    if ls:
-                        ls.resize(frame.get("cols", 120), frame.get("rows", 30))
-                    frame["agent_id"] = agent_id
-                    await hub.to_devbox(agent_id, frame)
+            elif t in ("stdin", "input", "permission", "interrupt", "resize", "terminate"):
+                await _forward_session_command(s, conn, frame)
             elif t in ("detach", "close"):  # viewer leaves; PTY keeps running
                 sid = frame.get("session_id")
-                ls = live_registry.get(sid)
-                if ls:
-                    ls.subscribers.discard(conn)
-                hub.unwatch(conn, sid)
-            elif t == "terminate":  # explicitly end the session (kill the CLI)
-                sid = frame.get("session_id")
-                agent_id = conn.sessions.get(sid)
-                if agent_id:
-                    sess = s.get(Session, sid)
-                    try:
-                        _session_role(s, uid, sess, WS_ROLE_OPERATOR)
-                    except HTTPException:
-                        await ws.send_json({"type": "error", "message": "terminate not allowed"})
-                        continue
-                    lease = get_keyboard_lease(s, sid)
-                    if not lease or lease.holder_user_id != uid or lease_is_expired(lease, now()):
-                        await ws.send_json({"type": "error", "code": "keyboard_lease_required",
-                                            "message": "keyboard holder controls termination"})
-                        continue
-                    await hub.to_devbox(agent_id, {
-                        "type": "terminate", "agent_id": agent_id, "session_id": sid})
-                    audit_event("session.terminated", actor_user_id=uid,
-                                resource_type="session", resource_id=sid)
+                if isinstance(sid, str):
+                    hub.unwatch(conn, sid)
+            else:
+                await ws.send_json({"type": "error", "code": "invalid_frame",
+                                    "message": "unknown command type"})
     except WebSocketDisconnect:
         pass
     finally:
-        for sid in list(conn.sessions):
-            ls = live_registry.get(sid)
-            if ls:
-                ls.subscribers.discard(conn)
         hub.remove_human(conn)
         s.close()
 

@@ -49,12 +49,16 @@ class FakePty:
 class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         FakePty.instances = []
-        self._orig = supervisor_mod.PtySession
-        supervisor_mod.PtySession = FakePty
-        supervisor_mod.resolve_cmd = lambda runtime, launch, **kw: ["fake"]
-
-    def tearDown(self):
-        supervisor_mod.PtySession = self._orig
+        for name, value in (("PtySession", FakePty),
+                            ("resolve_cmd", lambda runtime, launch, **kw: ["fake"]),
+                            ("probe_family", lambda *args, **kw: {})):
+            patcher = mock.patch.object(supervisor_mod, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        availability = mock.patch.object(
+            supervisor_mod, "availability", return_value=(True, None))
+        availability.start()
+        self.addCleanup(availability.stop)
 
     async def test_open_pty_emits_ready_and_output(self):
         sup = SessionSupervisor({"a": {"runtime": "mock"}})
@@ -608,6 +612,236 @@ class TwoProcessSplitTests(unittest.IsolatedAsyncioTestCase):
             service.stop()
             await asyncio.gather(serve_task, return_exceptions=True)
             service.supervisor.shutdown()
+
+
+class SupervisorStartupTests(unittest.IsolatedAsyncioTestCase):
+    """Every probe and child here is fake; waits expose real lifecycle races."""
+
+    def setUp(self):
+        FakePty.instances = []
+        for owner, name, value in (
+                (supervisor_mod, "PtySession", FakePty),
+                (supervisor_mod, "resolve_cmd", mock.Mock(return_value=["fake.exe"])),
+                (supervisor_mod, "probe_family", mock.Mock(return_value={})),
+                (supervisor_mod, "availability",
+                 mock.Mock(return_value=(True, None)))):
+            patcher = mock.patch.object(owner, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def supervisor(self):
+        sup = SessionSupervisor({"a": {"runtime": "mock"}})
+        self.addCleanup(sup.shutdown)
+        return sup
+
+    def assert_no_start_state(self, sup):
+        self.assertEqual(sup.ptys, {})
+        self.assertEqual(sup.pty_instances, {})
+        self.assertEqual(sup.pty_surfaces, {})
+        self.assertEqual(sup._open_locks, {})
+        self.assertEqual(sup._open_users, {})
+
+    async def test_probe_resolve_constructor_and_partial_start_fail_safely(self):
+        secret = r"SECRET=fake-token C:\private\workspace --private-argv"
+
+        class FailedStart(FakePty):
+            async def start(self):
+                raise RuntimeError(secret)
+
+        for stage in ("probe_family", "resolve_cmd", "PtySession", "start"):
+            with self.subTest(stage=stage):
+                sup = self.supervisor()
+                target = "PtySession" if stage == "start" else stage
+                replacement = (FailedStart if stage == "start" else
+                               mock.Mock(side_effect=RuntimeError(secret)))
+                with mock.patch.object(supervisor_mod, target, replacement):
+                    await sup.open_pty("a", "s", surface="terminal")
+                self.assert_no_start_state(sup)
+                errors = [f for f in sup.pending if f["type"] == "runtime.unavailable"]
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["code"], "spawn_failed")
+                self.assertIn("retry", errors[0]["message"])
+                self.assertNotIn(secret, str(sup.pending))
+                self.assertFalse(any(f["type"] in ("exit", "ready") for f in sup.pending))
+                if stage == "start":
+                    self.assertTrue(FakePty.instances[-1].killed)
+
+    async def test_unknown_runtime_is_visible_and_never_spawns_mock(self):
+        sup = self.supervisor()
+        sup.agents["a"]["runtime"] = "not-registered"
+        await sup.open_pty("a", "s")
+        self.assert_no_start_state(sup)
+        self.assertEqual(FakePty.instances, [])
+        self.assertEqual(sup.pending[-1]["type"], "runtime.unavailable")
+        self.assertEqual(sup.pending[-1]["code"], "surface_unavailable")
+        self.assertTrue(sup.pending[-1]["message"])
+
+    async def test_duplicate_open_is_serialized_across_probe_and_start(self):
+        sup = self.supervisor()
+        probe_entered, probe_release = asyncio.Event(), asyncio.Event()
+        start_entered, start_release = asyncio.Event(), asyncio.Event()
+
+        async def probe_thread(fn, *args, **kwargs):
+            probe_entered.set()
+            await probe_release.wait()
+            return fn(*args, **kwargs)
+
+        class SlowStart(FakePty):
+            async def start(self):
+                start_entered.set()
+                await start_release.wait()
+                await self.on_output("hello")
+
+        with mock.patch.object(supervisor_mod.asyncio, "to_thread", probe_thread), \
+                mock.patch.object(supervisor_mod, "PtySession", SlowStart):
+            first = asyncio.create_task(sup.open_pty("a", "s", surface="terminal"))
+            await asyncio.wait_for(probe_entered.wait(), 1)
+            second = asyncio.create_task(sup.open_pty("a", "s", surface="terminal"))
+            mismatch = asyncio.create_task(sup.open_pty("a", "s", surface="chat"))
+            probe_release.set()
+            await asyncio.wait_for(start_entered.wait(), 1)
+            self.assertEqual(len(FakePty.instances), 1)
+            self.assertEqual(sup.ptys, {})
+            start_release.set()
+            await asyncio.wait_for(asyncio.gather(first, second, mismatch), 1)
+        self.assertEqual(len(FakePty.instances), 1)
+        self.assertEqual(supervisor_mod.probe_family.call_count, 1)
+        ready = [f for f in sup.pending if f["type"] == "ready"]
+        snapshots = sup.sessions_frame()["sessions"]
+        self.assertEqual(len(ready), 2)
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(all(f["surface"] == "terminal" for f in ready + snapshots))
+        errors = [f for f in sup.pending if f["type"] == "runtime.unavailable"]
+        self.assertEqual([f["code"] for f in errors], ["surface_mismatch"])
+        self.assertFalse(sup._open_locks or sup._open_users)
+
+    async def test_retire_close_or_shutdown_during_probe_cannot_launch_late_child(self):
+        for action in ("retire", "close", "shutdown"):
+            with self.subTest(action=action):
+                sup = self.supervisor()
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def probe_thread(fn, *args, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    return fn(*args, **kwargs)
+
+                with mock.patch.object(supervisor_mod.asyncio, "to_thread", probe_thread):
+                    task = asyncio.create_task(sup.open_pty("a", "s"))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    if action == "retire":
+                        await sup.handle_control({"type": "agents", "agents": []})
+                        # A same-id re-add must not resurrect the obsolete start.
+                        await sup.handle_control({"type": "agents", "agents": [
+                            {"id": "a", "runtime": "mock"}]})
+                    elif action == "close":
+                        await sup.handle_control({"type": "close", "agent_id": "a", "session_id": "s"})
+                    else:
+                        sup.shutdown()
+                    release.set()
+                    await asyncio.wait_for(task, 1)
+                self.assert_no_start_state(sup)
+                self.assertEqual(FakePty.instances, [])
+
+    async def test_retire_or_shutdown_during_partial_start_kills_child(self):
+        for action in ("retire", "shutdown"):
+            with self.subTest(action=action):
+                sup = self.supervisor()
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                class SlowStart(FakePty):
+                    async def start(self):
+                        entered.set()
+                        await release.wait()
+                        await self.on_output("late output")
+
+                with mock.patch.object(supervisor_mod, "PtySession", SlowStart):
+                    task = asyncio.create_task(sup.open_pty("a", "s"))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    if action == "retire":
+                        await sup.handle_control({"type": "agents", "agents": []})
+                    else:
+                        sup.shutdown()
+                    with mock.patch.object(sup, "emit") as emit:
+                        release.set()
+                        await asyncio.wait_for(task, 1)
+                        emit.assert_not_called()
+                self.assert_no_start_state(sup)
+                self.assertTrue(FakePty.instances[-1].killed)
+
+    async def test_cancelling_partial_start_kills_child_and_releases_lock(self):
+        sup = self.supervisor()
+        entered = asyncio.Event()
+
+        class SlowStart(FakePty):
+            async def start(self):
+                entered.set()
+                await asyncio.Event().wait()
+
+        with mock.patch.object(supervisor_mod, "PtySession", SlowStart):
+            task = asyncio.create_task(sup.open_pty("a", "s"))
+            await asyncio.wait_for(entered.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assert_no_start_state(sup)
+        self.assertTrue(FakePty.instances[-1].killed)
+
+    async def test_old_exit_cannot_unregister_new_instance_and_shutdown_drops_late_output(self):
+        sup = self.supervisor()
+        await sup.open_pty("a", "s")
+        old = sup.ptys[("a", "s")]
+        old.alive = False
+        await sup.open_pty("a", "s")
+        fresh = sup.ptys[("a", "s")]
+        await old.on_exit(9)
+        self.assertIs(sup.ptys[("a", "s")], fresh)
+        sup.shutdown()
+        with mock.patch.object(sup, "emit") as emit:
+            await fresh.on_output("after shutdown")
+            await fresh.on_exit(9)
+            await sup.open_pty("a", "new")
+            emit.assert_not_called()
+        self.assert_no_start_state(sup)
+
+    async def test_pending_is_an_honest_detached_snapshot(self):
+        sup = self.supervisor()
+        sup.emit({"type": "ready", "session_id": "s"})
+        snapshot = sup.pending
+        self.assertIsInstance(snapshot, list)
+        snapshot[0]["type"] = "not-ready"
+        snapshot.clear()
+        self.assertEqual(sup.pending[0]["type"], "ready")
+
+    async def test_full_turn_queue_rejects_without_consuming_input_receipt(self):
+        sup = self.supervisor()
+
+        class BusySession(FakePty):
+            room = False
+
+            def can_accept_turn(self):
+                return self.room
+
+            def write_turn(self, data, options):
+                if self.room:
+                    self.written.append(data)
+                    return True
+                return False
+
+        p = BusySession([], None, None, None)
+        sup.ptys[("a", "s")] = p
+        frame = {"type": "input", "agent_id": "a", "session_id": "s",
+                 "client_input_id": "33333333-3333-4333-8333-333333333333",
+                 "data": "collaborator"}
+        await sup.handle_control(frame)
+        self.assertEqual(p.written, [])
+        self.assertEqual(sup.pending[-1]["status"], "rejected")
+        self.assertEqual(sup.pending[-1]["reason"], "turn_queue_full")
+        p.room = True
+        await sup.handle_control(frame)
+        await sup.handle_control(frame)
+        self.assertEqual(p.written, ["collaborator"])
+        self.assertEqual(sup.pending[-1]["status"], "delivered")
 
 
 if __name__ == "__main__":

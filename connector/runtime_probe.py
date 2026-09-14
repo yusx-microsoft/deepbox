@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,19 +34,22 @@ class ProbeResult:
 def run_probe(argv: list[str], timeout: float = 5.0) -> ProbeResult:
     """Run one declared argv probe without a shell and with bounded output."""
     try:
-        completed = subprocess.run(
-            argv,
-            input="",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            shell=False,
-            check=False,
-        )
-        return ProbeResult(completed.returncode, completed.stdout[:64 * 1024])
+        # PIPE would buffer the entire output before we could truncate it.
+        with tempfile.TemporaryFile() as output:
+            completed = subprocess.run(
+                argv,
+                input="",
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                shell=False,
+                check=False,
+            )
+            output.seek(0)
+            return ProbeResult(completed.returncode, output.read(64 * 1024).decode("utf-8", "replace"))
     except subprocess.TimeoutExpired:
         return ProbeResult(None, timed_out=True)
     except (OSError, ValueError):
@@ -52,11 +57,12 @@ def run_probe(argv: list[str], timeout: float = 5.0) -> ProbeResult:
 
 
 def _safe_version(raw: str) -> str | None:
-    for line in raw.splitlines():
-        clean = "".join(ch for ch in line.strip() if ord(ch) >= 0x20)
-        if clean:
-            return clean[:160]
-    return None
+    # Publish only a version number, never a CLI's arbitrary first line.
+    line = next((line.strip() for line in raw.splitlines() if line.strip()), "")[:160]
+    if "/" in line or "\\" in line:
+        return None
+    match = re.search(r"\bv?(\d+\.\d+(?:\.\d+)?)(?![\w.])", line)
+    return match.group(1) if match else None
 
 
 def _probe_command(adapter: runtimes.RuntimeAdapter, suffix: tuple[str, ...],

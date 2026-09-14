@@ -11,6 +11,9 @@
  * for chrome and mono for the terminal, which always stays the visual lead.
  */
 
+/* Author display rules (for example .chat-form) must not override hidden UI. */
+[hidden]{display:none!important}
+
 :root{
   /* Surfaces: base -> raised panels -> hover -> input wells */
   --bg:#0b0d10;
@@ -428,6 +431,7 @@ button.workspace-row.is-active{background:var(--accent-weak);border-color:rgba(5
   width:100%;max-width:420px;background:var(--panel);border:1px solid var(--border-strong);
   border-radius:var(--radius-lg);box-shadow:var(--shadow);overflow:hidden;
 }
+.modal.workspace-manager{max-width:700px}
 .modal-head{padding:16px 18px 4px}
 .modal-head h3{font-size:15px}
 .modal-head p{color:var(--fg-muted);font-size:12px;margin:5px 0 0}
@@ -439,9 +443,10 @@ button.workspace-row.is-active{background:var(--accent-weak);border-color:rgba(5
 .workspace-member .avatar{width:26px;height:26px;border-radius:6px;background:var(--well);border:1px solid var(--border);
   display:grid;place-items:center;font-family:var(--font-mono);font-size:10px;color:var(--fg-muted)}
 .workspace-member-name{display:flex;flex-direction:column;min-width:0;flex:1}
-.workspace-member-name b{font-size:12px;overflow:hidden;text-overflow:ellipsis}
+.workspace-member-name b{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .workspace-member-name small,.workspace-invite-row small{font-size:10px;color:var(--fg-faint)}
-.workspace-member-role{font-size:10px;color:var(--fg-muted);text-transform:uppercase;letter-spacing:.06em}
+.workspace-member-role{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--fg-muted);text-transform:uppercase;letter-spacing:.06em}
+.workspace-member-role select{max-width:230px;text-transform:none;letter-spacing:normal}
 .workspace-invite-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px}
 .workspace-invite-form input{grid-column:1/-1}.workspace-invite-form select{min-width:0}
 .workspace-invite-result{margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--well)}
@@ -450,7 +455,13 @@ button.workspace-row.is-active{background:var(--accent-weak);border-color:rgba(5
 .workspace-invitations{margin-top:16px}.workspace-invite-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border-faint)}
 .workspace-invite-row>span{display:flex;flex:1;min-width:0;flex-direction:column}.workspace-invite-row b{font-size:12px;overflow:hidden;text-overflow:ellipsis}
 .workspace-none{margin:0}.workspace-join-note{padding:10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--well);color:var(--fg-muted)}
-@media (max-width:680px){.workspace-invite-form{grid-template-columns:1fr}.workspace-invite-form button{width:100%}}
+@media (max-width:680px){
+  .workspace-invite-form{grid-template-columns:1fr}
+  .workspace-invite-form button{width:100%}
+  .workspace-member{flex-wrap:wrap}
+  .workspace-member-role{width:100%;padding-left:34px}
+  .workspace-member-role select{flex:1;max-width:none;min-width:0}
+}
 .field{margin-bottom:12px}
 .field:last-child{margin-bottom:0}
 .field label{display:block;font-size:12px;color:var(--fg-muted);margin-bottom:5px}

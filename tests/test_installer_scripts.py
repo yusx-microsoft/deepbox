@@ -160,6 +160,7 @@ def test_installer_discovers_and_stops_a_running_venv_connector(tmp_path):
     package = work / "connector"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    # File existence must mean the full PID is readable, not just that open() ran.
     (package / "__main__.py").write_text(
         "from pathlib import Path\n"
         "import subprocess\n"
@@ -167,7 +168,8 @@ def test_installer_discovers_and_stops_a_running_venv_connector(tmp_path):
         "import time\n"
         "child = subprocess.Popen([sys.executable, '-c', "
         "'import time; time.sleep(30)'])\n"
-        "Path('child.pid').write_text(str(child.pid), encoding='ascii')\n"
+        "Path('child.pid.tmp').write_text(str(child.pid), encoding='ascii')\n"
+        "Path('child.pid.tmp').replace('child.pid')\n"
         "time.sleep(30)\n",
         encoding="utf-8",
     )

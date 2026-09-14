@@ -97,7 +97,7 @@
 
   function findRuntimeCapability(capabilities, runtimeId){
     const wanted = String(runtimeId || '');
-    const list = Array.isArray(capabilities) ? capabilities : [];
+    const list = runtimeCapabilities(capabilities);
     return list.find(capability=> capability && (
       capability.runtime === wanted
       || (Array.isArray(capability.legacy_runtime_ids)
@@ -110,7 +110,7 @@
   function runtimeOptions(capabilities){
     const seen = new Set();
     const out = [];
-    for(const capability of Array.isArray(capabilities) ? capabilities : []){
+    for(const capability of runtimeCapabilities(capabilities)){
       if(!capability) continue;
       const installed = typeof capability === 'string' || (isCapabilityV2(capability)
         ? capability.installation?.status === 'installed'
@@ -137,7 +137,7 @@
   }
 
   function runtimeInventory(capabilities){
-    return (Array.isArray(capabilities) ? capabilities : []).filter(Boolean).map(capability=>{
+    return runtimeCapabilities(capabilities).filter(Boolean).map(capability=>{
       const v2 = isCapabilityV2(capability);
       return {
         id: String(capability.runtime || ''),
@@ -194,6 +194,11 @@
     return `/api/agents/${encodeURIComponent(String(agentId || ''))}`;
   }
 
+  function resumableSession(sessions, surface){
+    return sessions.find(session=>session.state === 'live'
+      && (!surface || session.surface === surface));
+  }
+
   // Generate the exact Windows connector bootstrap command shown after a
   // devbox token is minted. Keeping this pure makes wrapping/copy regressions
   // testable without a browser. Emits a single self-contained PowerShell block:
@@ -248,15 +253,14 @@
       const result = options === undefined ? send(chunk) : send(chunk, options);
       return result !== false;
     }
-    // Kept for the lease transition API: there is no buffered input to drop.
-    function discard(){}
     function close(){ active = false; }
-    return {push: push, flush: function(){}, discard: discard, close: close};
+    return {push, close};
   }
 
   // ---- status helpers ----------------------------------------------------
 
   function supportsStructuredChat(capability, surfaceId){
+    if(surfaceId) return surfaceId === 'structured';
     if(isCapabilityV2(capability)){
       return (surfaceId || capability.surface || preferredSurface(capability)) === 'structured';
     }
@@ -498,6 +502,7 @@
     preferredSurface: preferredSurface,
     capabilityForSurface: capabilityForSurface,
     agentApiPath: agentApiPath,
+    resumableSession: resumableSession,
     windowsInstallCommand: windowsInstallCommand,
     unixInstallCommand: unixInstallCommand,
     windowsConnectorCommand: windowsConnectorCommand,

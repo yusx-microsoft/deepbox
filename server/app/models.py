@@ -146,6 +146,8 @@ class Session(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"))
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String, default="Session")
+    # Generic connector-resolved UI contract; NULL preserves legacy sessions.
+    surface: Mapped[str | None] = mapped_column(String, nullable=True)
     # Recording retention policy: none|7d|30d|permanent (see VALID_RETENTIONS).
     retention: Mapped[str] = mapped_column(String, default=RETENTION_30D)
     workspace_id: Mapped[str | None] = mapped_column(
@@ -447,6 +449,8 @@ def _migrate(engine) -> None:
         stmts.append("ALTER TABLE user ADD COLUMN external_subject VARCHAR")
     if "session" in inspector.get_table_names():
         session_cols = {c["name"] for c in inspector.get_columns("session")}
+        if "surface" not in session_cols:
+            stmts.append("ALTER TABLE session ADD COLUMN surface VARCHAR")
         if "retention" not in session_cols:
             stmts.append(
                 f"ALTER TABLE session ADD COLUMN retention VARCHAR "

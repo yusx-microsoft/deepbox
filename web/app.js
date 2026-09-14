@@ -10,93 +10,30 @@ let workspaces = [], activeWorkspaceId = null;
 let authConfig = {mode:'local', password_enabled:true, microsoft_enabled:false};
 let workspaceInviteOpen = false;
 let fleetLoadRequest = 0;
+let viewEpoch = 0;       // invalidates requests and callbacks from a previous page
 let replayMode = false;
 let curAgentId = null;   // currently open agent, for active-row highlighting
 let currentSurface = null;
 let fleetQuery = '';     // fleet search text
-let nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock;
-let deriveCollaborationState, canSendInput, collabHeaderView;
+const ui = window.DeepboxUI;
+const Chat = window.DeepboxChat;
+const {nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock} = window.DeepboxReplay || {};
+const {deriveCollaborationState, canSendInput, canSendMessage, collabHeaderView} = window.DeepboxCollaboration || {};
 let collabState = null;  // normalized collaboration view model for curSession
 let keyboardRequester = null;
 let termInputSender = null;
-let ui = null;           // DeepboxUI pure helpers (dynamically loaded)
-
-// Cached dynamic-module loaders (same pattern as replay/collaboration).
-let replayHelpersPromise = null, collaborationHelpersPromise = null, uiPromise = null;
-
-function loadScriptOnce(src, globalName, errMsg, isUsable){
-  return new Promise((resolve, reject) => {
-    const current = window[globalName];
-    if(current && (!isUsable || isUsable(current))) return resolve(current);
-    const script = document.createElement('script');
-    script.src = src;
-    script.onload = () => {
-      const loaded = window[globalName];
-      if(loaded && (!isUsable || isUsable(loaded))) resolve(loaded);
-      else reject(new Error(errMsg));
-    };
-    script.onerror = () => reject(new Error(errMsg));
-    document.head.appendChild(script);
-  });
-}
-
-async function loadReplayHelpers(){
-  replayHelpersPromise = replayHelpersPromise ||
-    loadScriptOnce('/static/replay.js', 'DeepboxReplay', 'failed to load replay helpers');
-  const mod = await replayHelpersPromise;
-  ({nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock} = mod);
-  return mod;
-}
-
-async function loadCollaborationHelpers(){
-  collaborationHelpersPromise = collaborationHelpersPromise ||
-    loadScriptOnce('/static/collaboration.js', 'DeepboxCollaboration', 'failed to load collaboration helpers');
-  const mod = await collaborationHelpersPromise;
-  ({deriveCollaborationState, canSendInput, collabHeaderView} = mod);
-  return mod;
-}
-
-let chatHelpersPromise = null;
-let Chat = null;               // DeepboxChat module once loaded
 let chatState = null;          // current structured session view model
 let structuredMode = false;    // is the open session a structured (chat) agent?
 let chatControls = [];         // normalized adapter-owned control descriptors
 let chatControlValues = {};    // select values, keyed by generic control key
 let chatAttachments = {};      // in-memory file payloads; never persisted by browser
-let chatSending = false;
-let chatModeEpoch = 0;          // invalidates lazy mounts from a previous agent/view
-let chatEntryGate = null;       // single-flight gate, created by the chat helper
-async function loadChatHelpers(){
-  chatHelpersPromise = chatHelpersPromise ||
-    loadScriptOnce('/static/chat.js', 'DeepboxChat', 'failed to load chat helpers');
-  Chat = await chatHelpersPromise;
-  return Chat;
-}
 
 function resetStructuredChat(){
-  chatModeEpoch += 1;
-  chatEntryGate = null;
   structuredMode = false;
   chatState = null;
   chatControls = [];
   chatControlValues = {};
   chatAttachments = {};
-  chatSending = false;
-}
-
-
-async function loadUI(){
-  uiPromise = uiPromise || loadScriptOnce(
-    '/static/ui.js?cap=local-cli-v1',
-    'DeepboxUI',
-    'failed to load compatible ui helpers',
-    mod => typeof mod.createTerminalInputSender === 'function'
-      && typeof mod.selectWorkspace === 'function'
-      && typeof mod.workspaceInvitationCopy === 'function'
-      && typeof mod.workspaceAcceptanceCopy === 'function'
-  );
-  ui = await uiPromise;
-  return ui;
 }
 
 const hashParams = new URLSearchParams(location.hash.replace(/^#/, ''));
@@ -139,11 +76,14 @@ const escapeHtml = esc;
 // ---------------- auth ----------------
 async function renderLogin() {
   closeOverlay();
+  const view = clearAgentView();
   // First-owner bootstrap form when available.
   let status = {available:false};
   try { status = await api('/api/auth/bootstrap-status'); } catch {}
+  if(view !== viewEpoch) return;
   if (status.available) return renderBootstrap();
   try { authConfig = await api('/api/auth/config'); } catch {}
+  if(view !== viewEpoch) return;
 
   const inviteFromUrl = pendingInvite;
   const passwordEnabled = authConfig.password_enabled !== false;
@@ -231,6 +171,8 @@ async function renderLogin() {
 }
 
 function renderBootstrap() {
+  closeOverlay();
+  const view = clearAgentView();
   app.innerHTML = `<div class="auth"><div class="auth-card stack">
     <div class="auth-brand"><span class="glyph">_</span><b>deepbox</b></div>
     <div class="auth-sub">First-owner setup. Create the owner account with the bootstrap token.</div>
@@ -240,21 +182,32 @@ function renderBootstrap() {
     <input id="bd" placeholder="display name (optional)"/>
     <div class="row"><button id="bgo" style="flex:1">Create owner</button></div>
     <div id="err" class="auth-err"></div></div></div>`;
-  bgo.onclick = async () => {
+  const button = document.getElementById('bgo');
+  const token = document.getElementById('bt'), username = document.getElementById('bu');
+  const password = document.getElementById('bp'), displayName = document.getElementById('bd');
+  const error = document.getElementById('err');
+  button.onclick = async () => {
+    if(button.disabled || view !== viewEpoch) return;
+    button.disabled = true;
     try {
-      me = await api('/api/auth/bootstrap', {method:'POST', body: JSON.stringify({
-        token:bt.value, username:bu.value, password:bp.value,
-        display_name:bd.value||undefined})});
-      boot();
-    } catch(e){ err.textContent = 'Setup failed.'; }
+      const user = await api('/api/auth/bootstrap', {method:'POST', body: JSON.stringify({
+        token:token.value, username:username.value, password:password.value,
+        display_name:displayName.value||undefined})});
+      if(view === viewEpoch){ me = user; await boot(); }
+    } catch(e){ if(view === viewEpoch) error.textContent = e.message || 'Setup failed.'; }
+    finally { button.disabled = false; }
   };
 }
 
 // ---------------- main shell ----------------
 async function boot() {
+  if(!ui || !Chat || !normalizeReplay || !canSendMessage)
+    throw new Error('Browser helpers could not load. Reload the page and check that /static/*.js files are accessible.');
+  const view = viewEpoch;
   try { me = me || await api('/api/me/user'); }
-  catch { return renderLogin(); }
-  if (await loadDevboxes()) {
+  catch { if(view === viewEpoch) return renderLogin(); return; }
+  if(view !== viewEpoch) return;
+  if (await loadDevboxes() && view === viewEpoch) {
     renderShell();
     if(pendingWorkspaceInvite) setTimeout(presentWorkspaceInvitation, 0);
   }
@@ -262,10 +215,11 @@ async function boot() {
 
 async function loadDevboxes(){
   const request = ++fleetLoadRequest;
+  const view = viewEpoch;
   try {
     const [nextWorkspaces, nextDevboxes] = await Promise.all([
       api('/api/workspaces'), api('/api/devboxes')]);
-    if(request !== fleetLoadRequest) return false;
+    if(request !== fleetLoadRequest || view !== viewEpoch) return false;
     workspaces = nextWorkspaces;
     devboxes = nextDevboxes;
     let preferred = activeWorkspaceId;
@@ -274,14 +228,14 @@ async function loadDevboxes(){
     activeWorkspaceId = selected ? selected.id : null;
     return true;
   } catch(e) {
-    if(request === fleetLoadRequest) showAlert('Could not load workspaces', e.message);
+    if(request === fleetLoadRequest && view === viewEpoch) showAlert('Could not load workspaces', e.message);
     return false;
   }
 }
 
 function renderShell() {
   closeOverlay();
-  curAgentId = null;
+  clearAgentView();
   app.innerHTML = `
   <header class="topbar">
     <div class="brand"><span class="glyph">_</span><b>deepbox</b><span class="tag">switchboard</span></div>
@@ -300,7 +254,7 @@ function renderShell() {
       <div class="stage-body" id="stagebody"></div>
     </section>
   </main>`;
-  logout.onclick = async()=>{
+  document.getElementById('logout').onclick = async()=>{
     if(me.auth_provider === 'microsoft') {
       location.assign(authConfig.microsoft_logout_url || '/api/auth/microsoft/logout');
       return;
@@ -470,13 +424,20 @@ async function createWorkspace(){
 function workspaceRoleOptions(workspace){
   const options = [
     {value:'viewer', label:'Viewer — read and replay'},
-    {value:'operator', label:'Operator — interact with agents'}
+    {value:'operator', label:'Operator — send messages and use terminals'}
   ];
   if(workspace.role === 'owner') options.push({value:'admin', label:'Admin — manage devboxes and invitations'});
   return options;
 }
 
+function workspaceRoleLabel(role){
+  return {viewer:'Viewer (read-only)', operator:'Operator (send messages)',
+    admin:'Admin (manage workspace and send messages)', owner:'Owner (manage workspace and send messages)'}[role] || role;
+}
+
 async function openWorkspaceManager(workspaceId){
+  closeOverlay();
+  const view = viewEpoch, request = overlayEpoch;
   const workspace = workspaces.find(item=>item.id === workspaceId);
   if(!workspace) return;
   const canAdmin = ui.canAdminWorkspace(workspace.role);
@@ -485,20 +446,29 @@ async function openWorkspaceManager(workspaceId){
     const invitations = canAdmin
       ? await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/invitations`)
       : [];
-    const memberRows = members.map(member=>`<div class="workspace-member">
-      <span class="avatar">${esc(ui.initials(member.display_name||member.username))}</span>
-      <span class="workspace-member-name"><b>${esc(member.display_name||member.username)}</b><small>@${esc(member.username)}</small></span>
-      <span class="workspace-member-role">${esc(member.role)}</span>
-    </div>`).join('');
+    if(view !== viewEpoch || request !== overlayEpoch) return;
+    const memberRows = members.map(member=>{
+      const editable = canAdmin && member.role !== 'owner' && member.user_id !== me.id &&
+        (member.role !== 'admin' || workspace.role === 'owner');
+      const roles = workspaceRoleOptions(workspace).map(option=>
+        `<option value="${esc(option.value)}"${option.value === member.role ? ' selected' : ''}>${esc(workspaceRoleLabel(option.value))}</option>`).join('');
+      return `<div class="workspace-member" data-member="${esc(member.user_id)}">
+        <span class="avatar">${esc(ui.initials(member.display_name||member.username))}</span>
+        <span class="workspace-member-name"><b>${esc(member.display_name||member.username)}</b><small>@${esc(member.username)}</small></span>
+        <span class="workspace-member-role">${editable
+          ? `<select aria-label="Role for ${esc(member.username)}" data-member-role="${esc(member.role)}">${roles}</select><button class="ghost compact" data-save-member disabled>Save</button>`
+          : `<span title="${esc(workspaceRoleLabel(member.role))}">${esc(member.role)}</span>`}</span>
+      </div>`;
+    }).join('');
     const inviteRows = invitations.map(invitation=>{
       const state = invitation.accepted_at ? 'joined' : invitation.revoked_at ? 'revoked' : 'pending';
       return `<div class="workspace-invite-row" data-invitation-row="${esc(invitation.id)}">
-        <span><b>${esc(invitation.email)}</b><small>${esc(invitation.role)} · ${state}</small></span>
+        <span><b>${esc(invitation.email)}</b><small>${esc(workspaceRoleLabel(invitation.role))} · ${state}</small></span>
         ${state==='pending'?`<button class="ghost compact" data-revoke-invitation="${esc(invitation.id)}">Revoke</button>`:''}
       </div>`;
     }).join('') || '<p class="muted workspace-none">No invitations yet.</p>';
     const roleOptions = workspaceRoleOptions(workspace).map(option=>
-      `<option value="${esc(option.value)}">${esc(option.label)}</option>`).join('');
+      `<option value="${esc(option.value)}"${option.value === 'operator' ? ' selected' : ''}>${esc(workspaceRoleLabel(option.value))}</option>`).join('');
     const adminHtml = canAdmin ? `<section class="workspace-manager-section">
       <h4>Invite someone</h4>
       <form id="workspace-invite-form" class="workspace-invite-form">
@@ -506,6 +476,7 @@ async function openWorkspaceManager(workspaceId){
         <select id="workspace-invite-role">${roleOptions}</select>
         <button type="submit">Create invitation</button>
       </form>
+      <p id="workspace-invite-error" class="modal-err" role="alert"></p>
       <div id="workspace-invite-result" class="workspace-invite-result" hidden>
         <label>Share this one-time link</label>
         <div><input id="workspace-invite-link" readonly/><button id="workspace-invite-copy" class="ghost">Copy</button></div>
@@ -515,30 +486,59 @@ async function openWorkspaceManager(workspaceId){
 
     showModal({
       title:workspace.name,
-      desc:`Workspace role: ${workspace.role}`,
+      desc:`${workspaceRoleLabel(workspace.role)}. Operators can send chat messages; terminal typing also requires the shared keyboard. Viewers are read-only. Invitations never change an existing member’s role.`,
       bodyHtml:`<section class="workspace-manager-section"><h4>Members</h4>
-          <div class="workspace-members">${memberRows}</div></section>${adminHtml}`,
+          <div class="workspace-members">${memberRows}</div><p id="workspace-member-error" class="modal-err" role="alert"></p></section>${adminHtml}`,
       actions:[{label:'Close', primary:true, value:true}],
       onReady:overlay=>{
+        overlay.querySelector('.modal').classList.add('workspace-manager');
+        overlay.querySelectorAll('[data-member]').forEach(row=>{
+          const role = row.querySelector('[data-member-role]'), save = row.querySelector('[data-save-member]');
+          if(!role || !save) return;
+          role.onchange = ()=>{ save.textContent = 'Save'; save.disabled = role.value === role.dataset.memberRole; };
+          save.onclick = async()=>{
+            if(save.disabled || overlay !== overlayEl || view !== viewEpoch) return;
+            save.disabled = role.disabled = true;
+            const error = overlay.querySelector('#workspace-member-error');
+            error.textContent = '';
+            try {
+              const changed = await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/members/${encodeURIComponent(row.dataset.member)}`, {
+                method:'PATCH', body:JSON.stringify({role:role.value})});
+              if(overlay !== overlayEl || view !== viewEpoch) return;
+              role.value = role.dataset.memberRole = changed.role;
+              save.textContent = 'Saved';
+            } catch(problem) {
+              if(overlay === overlayEl && view === viewEpoch) error.textContent = problem.message || 'Could not change role.';
+            } finally {
+              role.disabled = false;
+              save.disabled = role.value === role.dataset.memberRole;
+            }
+          };
+        });
         overlay.querySelectorAll('[data-revoke-invitation]').forEach(button=>button.onclick=async()=>{
+          if(button.disabled || overlay !== overlayEl || view !== viewEpoch) return;
           button.disabled = true;
           try {
             await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/invitations/${encodeURIComponent(button.dataset.revokeInvitation)}`, {method:'DELETE'});
             const row = button.closest('[data-invitation-row]');
             if(row){ row.querySelector('small').textContent = row.querySelector('small').textContent.replace('pending','revoked'); button.remove(); }
-          } catch(error) { button.disabled=false; showAlert('Could not revoke invitation', error.message); }
+          } catch(error) { button.disabled=false; if(overlay === overlayEl && view === viewEpoch) overlay.querySelector('#workspace-invite-error').textContent = error.message; }
         });
         const form = overlay.querySelector('#workspace-invite-form');
         if(!form) return;
         form.onsubmit = async event=>{
           event.preventDefault();
           const submit = form.querySelector('button[type=submit]');
+          if(submit.disabled || overlay !== overlayEl || view !== viewEpoch) return;
           submit.disabled = true;
+          const error = overlay.querySelector('#workspace-invite-error');
+          error.textContent = '';
           try {
             const invitation = await api(`/api/workspaces/${encodeURIComponent(workspace.id)}/invitations`, {
               method:'POST', body:JSON.stringify({
                 email:overlay.querySelector('#workspace-invite-email').value,
                 role:overlay.querySelector('#workspace-invite-role').value})});
+            if(overlay !== overlayEl || view !== viewEpoch) return;
             const result = overlay.querySelector('#workspace-invite-result');
             const link = overlay.querySelector('#workspace-invite-link');
             link.value = invitation.join_url;
@@ -547,12 +547,12 @@ async function openWorkspaceManager(workspaceId){
               try { await navigator.clipboard.writeText(link.value); overlay.querySelector('#workspace-invite-copy').textContent='Copied'; }
               catch { link.select(); }
             };
-          } catch(error) { showAlert('Could not create invitation', error.message); }
+          } catch(problem) { if(overlay === overlayEl && view === viewEpoch) error.textContent = problem.message || 'Could not create invitation. Your email and role have been kept.'; }
           finally { submit.disabled = false; }
         };
       }
     });
-  } catch(error) { showAlert('Could not load workspace', error.message); }
+  } catch(error) { if(view === viewEpoch && request === overlayEpoch) showAlert('Could not load workspace', error.message); }
 }
 
 async function presentWorkspaceInvitation(){
@@ -616,9 +616,11 @@ function renderStageEmpty(){
 // ---------------- owner admin ----------------
 async function renderOwner(){
   closeOverlay();
+  const view = clearAgentView();
   let invites=[], users=[];
   try { [invites, users] = await Promise.all([
     api('/api/invitations'), api('/api/users')]); } catch(e){}
+  if(view !== viewEpoch) return;
   app.innerHTML = `
   <header class="topbar">
     <div class="brand"><span class="glyph">_</span><b>deepbox</b><span class="tag">owner</span></div>
@@ -681,7 +683,8 @@ async function renderOwner(){
 
   document.getElementById('mint').onclick = async()=>{
     const res = await api('/api/invitations',{method:'POST',body:JSON.stringify({
-      note:inote.value||undefined, ttl_hours:Number(ittl.value)||24})});
+      note:document.getElementById('inote').value||undefined, ttl_hours:Number(document.getElementById('ittl').value)||24})});
+    if(view !== viewEpoch) return;
     // Show plaintext + prefilled invite URL exactly once; not retained.
     // URL fragments never reach the HTTP server or its access logs.
     const url = `${location.origin}${location.pathname}#invite=${encodeURIComponent(res.token)}`;
@@ -973,14 +976,16 @@ function termHost(){
   if(!host){
     const body = document.getElementById('stagebody');
     if(!body) return null;
-    body.innerHTML = '<div id="term"></div>';
-    host = document.getElementById('term');
+    host = document.createElement('div');
+    host.id = 'term';
+    body.insertBefore(host, document.getElementById('replaybar'));
   }
   return host;
 }
 
 function focusTerminal(force){
-  if(!term || replayMode) return;
+  if(!term || replayMode || structuredMode) return;
+  const target = term, view = viewEpoch;
   const active = document.activeElement;
   const terminalOwnsFocus = !!(active && active.classList
     && active.classList.contains('xterm-helper-textarea'));
@@ -989,37 +994,77 @@ function focusTerminal(force){
     : force || terminalOwnsFocus;
   if(!mayFocus) return;
   requestAnimationFrame(()=>{
-    if(!term || replayMode) return;
-    term.focus();
-    term.scrollToBottom();
+    if(term !== target || view !== viewEpoch || replayMode || structuredMode) return;
+    target.focus();
+    target.scrollToBottom();
   });
 }
 
 function setupTerm(){
   const host = termHost();
-  if(!host) return;
-  term = new Terminal({fontFamily:"'JetBrains Mono',Consolas,monospace",fontSize:13,
-    cursorBlink:true, scrollOnUserInput:true, scrollback:5000, theme:XTERM_THEME});
-  fit = new FitAddon.FitAddon(); term.loadAddon(fit);
-  term.open(host);
-  host.addEventListener('pointerdown', ()=>focusTerminal(true));
-  fit.fit();
-  window.onresize = ()=>{ try{fit.fit(); sendResize();}catch(e){} };
-  term.onData(d => { if(!replayMode && termInputSender && curSession
-    && canSendInput && canSendInput(collabState))
-    termInputSender.push(d); });
+  if(!host) return false;
+  try {
+    if(typeof window.Terminal !== 'function' || typeof window.FitAddon?.FitAddon !== 'function')
+      throw new Error('The xterm terminal renderer could not load. Reload the page and allow the xterm scripts from cdn.jsdelivr.net, or use Chat if available.');
+    term = new window.Terminal({fontFamily:"'JetBrains Mono',Consolas,monospace",fontSize:13,
+      cursorBlink:true, scrollOnUserInput:true, scrollback:5000, theme:XTERM_THEME});
+    fit = new window.FitAddon.FitAddon(); term.loadAddon(fit);
+    term.open(host);
+    host.onpointerdown = ()=>focusTerminal(true);
+    fit.fit();
+    window.addEventListener('resize', resizeTerm);
+    const target = term;
+    term.onData(d => { if(term === target && !replayMode && !structuredMode && termInputSender && curSession
+      && canSendInput(collabState)) termInputSender.push(d); });
+    return true;
+  } catch(error) {
+    disposeTerminal();
+    host.innerHTML = `<p class="muted" role="alert">${esc(error.message || 'Terminal could not start. Reload the page to retry.')}</p>`;
+    return false;
+  }
+}
+
+function disposeTerminal(){
+  window.removeEventListener('resize', resizeTerm);
+  const host = document.getElementById('term');
+  if(host) host.onpointerdown = null;
+  const old = term;
+  term = null; fit = null;
+  if(old){ try{ old.dispose(); }catch(e){} }
 }
 
 function resetTerminal(){
-  if(term){ try{ term.dispose(); }catch(e){} }
-  term = null; fit = null;
-  const body = document.getElementById('stagebody');
-  if(body) body.innerHTML = '<div id="term"></div>';
-  setupTerm();
+  disposeTerminal();
+  const host = termHost();
+  if(host) host.textContent = '';
+  return setupTerm();
+}
+
+function resizeTerm(){
+  if(!term || !fit || structuredMode) return;
+  try { fit.fit(); sendResize(); } catch(e) {}
 }
 function sendResize(){
-  if(termWS && termWS.readyState===1 && curSession) termWS.send(JSON.stringify(
-    {type:'resize',session_id:curSession,cols:term.cols,rows:term.rows}));
+  if(term && !structuredMode && !replayMode && termWS && termWS.readyState===1 && curSession){
+    try { termWS.send(JSON.stringify({type:'resize',session_id:curSession,cols:term.cols,rows:term.rows})); } catch(e) {}
+  }
+}
+
+function setSessionSurface(surface, capability){
+  const next = surface === 'terminal' || surface === 'structured' ? surface
+    : currentSurface || (ui.supportsStructuredChat(capability) ? 'structured' : 'terminal');
+  currentSurface = next;
+  if(next === 'structured'){
+    stopKeyboardHeartbeat();
+    enterChatMode();
+    return true;
+  }
+  if(structuredMode){
+    resetStructuredChat();
+    document.getElementById('chat-surface')?.remove();
+    document.getElementById('chat-new')?.remove();
+  }
+  return !!term || resetTerminal();
 }
 
 // --- Structured chat surface ----------------------------------------------
@@ -1061,6 +1106,16 @@ function setChatComposerError(message){
 
 function syncChatControls(){
   if(!chatState) return;
+  const writable = !replayMode && canSendMessage(collabState);
+  const input = document.getElementById('chat-input');
+  if(input){
+    input.disabled = !writable;
+    input.placeholder = writable ? 'Message the agent\u2026  (Enter to send, Shift+Enter for newline)'
+      : 'Read-only · Operator, Admin or Owner can send messages';
+  }
+  document.querySelectorAll('#chat-form button, #chat-controls button, #chat-controls input[type="file"], .chat-file-remove, .chat-perm button').forEach(el=>{ el.disabled = !writable; });
+  const newChat = document.getElementById('chat-new');
+  if(newChat) newChat.disabled = !writable;
   const sessionLocked = chatState.configured || chatState.items.length > 0;
   for(const control of chatControls){
     if(control.kind !== 'select') continue;
@@ -1070,8 +1125,8 @@ function syncChatControls(){
     const validCustom = control.allow_custom && typeof selected === 'string';
     select.value = typeof selected === 'string' &&
       (control.choices.includes(selected) || validCustom) ? selected : '';
-    select.disabled = control.scope === 'session' && sessionLocked;
-    select.title = select.disabled ? 'Fixed for this chat. Start a New chat to change it.' : '';
+    select.disabled = !writable || control.scope === 'session' && sessionLocked;
+    select.title = !writable ? 'Read-only' : select.disabled ? 'Fixed for this chat. Start a New chat to change it.' : '';
   }
   const note = document.getElementById('chat-session-note');
   if(note) note.hidden = !(sessionLocked && chatControls.some(control=>control.scope === 'session'));
@@ -1109,6 +1164,8 @@ function renderAttachmentTray(){
 }
 
 async function addChatFiles(control, fileList){
+  const view = viewEpoch, attachments = chatAttachments;
+  if(!canSendMessage(collabState) || replayMode) return;
   setChatComposerError('');
   const current = chatAttachments[control.key] || [];
   const incoming = Array.from(fileList || []);
@@ -1124,9 +1181,10 @@ async function addChatFiles(control, fileList){
   }
   try{
     const payloads = await Promise.all(incoming.map(filePayload));
+    if(view !== viewEpoch || attachments !== chatAttachments || !canSendMessage(collabState)) return;
     chatAttachments[control.key] = current.concat(payloads);
     renderAttachmentTray();
-  }catch(error){ setChatComposerError(error.message || 'Could not read that file.'); }
+  }catch(error){ if(view === viewEpoch && attachments === chatAttachments) setChatComposerError(error.message || 'Could not read that file.'); }
 }
 
 function setupChatControls(){
@@ -1204,22 +1262,19 @@ function setupChatControls(){
   renderAttachmentTray();
 }
 
-async function enterChatMode(){
+function enterChatMode(){
   if(structuredMode && document.getElementById('chat-surface')) return;
-  const epoch = chatModeEpoch;
+  const body = document.getElementById('stagebody');
+  if(!body) return;
+  disposeTerminal();
+  document.getElementById('term')?.remove();
   structuredMode = true;
-  await loadChatHelpers();
-  if(epoch !== chatModeEpoch || !structuredMode) return;
-  chatEntryGate = chatEntryGate || Chat.createSingleFlight();
-  return chatEntryGate(()=>{
-    if(epoch !== chatModeEpoch || !structuredMode ||
-       document.getElementById('chat-surface')) return;
-    const body = document.getElementById('stagebody');
-    if(!body) return;
-    chatState = Chat.initialChatState();
-    body.innerHTML =
-      `<div id="chat-surface" class="chat-surface">
-       <div id="chat-scroll" class="chat-scroll"></div>
+  chatState = Chat.initialChatState();
+  const surface = document.createElement('div');
+  surface.id = 'chat-surface';
+  surface.className = 'chat-surface';
+  surface.innerHTML =
+      `<div id="chat-scroll" class="chat-scroll"></div>
        <div class="chat-composer">
          <div id="chat-controls" class="chat-controls" hidden></div>
          <div id="chat-file-tray" class="chat-file-tray" hidden></div>
@@ -1229,11 +1284,11 @@ async function enterChatMode(){
            <button type="submit" class="chat-send">Send</button>
          </form>
          <div id="chat-composer-error" class="chat-composer-error" role="status"></div>
-       </div>
-     </div>`;
+       </div>`;
+    body.insertBefore(surface, document.getElementById('replaybar'));
     setupChatControls();
     const head = document.getElementById('termhead');
-    if(head && !document.getElementById('chat-new')){
+    if(head && !replayMode && !document.getElementById('chat-new')){
       const button = document.createElement('button');
       button.id = 'chat-new';
       button.type = 'button';
@@ -1250,9 +1305,8 @@ async function enterChatMode(){
     input.addEventListener('keydown', (e)=>{
       if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); void sendChatMessage(); }
     });
-    input.focus();
+    if(!replayMode) input.focus();
     renderChatSurface();
-  });
 }
 
 function renderChatSurface(){
@@ -1262,18 +1316,20 @@ function renderChatSurface(){
   syncChatControls();
 }
 
-async function sendChatMessage(){
+function sendChatMessage(){
   const input = document.getElementById('chat-input');
-  if(!input || chatSending) return;
+  if(!input || !structuredMode || replayMode || !chatState) return;
   const text = input.value;
   if(!text.trim()) return;
-  if(!(canSendInput && canSendInput(collabState))) return;
+  if(!canSendMessage(collabState)){
+    setChatComposerError('Read-only: an Operator, Admin or Owner role is required to send messages.');
+    return;
+  }
   const options = Chat.buildTurnOptions(
     chatControls, chatControlValues, chatAttachments);
   const attachmentMetadata = Object.values(chatAttachments).flat().map(file => ({
     name:file.name, type:file.type, size:file.size,
   }));
-  chatSending = true;
   try{
     if(!termInputSender || !termInputSender.push(text, options)){
       setChatComposerError('The session is reconnecting. Try again in a moment.');
@@ -1286,118 +1342,134 @@ async function sendChatMessage(){
     input.value = '';
     renderChatSurface();
     input.focus();
-  }finally{ chatSending = false; }
+  }catch(error){ setChatComposerError(error.message || 'Message could not be sent. Your draft has been kept; try again.'); }
 }
 
 function sendPermission(requestId, allow){
-  if(chatState) chatState.pendingPermission = null;
-  renderChatSurface();
-  if(termWS && termWS.readyState===1 && curSession)
+  if(!structuredMode || replayMode || !canSendMessage(collabState)){
+    lineError('Read-only: an Operator, Admin or Owner role is required to answer permission requests.');
+    return;
+  }
+  if(!termWS || termWS.readyState!==1 || !curSession){
+    lineError('The session is reconnecting. Try again in a moment.');
+    return;
+  }
+  try {
     termWS.send(JSON.stringify({type:'permission',session_id:curSession,
       request_id:requestId, allow:!!allow}));
+    if(chatState) chatState.pendingPermission = null;
+    renderChatSurface();
+  } catch(error) { lineError(error.message || 'Permission response could not be sent. Try again.'); }
 }
 
 function handleChatFrame(f){
-  // Lazily switch into chat mode on the first structured event, then fold it.
-  const frameEpoch = chatModeEpoch;
-  const frameSession = curSession;
-  const apply = ()=>{
-    if(frameEpoch !== chatModeEpoch || frameSession !== curSession || !chatState) return;
-    const folded = Chat.foldEventPayload(chatState, f.data, f.type === 'restore');
-    chatState = folded.state;
-    const events = folded.events;
-    if(events.some((event) => event.ev === 'session.config')){
-      chatControlValues = Chat.reconcileControlValues(
-        chatControls, chatControlValues, chatState.config);
-    }
-    renderChatSurface();
-  };
-  if(structuredMode && chatState){ apply(); }
-  else { enterChatMode().then(apply); }
+  // Explicit terminal attachments must not be reinterpreted from event-looking output.
+  if(currentSurface === 'terminal') return;
+  setSessionSurface('structured');
+  if(!chatState) return;
+  const folded = Chat.foldEventPayload(chatState, f.data, f.type === 'restore');
+  chatState = folded.state;
+  if(folded.events.some(event => event.ev === 'session.config')){
+    chatControlValues = Chat.reconcileControlValues(chatControls, chatControlValues, chatState.config);
+  }
+  renderChatSurface();
 }
 
 
+async function endCurrentSession(){
+  const view = viewEpoch, session = curSession;
+  if(!session || (!canSendInput(collabState) && !['admin', 'owner'].includes(collabState?.role))) return;
+  if(!await showConfirm('End this session?', 'This stops the runtime for everyone in this session. Saved history remains available.', 'End session')) return;
+  if(view !== viewEpoch || session !== curSession) return;
+  try {
+    if(!termWS || termWS.readyState !== 1) throw new Error('Reconnect before ending the session.');
+    termWS.send(JSON.stringify({type:'terminate', session_id:session}));
+  } catch(error) {
+    lineError(error.message || 'Could not end the session.');
+  }
+}
+
 async function startNewChat(button){
-  if(!curAgentId || !curSession) return;
+  if(!curAgentId || !curSession || !canSendMessage(collabState) || button?.disabled) return;
+  const view = viewEpoch, agentId = curAgentId;
   const found = findAgent(curAgentId);
   if(!found) return;
   const agent = found.agent;
-  const hasConversation = !!(chatState && (chatState.configured || chatState.items.length));
-  if(hasConversation){
-    const confirmed = await showConfirm(
-      'Start a new chat?',
-      'This ends the current runtime session and starts a blank chat. Saved history remains available.',
-      'New chat');
-    if(!confirmed) return;
-  }
   const oldLabel = button?.textContent;
   if(button){ button.disabled = true; button.textContent = 'Starting...'; }
   try{
-    if(termInputSender) termInputSender.flush();
-    if(termWS && termWS.readyState===1){
-      termWS.send(JSON.stringify({type:'terminate', session_id:curSession}));
-    }
-    await openAgent(curAgentId, agent.display_name || agent.handle, 'structured', true);
+    await openAgent(agentId, agent.display_name || agent.handle, 'structured', true);
   }catch(error){
-    await showAlert('New chat could not start', error.message || 'The request failed.');
+    if(view === viewEpoch) await showAlert('New chat could not start', error.message || 'The request failed.');
   }finally{
     if(button?.isConnected){ button.disabled = false; button.textContent = oldLabel || 'New chat'; }
   }
 }
 
 async function openAgent(agentId, name, surfaceOverride=null, forceNew=false){
-  await loadCollaborationHelpers();
-  await loadDevboxes();
-  // Switching sessions: reset collaboration state so a stale lease/holder from
-  // the previous terminal never leaks input rights into the new one.
-  collabState = null;
-  keyboardRequester = null;
+  return openSession(agentId, name, {surface:surfaceOverride, forceNew});
+}
+
+function openLiveSession(session, name){
+  return openSession(session.agent_id, name, {surface:session.surface, session});
+}
+
+async function openSession(agentId, name, {surface=null, forceNew=false, session=null}={}){
+  closeOverlay();
+  const view = clearAgentView();
   curAgentId = agentId;
+  currentSurface = surface === 'terminal' || surface === 'structured' ? surface : null;
+  renderFleet();
+  const head = document.getElementById('termhead'), body = document.getElementById('stagebody');
+  if(!head || !body) return;
+  head.innerHTML =
+    `<span class="title">@<span class="handle">${esc(name)}</span></span>
+     <span class="sep">\u2014</span><span class="muted" id="livetag">opening session</span>
+     <span class="spacer"></span>
+     <button class="ghost" id="session-reconnect">Reconnect</button>
+     <button class="ghost" id="session-new" disabled>New session</button>
+     <button class="ghost danger" id="session-end" disabled>End session</button>
+     <span id="collab" class="collab"></span>
+     <span id="stat" class="status"></span>`;
+  body.innerHTML = '<p class="muted">Opening session\u2026</p>';
+  document.getElementById('session-reconnect').onclick = ()=>{
+    if(view !== viewEpoch) return;
+    if(curSession){ wantOpen = true; connectTermWS(); }
+    else openSession(agentId, name, {surface:currentSurface, forceNew, session});
+  };
+  document.getElementById('session-new').onclick = ()=>{
+    if(view === viewEpoch && canSendMessage(collabState)) openAgent(agentId, name, currentSurface, true);
+  };
+  document.getElementById('session-end').onclick = endCurrentSession;
+  if(!await loadDevboxes() || view !== viewEpoch) return;
   const activeDevbox = devboxes.find(devbox =>
     (devbox.agents || []).some(agent => agent.id === agentId));
   const activeAgent = (activeDevbox?.agents || []).find(agent => agent.id === agentId);
-  const familyCapability = ui.findRuntimeCapability(
-    ui.runtimeCapabilities(activeDevbox?.capabilities), activeAgent?.runtime);
-  currentSurface = surfaceOverride || ui.preferredSurface(familyCapability);
-  const structuredCapability = currentAgentCapability();
-  const expectsStructured = ui.supportsStructuredChat(structuredCapability);
-  // Leaving any previous structured chat surface: reset it before opening the
-  // next agent. Reported generic capabilities can opt the next surface into chat
-  // immediately; a canonical event remains the backward-compatible fallback.
-  resetStructuredChat();
-  renderFleet();
-  const wasReplayOrHistory = replayMode || !!document.getElementById('replaybar') ||
-    !!document.querySelector('#term [data-replay]') ||
-    !!document.querySelector('.history-wrap');
-  stopReplay();
-  const replaybar = document.getElementById('replaybar');
-  if(replaybar) replaybar.remove();
-  if(wasReplayOrHistory || !term || !document.getElementById('term')) resetTerminal();
-  // leaving previous session? flush input, then detach it (do NOT kill its PTY)
-  if(termInputSender) termInputSender.flush();
-  if(termWS && termWS.readyState===1 && curSession)
-    termWS.send(JSON.stringify({type:'detach',session_id:curSession}));
-  document.getElementById('termhead').innerHTML =
-    `<span class="title">@<span class="handle">${esc(name)}</span></span>
-     <span class="sep">\u2014</span><span class="muted" id="livetag">${expectsStructured ? 'live chat' : 'live terminal'}</span>
-     <span class="spacer"></span>
-     <span id="collab" class="collab"></span>
-     <span id="stat" class="status"></span>`;
+  const capability = ui.findRuntimeCapability(activeDevbox?.capabilities, activeAgent?.runtime);
+  currentSurface = currentSurface || ui.preferredSurface(capability);
+  body.textContent = '';
+  if(!setSessionSurface(currentSurface, capability)) return;
   renderCollab();
-  term.reset();
-  focusTerminal(true);
-  // Resume the newest PTY that is still alive on the devbox. Previously every
-  // click silently created a new session, making persisted history invisible.
-  const sessions = forceNew ? [] : await api(`/api/agents/${agentId}/sessions`);
-  let sess = forceNew ? null : sessions.find(s => s.state === 'live');
-  const resumed = !!sess;
-  if(!sess) sess = await api(`/api/agents/${agentId}/sessions`,{method:'POST'});
-  curSession = sess.id;
-  if(expectsStructured) await enterChatMode();
-  if(resumed){ const lt = document.getElementById('livetag');
-    if(lt) lt.textContent = expectsStructured ? 'resumed live chat' : 'resumed live session'; }
-  wantOpen = true;
-  connectTermWS();
+  try {
+    const path = `/api/agents/${encodeURIComponent(agentId)}/sessions`;
+    if(!session && !forceNew){
+      const sessions = await api(path);
+      if(view !== viewEpoch) return;
+      session = ui.resumableSession(sessions, currentSurface);
+    }
+    const resumed = !!session;
+    if(!session) session = await api(path, {method:'POST', body:JSON.stringify({surface:currentSurface})});
+    if(view !== viewEpoch) return;
+    curSession = session.id;
+    if(!setSessionSurface(session.surface, capability)) return;
+    const tag = document.getElementById('livetag');
+    if(tag) tag.textContent = `${resumed ? 'resumed' : 'live'} ${structuredMode ? 'chat' : 'terminal'}`;
+    wantOpen = true;
+    connectTermWS();
+    focusTerminal(true);
+  } catch(error) {
+    if(view === viewEpoch){ setStat('could not open session','busy'); lineError(error.message || 'Could not open session. Use Reconnect to retry.'); }
+  }
 }
 
 function setStat(txt, state){
@@ -1407,27 +1479,41 @@ function setStat(txt, state){
 }
 
 function connectTermWS(){
+  if(!wantOpen || !curSession || replayMode) return;
+  const view = viewEpoch, session = curSession;
+  if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
+  stopKeyboardHeartbeat();
+  collabState = null;
+  keyboardRequester = null;
+  renderCollab();
   if(termInputSender){ termInputSender.close(); termInputSender = null; }
-  if(termWS){ try{ wantOpen && (termWS.onclose=null); termWS.close(); }catch(e){} }
+  const old = termWS;
+  termWS = null;
+  if(old){ try{ old.close(); }catch(e){} }
   const proto = location.protocol==='https:'?'wss':'ws';
-  termWS = new WebSocket(`${proto}://${location.host}/ws/term`);
-  const inputWS = termWS;
-  const inputSession = curSession;
+  const socket = new WebSocket(`${proto}://${location.host}/ws/term`);
+  termWS = socket;
+  const isCurrent = ()=>socket === termWS && view === viewEpoch && session === curSession;
   termInputSender = ui.createTerminalInputSender((data, options) => {
-    if(inputWS.readyState!==1 || inputSession!==curSession) return false;
-    inputWS.send(JSON.stringify({
-      type:'input', session_id:inputSession, data:data, options:options,
+    if(!isCurrent() || !wantOpen || replayMode || socket.readyState!==1
+      || !(structuredMode ? canSendMessage(collabState) : canSendInput(collabState))) return false;
+    socket.send(JSON.stringify({
+      type:'input', session_id:session, data:data, options:options,
     }));
     return true;
   });
-  termWS.onopen = ()=>{
+  socket.onopen = ()=>{
+    if(!isCurrent() || !wantOpen) return;
     reconnectDelay = 500;
     setStat('live', 'online');
-    termWS.send(JSON.stringify({type:'attach',session_id:curSession,
-      cols:term.cols,rows:term.rows,surface:currentSurface}));
+    socket.send(JSON.stringify({type:'attach',session_id:session,
+      cols:term?.cols || 120,rows:term?.rows || 30,surface:currentSurface}));
   };
-  termWS.onmessage = (ev)=>{
-    const f = JSON.parse(ev.data);
+  socket.onmessage = (ev)=>{
+    if(!isCurrent() || !wantOpen) return;
+    let f;
+    try { f = JSON.parse(ev.data); } catch { lineError('Received an invalid session frame. Reconnect to retry.'); return; }
+    if(!f || typeof f !== 'object') return;
     if(f.session_id && f.session_id!==curSession) return;
     // Structured (chat) frames carry a canonical event JSON in `data`. Render
     // them into the chat surface instead of the terminal. Everything else
@@ -1437,97 +1523,131 @@ function connectTermWS(){
       return;
     }
     switch(f.type){
+      case 'ready':
       case 'session.ready':
-        if(currentSurface && f.surface !== currentSurface){
-          setStat('surface mismatch','busy');
-          termWS.close();
-          showAlert('Session surface mismatch', `Requested ${currentSurface}, but the connector confirmed ${f.surface || 'unknown'}. Deepbox will not silently fall back.`);
-          return;
-        }
-        currentSurface = f.surface || currentSurface;
+        setSessionSurface(f.surface, f.capabilities);
+        renderCollab();
+        focusTerminal(true);
         setStat(currentSurface === 'structured' ? 'chat ready' : 'terminal ready','online');
         break;
       case 'runtime.unavailable': {
         const reason = String(f.code || 'runtime_unavailable').replaceAll('_', ' ');
         setStat(`runtime unavailable: ${reason}`,'busy');
-        if(structuredMode && chatState){
-          chatState.items.push({kind:'error', text:`Runtime unavailable: ${reason}`});
-          renderChatSurface();
-        }
+        lineError(`Runtime unavailable: ${reason}. Check the connector runtime configuration and reconnect.`);
         break;
       }
       case 'restore':          // reconnect: instantly repaint current screen
-        term.reset(); term.write(f.data); break;
+        if(!structuredMode && term){ term.reset(); term.write(f.data || ''); } break;
       case 'output':
-        term.write(f.data); break;
+        if(!structuredMode && term) term.write(f.data || ''); break;
       case 'status':
+        if(f.surface){ setSessionSurface(f.surface); renderCollab(); }
         if(f.state==='live') setStat('live','online');
         else if(f.state==='offline'){ setStat('devbox offline','busy');
-          term.write('\r\n[devbox offline \u2014 the connector isn\'t running]\r\n'); }
+          lineError('Devbox offline \u2014 the connector is not running. Reconnect the connector, then retry.'); }
         else if(f.state==='ended'){ setStat('ended','offline');
-          term.write(`\r\n[session ended, code ${f.code}]\r\n`); }
+          wantOpen = false; stopKeyboardHeartbeat();
+          lineError(`Session ended, code ${f.code}. Start a New session to continue.`); renderCollab(); }
         break;
       case 'exit':
         setStat('ended','offline');
-        if(f.data) term.write(f.data);
-        term.write(`\r\n[session ended, code ${f.code}]\r\n`); break;
+        wantOpen = false; stopKeyboardHeartbeat();
+        if(!structuredMode && term && f.data) term.write(f.data);
+        lineError(`Session ended, code ${f.code}. Start a New session to continue.`); renderCollab(); break;
       case 'error':
-        term.write(`\r\n[error] ${f.message}\r\n`); break;
+        lineError(f.message || 'The session request failed.'); break;
+      case 'snapshot':
       case 'collaboration': {
         const hadKeyboard = !!(collabState && collabState.isHolder);
+        if(f.surface) setSessionSurface(f.surface);
         collabState = deriveCollaborationState(f, me ? {id: me.id, username: me.username} : null);
         if(!collabState.isHolder){
           keyboardRequester = null;
-          if(termInputSender) termInputSender.discard();
         }
         renderCollab();
         if(!hadKeyboard && collabState.isHolder) focusTerminal(true);
         break;
       }
       case 'keyboard_request':
-        if(collabState && collabState.isHolder){
+        if(!structuredMode && collabState && collabState.isHolder){
           keyboardRequester = {id:f.requester_user_id, username:f.requester_username};
           renderCollab();
         }
         break;
     }
   };
-  termWS.onclose = ()=>{
+  socket.onerror = ()=>{ if(isCurrent()) lineError('Session connection failed. Check your connection or use Reconnect.'); };
+  socket.onclose = ()=>{
+    if(!isCurrent()) return;
+    stopKeyboardHeartbeat();
     if(termInputSender){ termInputSender.close(); termInputSender = null; }
+    collabState = null;
+    keyboardRequester = null;
+    renderCollab();
     if(!wantOpen) return;
     setStat('reconnecting\u2026','busy');
-    reconnectTimer = setTimeout(connectTermWS, reconnectDelay);
+    reconnectTimer = setTimeout(()=>{ if(isCurrent() && wantOpen) connectTermWS(); }, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay*2, 5000);  // exponential backoff
   };
 }
 
+function lineError(message){
+  if(structuredMode && chatState){
+    chatState.items.push({kind:'error', text:String(message)});
+    renderChatSurface();
+    setChatComposerError(message);
+  } else if(term) term.write(`\r\n[error] ${message}\r\n`);
+  else {
+    const body = document.getElementById('stagebody');
+    if(body){ const error = document.createElement('p'); error.className = 'muted'; error.setAttribute('role','alert'); error.textContent = message; body.appendChild(error); }
+  }
+}
+
 // ---------------- collaboration (keyboard lease) ----------------
 function requestKeyboard(){
-  if(termWS && termWS.readyState===1 && curSession)
+  if(!structuredMode && !replayMode && collabState?.canRequest && termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'keyboard_acquire',session_id:curSession}));
 }
 function releaseKeyboard(){
-  if(termInputSender) termInputSender.flush();
-  if(termWS && termWS.readyState===1 && curSession)
+  if(!structuredMode && !replayMode && canSendInput(collabState) && termWS && termWS.readyState===1 && curSession)
     termWS.send(JSON.stringify({type:'keyboard_release',session_id:curSession}));
 }
 function handoffKeyboard(){
-  if(termWS && termWS.readyState===1 && curSession && keyboardRequester)
+  if(!structuredMode && !replayMode && canSendInput(collabState) && termWS && termWS.readyState===1 && curSession && keyboardRequester)
     termWS.send(JSON.stringify({type:'keyboard_handoff',session_id:curSession,
       target_user_id:keyboardRequester.id}));
   keyboardRequester = null;
 }
-setInterval(()=>{
-  if(collabState && collabState.isHolder && termWS && termWS.readyState===1 && curSession)
-    termWS.send(JSON.stringify({type:'keyboard_renew',session_id:curSession}));
-}, 20000);
+let keyboardHeartbeat = null;
+function stopKeyboardHeartbeat(){
+  if(keyboardHeartbeat !== null){ clearInterval(keyboardHeartbeat); keyboardHeartbeat = null; }
+}
+function syncKeyboardHeartbeat(){
+  if(structuredMode || replayMode || !wantOpen || !canSendInput(collabState) || !termWS || termWS.readyState!==1){
+    stopKeyboardHeartbeat();
+    return;
+  }
+  if(keyboardHeartbeat !== null) return;
+  const socket = termWS, session = curSession, view = viewEpoch;
+  keyboardHeartbeat = setInterval(()=>{
+    if(view !== viewEpoch || socket !== termWS || session !== curSession || structuredMode || !canSendInput(collabState)) return;
+    try { socket.send(JSON.stringify({type:'keyboard_renew',session_id:session})); } catch(e) {}
+  }, 20000);
+}
 // Render the compact keyboard status + action into #collab (lives in termhead).
 function renderCollab(){
+  syncKeyboardHeartbeat();
+  syncChatControls();
+  const newSession = document.getElementById('session-new');
+  if(newSession) newSession.disabled = !canSendMessage(collabState);
+  const endSession = document.getElementById('session-end');
+  if(endSession) endSession.disabled = !canSendInput(collabState) &&
+    !['admin', 'owner'].includes(collabState?.role);
+  if(term) term.options.disableStdin = replayMode || !canSendInput(collabState);
   const el = document.getElementById('collab');
   if(!el) return;
   const s = collabState;
-  const view = collabHeaderView(s, keyboardRequester);
-  if(term) term.options.disableStdin = !view.canType;
+  const view = collabHeaderView(s, keyboardRequester, currentSurface);
   let btn = '';
   if(view.button === 'handoff'){
     btn = '<button class="ghost" id="collab-handoff">Hand off</button>';
@@ -1569,74 +1689,92 @@ function stopReplay(){
 }
 
 function clearAgentView(){
+  ++viewEpoch;
   stopReplay();
+  stopKeyboardHeartbeat();
   const replaybar = document.getElementById('replaybar');
   if(replaybar) replaybar.remove();
   wantOpen = false;
   if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
   if(termInputSender){ termInputSender.close(); termInputSender = null; }
-  if(termWS){ try{ termWS.onclose=null; termWS.close(); }catch(e){} termWS=null; }
-  if(term){ try{ term.dispose(); }catch(e){} term=null; fit=null; }
+  const old = termWS;
+  termWS = null;
+  if(old){ try{ old.close(); }catch(e){} }
+  disposeTerminal();
   curAgentId = null;
   curSession = null;
   collabState = null;
+  keyboardRequester = null;
+  currentSurface = null;
   resetStructuredChat();
   replay = null;
   replayAgentId = null;
   replayAgentName = '';
   renderStageEmpty();
+  return viewEpoch;
 }
 
 async function openHistory(agentId, name){
-  // Cleanly leave any live session / reconnect loop.
-  stopReplay();
-  const replaybar = document.getElementById('replaybar');
-  if(replaybar) replaybar.remove();
-  wantOpen = false;
+  closeOverlay();
+  const surface = currentSurface;
+  const view = clearAgentView();
   curAgentId = agentId;
   renderFleet();
-  if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer = null; }
-  if(termWS){ try{ termWS.onclose=null; termWS.close(); }catch(e){} termWS=null; }
-  curSession = null;
 
   replayAgentId = agentId; replayAgentName = name;
-  let sessions = [];
-  try { sessions = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`); }
-  catch(e){ sessions = []; }
-
-  document.getElementById('termhead').innerHTML =
+  const head = document.getElementById('termhead'), body = document.getElementById('stagebody');
+  if(!head || !body) return;
+  head.innerHTML =
     `<span class="title">@<span class="handle">${esc(name)}</span></span>
      <span class="sep">\u2014</span><span class="muted">session history</span>
      <span class="spacer"></span>
      <button class="ghost" id="hist-live">\u2190 Back to live</button>`;
-  document.getElementById('hist-live').onclick = ()=>openAgent(agentId, name);
-
-  if(term){ try{ term.dispose(); }catch(e){} term = null; fit = null; }
-  const body = document.getElementById('stagebody');
-  body.innerHTML = '<div id="term"></div>';
-  const termEl = document.getElementById('term');
-  termEl.style.background = 'transparent';
+  document.getElementById('hist-live').onclick = ()=>openAgent(agentId, name, surface);
+  body.innerHTML = '<p class="muted">Loading session history\u2026</p>';
+  let sessions;
+  try { sessions = await api(`/api/agents/${encodeURIComponent(agentId)}/sessions`); }
+  catch(e){ if(view === viewEpoch) lineError(`Could not load history: ${e.message}`); return; }
+  if(view !== viewEpoch) return;
 
   const list = sessions.map(s=>{
-    const st = s.state==='live' ? 'online' : 'offline';
+    const alive = s.alive ?? s.state === 'live';
+    const st = alive ? 'online' : 'offline';
     return `<div class="history-item">
       <span class="status is-${st}"><span class="status-dot"></span><span class="status-label">${esc(s.state||'')}</span></span>
       <b class="mono">${esc(s.id)}</b>
-      <span class="muted">started ${esc(s.created_at||'')}</span>
+      <span class="muted">${s.surface === 'structured' ? 'Chat' : s.surface === 'terminal' ? 'Terminal' : 'Legacy surface unknown'} · started ${esc(s.created_at||'')}</span>
       <span class="spacer"></span>
+      ${alive && s.available !== false ? `<button class="ghost" data-attach="${esc(s.id)}">Attach live</button>` : ''}
       <button class="ghost" data-replay="${esc(s.id)}">Replay</button>
     </div>`;
   }).join('') || '<div class="muted" style="padding:14px">No sessions recorded.</div>';
-  termEl.innerHTML = `<div class="history-wrap">
+  body.innerHTML = `<div class="history-wrap">
     <div class="history-head">Session history for @${esc(name)}</div>${list}</div>`;
-  termEl.querySelectorAll('[data-replay]').forEach(b=>
-    b.onclick=()=>startReplay(b.dataset.replay));
+  body.querySelectorAll('[data-attach]').forEach(b=>b.onclick=()=>{
+    const session = sessions.find(s=>s.id === b.dataset.attach);
+    if(session && view === viewEpoch) openLiveSession({...session,agent_id:agentId}, name);
+  });
+  body.querySelectorAll('[data-replay]').forEach(b=>
+    b.onclick=()=>startReplay(b.dataset.replay, sessions.find(s=>s.id === b.dataset.replay)));
 }
 
-async function startReplay(sessionId){
+async function startReplay(sessionId, session=null){
+  closeOverlay();
+  const agentId = session?.agent_id || replayAgentId || curAgentId;
+  const name = replayAgentName || findAgent(agentId)?.agent.display_name || agentId || '';
+  const view = clearAgentView();
+  curAgentId = agentId;
+  replayAgentId = agentId; replayAgentName = name;
+  const body = document.getElementById('stagebody'), head = document.getElementById('termhead');
+  if(!body || !head) return;
+  body.innerHTML = '<p class="muted">Loading replay\u2026</p>';
+  head.innerHTML = `<span class="title">@${esc(name)}</span><span class="sep">\u2014</span><span class="muted">replay (read-only)</span>
+    <span class="spacer"></span><button class="ghost" id="rp-history">\u2190 History</button>`;
+  document.getElementById('rp-history').onclick = ()=>openHistory(agentId, name);
   let data;
-  try { data = await api(`/api/sessions/${sessionId}/replay`); }
-  catch(e){ await showAlert('Replay unavailable', e.message); return; }
+  try { data = await api(`/api/sessions/${encodeURIComponent(sessionId)}/replay`); }
+  catch(e){ if(view === viewEpoch) lineError(`Replay unavailable: ${e.message}`); return; }
+  if(view !== viewEpoch) return;
   replay = normalizeReplay(data);
   replayMode = true;
   replayPlaying = false;
@@ -1644,10 +1782,9 @@ async function startReplay(sessionId){
   replayCursor = 0;
   const total = replayDuration(replay);
 
-  // Rebuild xterm after the history list replaced its host contents.
-  const body = document.getElementById('stagebody');
+  const surface = data.surface || session?.surface ||
+    (replay.events.some(event=>event.kind === 'event' || event.type === 'event') ? 'structured' : 'terminal');
   body.innerHTML = '<div id="term"></div>';
-  const termEl = document.getElementById('term');
   const bar = document.createElement('div');
   bar.id = 'replaybar';
   bar.style.cssText = 'padding:8px 12px;border-top:1px solid var(--border);background:var(--panel)';
@@ -1678,19 +1815,44 @@ async function startReplay(sessionId){
         <option value="permanent">permanent</option>
       </select>
       <span class="muted" id="rp-retmsg"></span>
+      <button class="ghost danger" id="btnDeleteReplay">Delete recording</button>
     </div>`;
   body.appendChild(bar);
-  resetTerminal();
-  if(term.options) term.options.disableStdin = true;
+  const mounted = setSessionSurface(surface);
+  if(term) term.options.disableStdin = true;
+  if(structuredMode){
+    document.getElementById('chat-form').hidden = true;
+    document.getElementById('chat-controls').hidden = true;
+    document.getElementById('rp-final').textContent = 'final transcript';
+  }
 
   const selRet = document.getElementById('rp-retention');
+  const retmsg = document.getElementById('rp-retmsg');
+  const btnDeleteReplay = document.getElementById('btnDeleteReplay');
+  const workspace = ui.selectWorkspace(workspaces, activeWorkspaceId);
+  const canManage = !!workspace && ui.canAdminWorkspace(workspace.role);
+  selRet.disabled = !canManage;
+  btnDeleteReplay.disabled = !canManage;
   selRet.value = ret;
   selRet.onchange = async ()=>{
+    if(selRet.disabled || view !== viewEpoch) return;
+    selRet.disabled = true;
     try {
       await api(`/api/sessions/${encodeURIComponent(sessionId)}/retention`,
         {method:'PATCH', body: JSON.stringify({retention: selRet.value})});
-      document.getElementById('rp-retmsg').textContent = 'saved';
-    } catch(e){ document.getElementById('rp-retmsg').textContent = 'error'; }
+      if(view === viewEpoch) retmsg.textContent = 'saved';
+    } catch(e){ if(view === viewEpoch) retmsg.textContent = e.message || 'Could not save retention.'; }
+    finally { if(view === viewEpoch) selRet.disabled = !canManage; }
+  };
+  btnDeleteReplay.onclick = async()=>{
+    if(btnDeleteReplay.disabled || view !== viewEpoch) return;
+    btnDeleteReplay.disabled = true;
+    try {
+      if(!await showConfirm('Delete recording?', 'Permanently erase this recorded transcript and checkpoints. This cannot be undone.', 'Delete recording') || view !== viewEpoch) return;
+      await api(`/api/sessions/${encodeURIComponent(sessionId)}/recording`, {method:'DELETE'});
+      if(view === viewEpoch) await startReplay(sessionId, session);
+    } catch(error){ if(view === viewEpoch) retmsg.textContent = error.message || 'Could not delete recording.'; }
+    finally { if(view === viewEpoch) btnDeleteReplay.disabled = !canManage; }
   };
 
   document.getElementById('rp-speed').onchange = (e)=>{ replaySpeed = Number(e.target.value)||1; };
@@ -1700,15 +1862,25 @@ async function startReplay(sessionId){
   document.getElementById('rp-final').onclick = ()=>showFinalScreen();
   document.getElementById('rp-seek').oninput = (e)=>{ pauseReplay(); replaySeek(Number(e.target.value)); };
 
-  replaySeek(0);
+  if(mounted) replaySeek(structuredMode ? total : 0);
 }
 
 // Reset terminal, load nearest checkpoint <= target, apply subsequent events.
 function replaySeek(target){
-  if(!replay) return;
+  if(!replay || !replayMode) return;
   const total = replayDuration(replay);
   target = Math.max(0, Math.min(target, total));
   replayCursor = target;
+  if(structuredMode){
+    chatState = Chat.initialChatState();
+    for(const event of eventsBetween(replay.events, -Infinity, target)){
+      if(event.kind === 'event' || event.type === 'event') chatState = Chat.foldEventPayload(chatState, event.data, false).state;
+    }
+    renderChatSurface();
+    updateReplayUI();
+    return;
+  }
+  if(!term) return;
   term.reset();
   const ci = nearestCheckpointIndex(replay.checkpoints, target);
   let startTime = -Infinity, startCursor = null;
@@ -1743,7 +1915,7 @@ function pauseReplay(){
 }
 
 function playReplay(){
-  if(!replay) return;
+  if(!replay || !replayMode || (!structuredMode && !term)) return;
   const total = replayDuration(replay);
   if(replayCursor >= total) replaySeek(0);
   replayPlaying = true;
@@ -1753,12 +1925,19 @@ function playReplay(){
 
 // Advance to the next event after replayCursor, honoring speed.
 function scheduleReplayStep(){
-  if(!replayPlaying) return;
+  if(!replayPlaying || !replayMode) return;
   const next = (replay.events||[]).find(e=> typeof e.time==='number' && e.time>replayCursor+1e-9);
   if(!next){ pauseReplay(); return; }
   const delayMs = Math.max(0, (next.time - replayCursor) * 1000 / replaySpeed);
+  const view = viewEpoch, activeReplay = replay;
   replayTimer = setTimeout(()=>{
-    if(!replayPlaying) return;
+    if(view !== viewEpoch || replay !== activeReplay || !replayPlaying || !replayMode) return;
+    if(structuredMode){
+      replaySeek(next.time);
+      scheduleReplayStep();
+      return;
+    }
+    if(!term) return;
     const batch = (replay.events||[]).filter(e =>
       typeof e.time==='number' && e.time>replayCursor+1e-9 && e.time<=next.time);
     replayCursor = next.time;
@@ -1771,9 +1950,11 @@ function scheduleReplayStep(){
 
 // Static preview of the final screen (last checkpoint) and seek to end.
 function showFinalScreen(){
-  if(!replay) return;
+  if(!replay || !replayMode) return;
   pauseReplay();
   const total = replayDuration(replay);
+  if(structuredMode){ replaySeek(total); return; }
+  if(!term) return;
   const cps = replay.checkpoints || [];
   const last = cps.length ? cps[cps.length-1] : null;
   if(last && last.serialized_screen && last.time >= (replay.events||[]).reduce((m,e)=>Math.max(m,e.time||0),0)){
@@ -1791,16 +1972,11 @@ let paletteState = null; // {items, filtered, index}
 
 function openCommandPalette(){
   if(!ui || !me) return;
-  closeOverlay();
   const workspace = ui.selectWorkspace(workspaces, activeWorkspaceId);
   const workspaceBoxes = workspace ? ui.devboxesForWorkspace(devboxes, workspace.id) : [];
   let items = ui.commandItems({devboxes:workspaceBoxes, isOwner: me.role==='owner'});
   if(!workspace || !ui.canAdminWorkspace(workspace.role)) items = items.filter(item=>item.id !== 'devbox.create');
-  paletteState = {items, filtered: items, index: 0};
-  const overlay = document.createElement('div');
-  overlay.className = 'overlay';
-  overlay.id = 'overlay';
-  overlay.innerHTML = `
+  return showOverlay(`
     <div class="palette" role="dialog" aria-label="Command palette">
       <div class="palette-input-wrap">
         <span class="icon">\u203a</span>
@@ -1812,16 +1988,17 @@ function openCommandPalette(){
         <span><span class="kbd">\u21b5</span> open</span>
         <span><span class="kbd">esc</span> close</span>
       </div>
-    </div>`;
-  overlay.onclick = (e)=>{ if(e.target===overlay) closeOverlay(); };
-  document.body.appendChild(overlay);
-  const input = document.getElementById('palette-q');
+    </div>`, overlay=>{
+  paletteState = {items, filtered: items, index: 0};
+  const input = overlay.querySelector('#palette-q');
   input.oninput = ()=>{
+    if(overlay !== overlayEl) return;
     paletteState.filtered = ui.filterCommands(paletteState.items, input.value);
     paletteState.index = 0;
     renderPaletteList();
   };
   input.onkeydown = (e)=>{
+    if(overlay !== overlayEl) return;
     if(e.key==='ArrowDown'){ e.preventDefault();
       paletteState.index = ui.moveSelection(paletteState.index, 1, paletteState.filtered.length); renderPaletteList(); }
     else if(e.key==='ArrowUp'){ e.preventDefault();
@@ -1831,6 +2008,7 @@ function openCommandPalette(){
   };
   renderPaletteList();
   input.focus();
+  });
 }
 
 function renderPaletteList(){
@@ -1883,33 +2061,57 @@ document.addEventListener('keydown', (e)=>{
 });
 
 // ---------------- overlay: palette + modals ----------------
+let overlayEl = null, dismissOverlay = null, overlayEpoch = 0;
 function closeOverlay(){
-  const o = document.getElementById('overlay');
-  if(o) o.remove();
+  ++overlayEpoch;
+  if(dismissOverlay) dismissOverlay(null);
+  else document.getElementById('overlay')?.remove();
   paletteState = null;
+}
+
+// One lifecycle for dialogs and forms. Replacement is cancellation, not a lost
+// promise; late/double clicks cannot remove the next overlay or submit it.
+function showOverlay(html, onReady){
+  closeOverlay();
+  return new Promise((resolve,reject)=>{
+    const overlay = document.createElement('div');
+    overlay.className = 'overlay'; overlay.id = 'overlay';
+    overlay.innerHTML = html;
+    let settled = false;
+    const done = (value,error)=>{
+      if(settled) return;
+      settled = true;
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+      if(overlayEl === overlay){
+        overlayEl = null; dismissOverlay = null; paletteState = null; ++overlayEpoch;
+      }
+      error ? reject(error) : resolve(value);
+    };
+    const onKey = event=>{
+      if(overlayEl === overlay && event.key === 'Escape'){ event.preventDefault(); done(null); }
+    };
+    overlay.onclick = event=>{ if(event.target === overlay) done(null); };
+    overlayEl = overlay;
+    dismissOverlay = done;
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    try { if(onReady) onReady(overlay,done); } catch(error) { done(null,error); }
+  });
 }
 
 // Generic modal. Returns a Promise resolving to the chosen action's value.
 function showModal({title, desc, bodyHtml, actions, onReady}){
-  return new Promise(resolve=>{
-    closeOverlay();
-    const overlay = document.createElement('div');
-    overlay.className = 'overlay'; overlay.id = 'overlay';
-    const acts = (actions||[{label:'OK', primary:true, value:true}]);
-    overlay.innerHTML = `<div class="modal" role="dialog" aria-label="${esc(title||'')}">
+    const acts = actions || [{label:'OK', primary:true, value:true}];
+    return showOverlay(`<div class="modal" role="dialog" aria-label="${esc(title||'')}">
       <div class="modal-head"><h3>${esc(title||'')}</h3>${desc?`<p>${esc(desc)}</p>`:''}</div>
       ${bodyHtml?`<div class="modal-body">${bodyHtml}</div>`:''}
       <div class="modal-actions">${acts.map((a,i)=>
         `<button class="${a.primary?'':'ghost'}${a.danger?' danger':''}" data-a="${i}">${esc(a.label)}</button>`).join('')}</div>
-    </div>`;
-    const done = (v)=>{ overlay.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
-    const onKey = (e)=>{ if(e.key==='Escape'){ e.preventDefault(); done(null); } };
-    overlay.onclick = (e)=>{ if(e.target===overlay) done(null); };
-    document.addEventListener('keydown', onKey);
-    document.body.appendChild(overlay);
-    if(onReady) onReady(overlay);
+    </div>`, (overlay,done)=>{
     overlay.querySelectorAll('[data-a]').forEach(b=>
       b.onclick = ()=> done(acts[Number(b.dataset.a)].value));
+    if(onReady) onReady(overlay);
   });
 }
 
@@ -1924,10 +2126,6 @@ function showConfirm(title, message, confirmLabel){
 
 // Form modal. Returns {field:value,...} on submit, or null on cancel.
 function showForm({title, desc, fields, submit, extraHtml='', onReady=null}){
-  return new Promise(resolve=>{
-    closeOverlay();
-    const overlay = document.createElement('div');
-    overlay.className = 'overlay'; overlay.id = 'overlay';
     const fieldHtml = fields.map((f,i)=>{
       const id = 'f_'+i;
       const control = f.type==='select'
@@ -1939,39 +2137,36 @@ function showForm({title, desc, fields, submit, extraHtml='', onReady=null}){
         : `<input id="${id}" data-field="${esc(f.name)}" type="${esc(f.type||'text')}" placeholder="${esc(f.placeholder||'')}" value="${esc(f.value||'')}"/>`;
       return `<div class="field"><label for="${id}">${esc(f.label)}</label>${control}${f.helpHtml||''}</div>`;
     }).join('');
-    overlay.innerHTML = `<div class="modal" role="dialog" aria-label="${esc(title||'')}">
+    return showOverlay(`<div class="modal" role="dialog" aria-label="${esc(title||'')}">
       <div class="modal-head"><h3>${esc(title||'')}</h3>${desc?`<p>${esc(desc)}</p>`:''}</div>
       <div class="modal-body">${fieldHtml}${extraHtml}</div>
       <div class="modal-err" id="form-err"></div>
       <div class="modal-actions">
         <button class="ghost" data-cancel>Cancel</button>
         <button data-submit>${esc(submit||'Save')}</button>
-      </div></div>`;
-    const done = (v)=>{ overlay.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
+      </div></div>`, (overlay,done)=>{
     const collect = ()=>{
       const out = {};
-      for(let i=0;i<fields.length;i++) out[fields[i].name] = document.getElementById('f_'+i).value.trim();
+      for(let i=0;i<fields.length;i++) out[fields[i].name] = overlay.querySelector('#f_'+i).value.trim();
       for(const f of fields) if(f.required && !out[f.name]){
-        document.getElementById('form-err').textContent = f.label+' is required.'; return null; }
+        overlay.querySelector('#form-err').textContent = f.label+' is required.'; return null; }
       return out;
     };
-    const submitForm = ()=>{ const v = collect(); if(v) done(v); };
-    const onKey = (e)=>{
-      if(e.key==='Escape'){ e.preventDefault(); done(null); }
-      else if(e.key==='Enter'){ e.preventDefault(); submitForm(); }
+    const submitForm = ()=>{ if(overlay !== overlayEl) return; const v = collect(); if(v) done(v); };
+    overlay.onkeydown = (e)=>{
+      if(e.key==='Enter' && !e.isComposing && !['TEXTAREA','BUTTON'].includes(e.target?.tagName)){
+        e.preventDefault(); submitForm();
+      }
     };
-    overlay.onclick = (e)=>{ if(e.target===overlay) done(null); };
-    document.addEventListener('keydown', onKey);
-    document.body.appendChild(overlay);
     overlay.querySelector('[data-cancel]').onclick = ()=> done(null);
     overlay.querySelector('[data-submit]').onclick = submitForm;
     if(onReady) onReady(overlay);
-    const first = overlay.querySelector('input,select'); if(first) first.focus();
+    const first = overlay.querySelector('input,select'); if(first && overlay === overlayEl) first.focus();
   });
 }
 
 // ---------------- start ----------------
-Promise.all([loadReplayHelpers(), loadUI()]).then(boot).catch(error => {
+boot().catch(error => {
   app.innerHTML = `<div class="auth"><div class="auth-card"><h2>Unable to start</h2>
     <p class="muted">${esc(error.message)}</p></div></div>`;
 });

@@ -175,16 +175,42 @@ async def _spawn_fake(lines):
 
 
 async def _co_write_encodes():
-    sess = A.StructuredAgentSession(
-        ["claude"], None, _noop, _noop,
-        spawn=lambda: _spawn_fake([]))
-    await sess.start()
-    # Ensure alive before write (reader hasn't hit EOF wait yet in this tick).
-    sess._alive = True
-    sess.write("do the thing")
-    assert b"do the thing" in sess._proc.stdin.buf
+    got = []
+    closed = asyncio.Event()
+    exited = asyncio.Event()
+    proc = _FakeProc([])
 
-def test_write_encodes_user_turn_sync():
+    async def read_until_closed():
+        await closed.wait()
+        return b""
+
+    async def spawn():
+        return proc
+
+    async def on_output(value):
+        got.append(json.loads(value))
+
+    async def on_exit(code):
+        exited.set()
+
+    proc.stdout.readline = read_until_closed
+    sess = A.StructuredAgentSession(
+        ["fake-agent"], None, on_output, on_exit, spawn=spawn, lazy_start=True)
+    await sess.start()
+    try:
+        assert sess.write("do the thing") is True
+        await asyncio.wait_for(sess._turn_task, 1)
+        packet = json.loads(proc.stdin.buf)
+        assert packet["type"] == "user"
+        assert "do the thing" in json.dumps(packet)
+        assert [e["text"] for e in got if e["ev"] == A.EV_USER_ECHO] == ["do the thing"]
+        assert [e["options"] for e in got if e["ev"] == A.EV_SESSION_CONFIG] == [{}]
+    finally:
+        sess.kill()
+        closed.set()
+        await asyncio.wait_for(exited.wait(), 1)
+
+def test_write_uses_canonical_async_turn_path():
     asyncio.run(_co_write_encodes())
 
 
@@ -376,4 +402,140 @@ async def _co_spawn_failure_becomes_protocol_error():
 
 def test_spawn_failure_becomes_protocol_error_sync():
     asyncio.run(_co_spawn_failure_becomes_protocol_error())
+
+
+def test_kill_before_scheduled_lazy_turn_prevents_spawn_and_restart():
+    async def run():
+        spawned = []
+
+        async def spawn():
+            spawned.append(True)
+            return _FakeProc([])
+
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, _noop, _noop,
+            spawn=spawn, lazy_start=True)
+        await sess.start()
+        assert sess.write("queued") is True
+        worker = sess._turn_task
+        sess.kill()
+        await asyncio.wait_for(worker, 1)
+        assert not spawned
+        assert not sess.is_alive() and sess._proc is None
+        assert sess._turn_task is None and not sess._turn_queue
+        assert sess.write("after kill") is False
+        try:
+            await sess.start()
+        except RuntimeError as exc:
+            assert str(exc) == "Session is closed"
+        else:
+            raise AssertionError("Killed sessions must not restart")
+
+    asyncio.run(run())
+
+
+def test_kill_during_lazy_or_eager_spawn_reaps_late_child():
+    async def run(lazy):
+        entered, release = asyncio.Event(), asyncio.Event()
+        proc = _FakeProc([])
+        waited = []
+
+        async def spawn():
+            entered.set()
+            await release.wait()
+            return proc
+
+        async def wait():
+            waited.append(True)
+            return proc.returncode
+
+        proc.wait = wait
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, _noop, _noop,
+            spawn=spawn, lazy_start=lazy)
+        if lazy:
+            await sess.start()
+            sess.write("first")
+            sess.write("must not launch")
+            task = sess._turn_task
+        else:
+            task = asyncio.create_task(sess.start())
+        await asyncio.wait_for(entered.wait(), 1)
+        sess.kill()
+        release.set()
+        await asyncio.wait_for(task, 1)
+        assert proc._killed and waited == [True]
+        assert sess._proc is None and not sess.is_alive()
+        assert not sess._turn_queue and sess._turn_task is None
+        assert not proc.stdin.buf
+
+    for lazy in (False, True):
+        asyncio.run(run(lazy))
+
+
+def test_scheduled_turn_failure_is_canonical_redacted_and_worker_recovers():
+    async def run():
+        got = []
+        attempts = []
+
+        async def on_output(raw):
+            got.append(json.loads(raw))
+
+        def options(value):
+            attempts.append(value)
+            raise RuntimeError(r"SECRET=fake-token C:\private --private-argv")
+
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, on_output, _noop,
+            lazy_start=True, option_sanitizer=options)
+        await sess.start()
+        assert sess.write_turn("one", {})
+        assert sess.write_turn("two", {})
+        await asyncio.wait_for(sess._turn_task, 1)
+        assert len(attempts) == 2
+        errors = [e for e in got if e["ev"] == A.EV_ERROR]
+        assert len(errors) == 2
+        assert all(e["code"] == "runtime.unavailable" for e in errors)
+        assert "SECRET" not in json.dumps(got)
+        assert "private" not in json.dumps(got)
+        assert sess._turn_task is None and not sess._turn_pending
+        assert sess.is_alive()
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_kill_during_windows_retry_backoff_prevents_later_spawn(monkeypatch):
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        attempts = []
+
+        async def spawn(*args, **kwargs):
+            attempts.append(args)
+            exc = PermissionError(13, "fake private spawn details")
+            exc.winerror = 5
+            raise exc
+
+        async def retry_sleep(_delay):
+            entered.set()
+            await release.wait()
+
+        monkeypatch.setattr(A, "IS_WIN", True)
+        monkeypatch.setattr(A, "_resolve_spawn_argv", lambda argv: argv)
+        monkeypatch.setattr(A.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(A.asyncio, "sleep", retry_sleep)
+        sess = A.StructuredAgentSession(
+            ["fake-native.exe"], None, _noop, _noop, lazy_start=True)
+        await sess.start()
+        sess.write("first")
+        worker = sess._turn_task
+        await asyncio.wait_for(entered.wait(), 1)
+        sess.kill()
+        release.set()
+        await asyncio.wait_for(worker, 1)
+        assert len(attempts) == 1
+        assert not sess.is_alive() and sess._proc is None
+        assert sess._turn_task is None
+
+    asyncio.run(run())
 

@@ -54,7 +54,9 @@ Browser  <--WSS /ws/term-->  Server  <--WSS /ws/devbox-->  Connector  -->  CLI a
 - **`models.py`** — SQLAlchemy ORM schema and `init_db()` (per-connection SQLite
   PRAGMAs: WAL, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout`,
   `wal_autocheckpoint`). Holds `PROTOCOL_VERSION`, retention constants, and the
-  additive `_migrate()` / workspace backfill.
+  additive `_migrate()` / workspace backfill. `Session.surface` stores `terminal`
+  or `structured`; migrated sessions remain unknown until a validated ready or
+  snapshot establishes their surface. No runtime-name inference is needed.
 - **`hub.py`** — in-memory `Hub`: routes frames between connected browsers and
   connectors, per-devbox bounded send queues, hello ordering, duplicate-connection
   retirement, and presence.
@@ -95,7 +97,7 @@ across all of the caller's memberships. Highlights:
 - **Fleet:** `GET|POST /api/devboxes`, `DELETE /api/devboxes/{id}`, devbox tokens
   (`GET|POST|DELETE`), agents (`POST /api/devboxes/{id}/agents`,
   `DELETE /api/agents/{id}`), and connector inventory intake
-  (`POST /api/devboxes/{id}/runtimes|projects|skills`).
+  (`POST /api/devboxes/{id}/runtimes|projects|skills`, bearer authenticated).
 - **Sessions & replay:** `GET|POST /api/agents/{id}/sessions`,
   `GET /api/sessions/{id}/messages`, `GET /api/sessions/{id}/recording`
   (asciicast v2), `GET /api/sessions/{id}/replay` (header/events/checkpoints/
@@ -112,6 +114,21 @@ WebSockets:
 - **`/ws/term`** — browser session channel. Origin-checked; cookie-authenticated.
   Carries input, resize, keyboard-lease, and the relayed output/event stream.
 
+Session create/list and ready/snapshot frames carry the generic `surface` value.
+An attach cannot silently change an existing session's surface. Structured
+`stdin`/`input`, permission replies, and interrupts require Operator or above,
+but not the terminal keyboard lease. Terminal input and resize retain exclusive
+keyboard ownership. Structured keyboard REST requests return 400; browser keyboard
+frames return `keyboard_not_required`. Closing a process is separate: the keyboard
+holder or workspace Admin/Owner can terminate it (an Operator cannot terminate a
+structured process merely by being able to chat).
+
+Every input checks current identity, membership, and attachment. Every connector
+session frame checks the current devbox connection, session's owning agent, and
+instance fence—including legacy output, ready, exit and process snapshots, not
+just durable v3 frames. Malformed frames return an error instead of tearing down
+the connection. Valid legacy wire forms remain supported at this boundary.
+
 ## 4. Connector (`connector/`)
 
 - **`client.py` / `Connector.run()`** — top-level loop: `GET /api/me`, report
@@ -127,6 +144,10 @@ WebSockets:
   in-process `LoopbackChannel` by default (`python -m connector`), or as two
   processes via `--mode supervisor` / `--mode transport` over a local named pipe
   (Windows) or Unix socket (`0600`).
+  There is one sender/delivery path: the unused `Connector._sender` and its
+  supervisor-property facades have been removed. Diagnostics and both transports
+  share URL validation: HTTPS is required off loopback, and credential-bearing,
+  query-bearing or fragment-bearing base URLs are rejected before using a token.
 - **`spool.py`** — durable output spool (SQLite, WAL, `synchronous=FULL`); see
   [`persistence.md`](persistence.md).
 - **`runtimes.py`** — single source of truth for runtime adapters. `RuntimeAdapter`
@@ -134,21 +155,33 @@ WebSockets:
   probe hints, terminal/structured surfaces, and personal/project skill roots.
   Built-in: `mock`, `claude-code`, `copilot-cli`, `codex-cli`,
   `claude-code-structured`, and `copilot-cli-structured`.
-  `resolve_cmd()` builds argv (explicit `launch_cmd` via `shlex.split`, else the
+  `resolve_cmd()` builds argv (platform-appropriate parsing of `launch_cmd`, else the
   shared `build_command()`), rejects empty/control/shell-metacharacter tokens,
-  and spawns argv directly (no shell). Unknown runtime IDs are rejected.
+  and spawns argv directly (no shell). Unknown runtime IDs without an explicit
+  command are rejected instead of being replaced with `mock`.
 - **`runtime_probe.py`** — runs local subprocess probes and emits capability
   schema v2 (installation, compatibility, authentication, models, surfaces, and a
   content-hash `revision`). Executable paths, raw probe output, and credentials
-  are never uploaded.
+  are never uploaded. Version metadata is a parsed version number, not an arbitrary
+  first output line. Probe output is captured in a temporary file and only a 64 KiB
+  prefix is read into memory; timeouts and failed probes keep their fixed statuses.
 - **`pty_session.py`** — cross-platform pseudo-terminal for interactive TUIs
   (Windows ConPTY via `pywinpty`; POSIX `pty.fork` + `os.execvp`). Default size
-  120x30, re-sized by the first browser `resize` frame.
+  120x30, re-sized by the first browser `resize` frame. Windows passes argv directly
+  to `PtyProcess.spawn`; explicit command parsing preserves Windows paths and
+  quoted arguments. Normal exit and kill release the child and PTY reader handles;
+  a failed working-directory change never falls through to a different directory.
 - **`agent_session.py`** — structured (`kind="event"`) sessions. Translates a
   runtime's JSON stream into display-safe canonical events (`status`,
   `session.config`, `user.echo`, `message.delta`, `message`, `tool.call`,
   `tool.result`, `permission.ask`, `turn.end`, `error`). `write_turn(text,
   options)` applies per-turn/session controls under the adapter allowlist.
+  All writes use the same bounded turn queue; per-turn processes finish before
+  the next queued turn starts. Full/closed queues reject input explicitly.
+  Kill cancels queued work, so a scheduled turn cannot launch a new child later.
+  Supervisor starts are serialized per session and invalidated by retirement or
+  shutdown; partially-started children are cleaned and failures have safe,
+  actionable `runtime.unavailable` messages.
 - **`local_store.py`** — local project + skill state (SQLite); project paths are
   retained locally and stripped from cloud inventory; see
   [`persistence.md`](persistence.md).
@@ -156,7 +189,9 @@ WebSockets:
   (regular files only; no traversal/symlink; 256 files / 10 MiB caps), and does
   atomic staged install/rollback/drift/GC. Scripts are surfaced
   (`contains_scripts=true`) but never executed by DeepBox.
-- **`diagnostics.py`** — `run_doctor()` URL/TLS/DNS/protocol checks.
+- **`diagnostics.py`** — shared server URL validation and `run_doctor()`
+  URL/TLS/DNS/protocol checks. Unknown connection failures expose the exception
+  class, not raw exception text that may contain URLs or credentials.
 - **`mockcli.py`** — a fake CLI (echoes `you said: ...`) so the full chain can be
   exercised without a real agent.
 
@@ -185,10 +220,16 @@ WebSockets:
   (`Workspace → Devbox → Agent`), workspace management affordances, one-time
   token display, session content area, DOM/WebSocket/FileReader wiring, and
   replay UI. Role checks are always re-enforced on the server.
-- **`ui.js`, `chat.js`, `replay.js`, `collaboration.js`** — DOM-free logic:
+- **`ui.js`, `chat.js`, `replay.js`, `collaboration.js`** — shared helpers:
   fleet aggregation, filtering, command building, runtime label/option handling,
   the canonical event reducer, JSONL parsing, replay seek/checkpoint logic, and
-  collaboration view state. Loaded dynamically by `app.js`.
+  collaboration view state, plus the transcript renderer. Loaded in fixed deferred
+  script order before `app.js`; there are no lazy-loader promises or single-flight
+  chat-mount gates. Explicit Terminal selects only a matching live terminal;
+  New session retains the selected surface. Chat and structured replay never
+  initialize xterm. Terminal replay mounts xterm inside its host without replacing
+  the replay toolbar. Route/socket guards reject late responses from old views;
+  replacing an overlay resolves cancellation and removes its Escape handler.
 
 The reducer merges `session.config`, `user.echo`, assistant messages, tool cards,
 permissions, turn and error state; optimistic user turns are de-duplicated against
@@ -209,7 +250,7 @@ checks the database and recording data directory). See
 ## 7. Testing
 
 Server, connector, security, and persistence suites live in `tests/` and run with
-pytest; DOM-free browser logic runs with `node --test`.
+pytest; pure helpers and actual app orchestration run with `node --test`.
 
 ```bat
 :: Python suites
@@ -218,7 +259,7 @@ pytest; DOM-free browser logic runs with `node --test`.
 .venv\Scripts\python -m pytest tests\test_server_recording.py -q
 
 :: Browser (node:test) suites
-node --test web\ui.test.js web\chat.test.js web\replay.test.js web\collaboration.test.js
+node --test web\ui.test.js web\chat.test.js web\replay.test.js web\collaboration.test.js web\app.test.js
 ```
 
 Representative coverage:
@@ -226,6 +267,8 @@ Representative coverage:
 | Area | Tests |
 |---|---|
 | End-to-end lifecycle | `test_agent_lifecycle.py`, `test_hub.py`, `test_onboarding.py` |
+| Surface selection and shared-session security | `test_session_surfaces.py`, `web/app.test.js` |
+| PTY lifecycle (including isolated Windows children) | `test_pty_session.py` |
 | Recording / replay / retention | `test_server_recording.py`, `test_persistence.py` |
 | Connector transport split | `test_connector_supervisor.py`, `test_connector_transport.py`, `test_connector_ipc.py` |
 | Durable spool | `test_connector_spool.py` |

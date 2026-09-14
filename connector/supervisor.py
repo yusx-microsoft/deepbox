@@ -38,34 +38,6 @@ MAX_INFLIGHT_FRAMES = 64
 MAX_INFLIGHT_BYTES = 512 * 1024
 
 
-class _PendingView:
-    """List-like compatibility view over ephemeral controls + durable output."""
-
-    def __init__(self, supervisor: "SessionSupervisor"):
-        self._supervisor = supervisor
-
-    def _frames(self) -> list[dict]:
-        controls = [frame for _delivery_id, frame in self._supervisor._controls]
-        outputs = [
-            frame for _delivery_id, frame
-            in self._supervisor._spool.pending_records()
-        ]
-        return controls + outputs
-
-    def __len__(self) -> int:
-        return len(self._frames())
-
-    def __iter__(self):
-        return iter(self._frames())
-
-    def __getitem__(self, index):
-        return self._frames()[index]
-
-    def __bool__(self) -> bool:
-        return bool(self._supervisor._controls or
-                    self._supervisor._spool.pending_records())
-
-
 class SessionSupervisor:
     """Owns every local agent session, independent of any transport."""
 
@@ -80,6 +52,9 @@ class SessionSupervisor:
         self.ptys: dict[tuple[str, str], PtySession | StructuredAgentSession] = {}
         self.pty_instances: dict[tuple[str, str], str] = {}
         self.pty_surfaces: dict[tuple[str, str], str] = {}
+        self._open_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._open_users: dict[tuple[str, str], int] = {}
+        self._stopped = False
         # Durable, sequence-numbered store of unacknowledged session output. Tests
         # may inject an InMemorySpool; the CLI injects a DiskSpool.
         self._spool: SpoolBase = spool if spool is not None else InMemorySpool()
@@ -87,7 +62,6 @@ class SessionSupervisor:
         # frames must not be replayed after a supervisor restart.
         self._controls: deque[tuple[str, dict]] = deque()
         self._next_control_id = 0
-        self.pending = _PendingView(self)
         self.pending_event = asyncio.Event()
         # A frame remains queued until the transport confirms WebSocket send.
         # The IPC delivery_id carried to the transport IS the durable seq, so an
@@ -106,6 +80,13 @@ class SessionSupervisor:
         # Un-acked frames recovered from a prior run are immediately eligible.
         if self._spool.pending_records():
             self.pending_event.set()
+
+    @property
+    def pending(self) -> list[dict]:
+        """Snapshot of pending frames; only delivery ACKs advance the spool."""
+        return ([dict(frame) for _delivery_id, frame in self._controls]
+                + [dict(frame) for _delivery_id, frame
+                   in self._spool.pending_records()])
 
     # -- local project resolution -----------------------------------------
 
@@ -309,6 +290,9 @@ class SessionSupervisor:
             removed_agent_ids = set(self.agents) - set(updated)
             self.agents = updated
             if removed_agent_ids:
+                for key in list(self._open_locks):
+                    if key[0] in removed_agent_ids:
+                        self._invalidate_open(key)
                 removed_streams: set[tuple[str, str]] = set()
                 for _delivery_id, pending in self._spool.pending_records():
                     session_id = pending.get("session_id")
@@ -352,6 +336,24 @@ class SessionSupervisor:
             except (TypeError, ValueError, AttributeError):
                 return
             if p:
+                reason = None
+                if not p.is_alive():
+                    reason = "runtime_not_running"
+                elif not isinstance(frame.get("data", ""), str):
+                    reason = "invalid_input"
+                elif (callable(getattr(p, "can_accept_turn", None))
+                      and not p.can_accept_turn()):
+                    p.write_turn(frame.get("data", ""), frame.get("options"))
+                    reason = "turn_queue_full"
+                if reason:
+                    # Do not record a delivery receipt for rejected input.
+                    # Retrying its id after capacity returns must still work.
+                    self.emit({
+                        "type": "input_ack", "agent_id": aid,
+                        "session_id": sid, "client_input_id": client_input_id,
+                        "status": "rejected", "reason": reason,
+                    })
+                    return
                 first_delivery = self._spool.record_input_once(client_input_id)
                 if first_delivery:
                     writer = getattr(p, "write_turn", None)
@@ -379,6 +381,7 @@ class SessionSupervisor:
                                      bool(frame.get("allow")))
         elif t in ("close", "terminate"):
             key = (aid, sid)
+            self._invalidate_open(key)
             p = self.ptys.pop(key, None)
             if p:
                 p.kill()
@@ -425,6 +428,52 @@ class SessionSupervisor:
     async def open_pty(self, agent_id: str, session_id: str,
                        cols: int = 120, rows: int = 30,
                        surface: str | None = None) -> None:
+        if self._stopped or agent_id not in self.agents:
+            return
+        key = (agent_id, session_id)
+        lock = self._open_locks.setdefault(key, asyncio.Lock())
+        self._open_users[key] = self._open_users.get(key, 0) + 1
+
+        def current():
+            return (not self._stopped and agent_id in self.agents
+                    and self._open_locks.get(key) is lock)
+
+        try:
+            async with lock:
+                if not current():
+                    return
+                try:
+                    await self._open_pty(
+                        agent_id, session_id, cols, rows, surface, current)
+                except Exception:
+                    # Exceptions can contain executable paths, argv, environment
+                    # values or provider credentials. Never forward their text.
+                    if current():
+                        self.emit({
+                            "type": "runtime.unavailable",
+                            "agent_id": agent_id,
+                            "session_id": session_id,
+                            "code": "spawn_failed",
+                            "surface": surface,
+                            "message": (
+                                "Could not start the runtime. Check that the CLI "
+                                "is installed, executable and authenticated, and "
+                                "that the local workspace is accessible, then retry."),
+                        })
+        finally:
+            if self._open_locks.get(key) is lock:
+                self._open_users[key] -= 1
+                if not self._open_users[key]:
+                    self._invalidate_open(key)
+
+    def _invalidate_open(self, key) -> None:
+        # In-flight callers retain the old lock, but may no longer launch or
+        # register a child after close, retirement or shutdown (even on re-add).
+        self._open_locks.pop(key, None)
+        self._open_users.pop(key, None)
+
+    async def _open_pty(self, agent_id, session_id, cols, rows, surface,
+                        current) -> None:
         key = (agent_id, session_id)
         existing = self.ptys.get(key)
         if existing and existing.is_alive():
@@ -451,6 +500,10 @@ class SessionSupervisor:
             self.ptys.pop(key, None)
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
+            try:
+                existing.kill()
+            except Exception:
+                pass
         pty_instance_id = str(uuid4())
         info = self.agents.get(agent_id)
         if not info:
@@ -462,7 +515,7 @@ class SessionSupervisor:
                 "session_id": session_id,
                 "runtime": info.get("runtime") or "",
                 "code": "project_unavailable",
-                "message": str(info["project_error"]),
+                "message": "Local project is unavailable. Restore or rebind the workspace, then retry.",
             })
             return
         configured_runtime = info.get("runtime", "mock")
@@ -490,6 +543,7 @@ class SessionSupervisor:
                 "code": "surface_unavailable",
                 "runtime": configured_runtime,
                 "surface": surface,
+                "message": "This runtime does not support the requested surface. Choose an available runtime and surface.",
             })
             return
         runtime_id = adapter.id
@@ -500,6 +554,8 @@ class SessionSupervisor:
         # spawn and return a structured, non-secret failure when unavailable.
         capability = await asyncio.to_thread(
             probe_family, adapter.family_id, include_models=False)
+        if not current():
+            return
         can_spawn, reason = availability(capability, confirmed_surface)
         if not can_spawn:
             self.emit({
@@ -525,7 +581,9 @@ class SessionSupervisor:
         structured = adapter.structured
 
         async def on_output(data: str):
-            if agent_id not in self.agents:
+            if self._stopped or agent_id not in self.agents:
+                return
+            if self.ptys.get(key) is not p and not current():
                 return
             frame = {"type": "output", "agent_id": agent_id,
                      "session_id": session_id,
@@ -597,14 +655,20 @@ class SessionSupervisor:
                            cols=cols, rows=rows)
         try:
             await p.start()
-        except Exception as e:  # pragma: no cover - real spawn failure
-            self.emit({"type": "exit", "agent_id": agent_id,
-                       "session_id": session_id, "code": -1,
-                       "data": f"\r\n[failed to start: {e}]\r\n"})
-            return
-        self.ptys[key] = p
-        self.pty_instances[key] = pty_instance_id
-        self.pty_surfaces[key] = confirmed_surface
+            if not current():
+                return
+            if not p.is_alive():
+                raise RuntimeError("Runtime exited during startup")
+            self.ptys[key] = p
+            self.pty_instances[key] = pty_instance_id
+            self.pty_surfaces[key] = confirmed_surface
+        finally:
+            if self.ptys.get(key) is not p:
+                # start() can raise or be cancelled after creating a child.
+                try:
+                    p.kill()
+                except Exception:
+                    pass
         self.emit({"type": "ready", "agent_id": agent_id,
                    "session_id": session_id,
                    "pty_instance_id": pty_instance_id,
@@ -628,9 +692,18 @@ class SessionSupervisor:
 
     def shutdown(self) -> None:
         """Stop all sessions on supervisor exit. Never called on detach."""
-        for p in list(self.ptys.values()):
-            p.kill()
+        if self._stopped:
+            return
+        self._stopped = True
+        self._open_locks.clear()
+        self._open_users.clear()
+        sessions = list(self.ptys.values())
         self.ptys.clear()
         self.pty_instances.clear()
         self.pty_surfaces.clear()
+        for p in sessions:
+            try:
+                p.kill()
+            except Exception:
+                pass
         self._spool.close()

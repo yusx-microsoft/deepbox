@@ -14,7 +14,7 @@
   function deriveCollaborationState(frame, currentUser){
     frame = frame || {};
     const keyboard = frame.keyboard || {};
-    const role = frame.role || 'viewer';
+    const role = OPERATOR_ROLES.includes(frame.role) ? frame.role : 'viewer';
     const isViewer = role === 'viewer';
     const canOperate = OPERATOR_ROLES.indexOf(role) !== -1;
 
@@ -65,7 +65,11 @@
 
   // canSendInput(state): only the current keyboard holder may transmit input.
   function canSendInput(state){
-    return !!(state && state.isHolder === true);
+    return !!(state && state.canOperate && state.isHolder);
+  }
+
+  function canSendMessage(state){
+    return !!(state && state.canOperate);
   }
 
   // collabHeaderView(state, requester?)
@@ -75,11 +79,13 @@
   //   with silently disabled stdin, so the terminal is never mysteriously
   //   untypable. requester is the optional {username} currently asking for the
   //   keyboard when the local user holds it.
-  function collabHeaderView(state, requester){
+  function collabHeaderView(state, requester, surface){
     if(!state) return {cls: 'collab-pending', label: 'connecting\u2026',
                        button: null, canType: false};
     if(state.isViewer) return {cls: 'collab-viewer', label: 'read-only',
                                button: null, canType: false};
+    if(surface === 'structured') return {cls: 'collab-holder', label: 'shared chat',
+                                        button: null, canType: true};
     if(state.isHolder){
       return requester
         ? {cls: 'collab-holder',
@@ -97,6 +103,6 @@
             button: state.canRequest ? 'request' : null, canType: false};
   }
 
-  return {deriveCollaborationState, canSendInput, collabHeaderView,
+  return {deriveCollaborationState, canSendInput, canSendMessage, collabHeaderView,
           OPERATOR_ROLES};
 });

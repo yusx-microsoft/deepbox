@@ -5,7 +5,7 @@ For every session we keep:
     (so a reconnecting/late viewer can be restored instantly, bounded by screen size)
   - an on-disk asciicast v2 recording (DVR) of every output chunk with timestamps
     (so the full session can be replayed / audited — something a local terminal lacks)
-  - the set of subscribers (browser connections currently watching)
+  Watcher routing lives only in Hub; this module owns output and recording state.
 
 Viewers come and go freely; the PTY (the live process) lives on the devbox and is
 NOT affected by viewers detaching. This module never touches the PTY directly — it
@@ -110,7 +110,6 @@ class LiveSession:
         self.rows = rows
         self.screen = pyte.HistoryScreen(cols, rows, history=5000)
         self.stream = pyte.ByteStream(self.screen)
-        self.subscribers: set = set()
         self.ended = False
         self.exit_code: int | None = None
         self.delivered_input_ids: set[str] = set()
@@ -201,20 +200,16 @@ class LiveSession:
         if client_input_id not in self.delivered_input_ids:
             self.pending_inputs.setdefault(client_input_id, data)
 
-    def acknowledge_input(self, client_input_id: str) -> bool:
-        """Record a queued input exactly once after connector acknowledgement."""
-        if client_input_id in self.delivered_input_ids:
+    def acknowledge_input(self, client_input_id: str, status: str = "delivered") -> bool:
+        """Record confirmed delivery; discard rejected input without recording it."""
+        if status not in {"delivered", "rejected"} or client_input_id in self.delivered_input_ids:
             return False
         data = self.pending_inputs.pop(client_input_id, None)
-        if data is None:
+        if data is None or status != "delivered":
             return False
         self.delivered_input_ids.add(client_input_id)
         self._record("i", data)
         return True
-
-    def record_input(self, data: str):
-        """Legacy input recorder retained for pre-v3 callers."""
-        self._record("i", data)
 
     def resize(self, cols: int, rows: int):
         if cols == self.cols and rows == self.rows:

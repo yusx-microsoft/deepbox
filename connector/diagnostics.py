@@ -42,17 +42,33 @@ def explain_connection_error(exc: BaseException) -> str:
         if status == 401:
             return "Authentication failed (401). Check or rotate this Devbox token."
         return f"Server returned HTTP {status}."
-    return f"Connection failed: {exc.__class__.__name__}: {exc}"
+    # Exception text can contain request URLs, headers, or credentials.
+    return f"Connection failed ({type(exc).__name__}). Check the server address and network."
 
 
 def inspect_url(server_url: str) -> Check:
-    parsed = urlparse(server_url)
+    try:
+        parsed = urlparse(server_url)
+        parsed.port  # Validate brackets and the optional port before making a request.
+    except ValueError:
+        return Check("server URL", False, "invalid hostname or port")
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return Check("server URL", False, "must be an http:// or https:// URL with a hostname")
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        return Check("server URL", False, "must not contain credentials, a query, or a fragment")
     local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
     if parsed.scheme != "https" and not local:
         return Check("server URL", False, "remote connectors must use HTTPS/WSS")
     return Check("server URL", True, server_url.rstrip("/"))
+
+
+def checked_server_url(server_url: str) -> str:
+    """Validate before credentials or runtime state are used by a connector."""
+    check = inspect_url(server_url)
+    if not check.ok:
+        raise ValueError(check.detail)
+    parsed = urlparse(server_url)
+    return parsed._replace(path=parsed.path.rstrip("/")).geturl()
 
 
 def run_doctor(server_url: str, token: str, protocol_version: int) -> list[Check]:

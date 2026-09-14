@@ -1,9 +1,9 @@
 /* DeepBox structured chat surface.
  *
  * Renders canonical structured events emitted by headless runtime adapters.
- * Loaded lazily by app.js so the terminal fallback stays independent.
+ * Loaded before app.js alongside the other local UI helpers.
  *
- * `applyEvent(state, ev)` returns a new view model for each canonical event,
+ * `applyEvent(state, ev)` updates the caller-owned view model in place,
  * so reducer tests do not need a DOM. `renderChat(...)` is the DOM layer.
  */
 (function (global) {
@@ -185,18 +185,6 @@
     const events = parseEventPayload(payload);
     for (const event of events) applyEvent(next, event);
     return { state: next, events };
-  }
-
-  // Coalesce concurrent lazy mounts (for example, a cold burst of event frames)
-  // without serializing later mounts after the current one has settled.
-  function createSingleFlight() {
-    let pending = null;
-    return function run(task) {
-      if (!pending) {
-        pending = Promise.resolve().then(task).finally(() => { pending = null; });
-      }
-      return pending;
-    };
   }
 
   // Append a local user turn immediately (0-RTT echo) before the agent replies.
@@ -391,7 +379,7 @@
 
   const api = {
     parseEventPayload, initialChatState, applyEvent, foldEventPayload,
-    createSingleFlight, appendUserTurn, renderChat,
+    appendUserTurn, renderChat,
     controlsFromCapability, reconcileControlValues, buildTurnOptions,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

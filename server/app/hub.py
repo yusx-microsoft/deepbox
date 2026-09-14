@@ -17,6 +17,8 @@ class DevboxConn:
     devbox_id: str
     agent_ids: set[str] = field(default_factory=set)
     active_session_ids: set[str] = field(default_factory=set)
+    # Resolved live instances fence late control frames, not durable replay.
+    session_instances: dict[str, str] = field(default_factory=dict)
     outbound: asyncio.Queue[dict] = field(
         default_factory=lambda: asyncio.Queue(maxsize=256), repr=False
     )
@@ -164,6 +166,9 @@ class Hub:
                 if self.agent_to_devbox.get(aid) == devbox_id:
                     self.agent_to_devbox.pop(aid, None)
             return True
+
+    def is_current_devbox(self, conn: DevboxConn) -> bool:
+        return self.devboxes.get(conn.devbox_id) is conn and not conn.retired
 
     def is_devbox_online(self, devbox_id: str) -> bool:
         conn = self.devboxes.get(devbox_id)

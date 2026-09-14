@@ -11,6 +11,7 @@ import asyncio
 import json
 from collections import OrderedDict
 
+from .diagnostics import checked_server_url
 from .ipc import Channel
 
 PROTOCOL_VERSION = 3
@@ -29,12 +30,8 @@ async def heartbeat_loop(websocket, interval: float = HEARTBEAT_INTERVAL) -> Non
 
 
 def ws_url(server_url: str) -> str:
-    u = server_url.rstrip("/")
-    if u.startswith("https"):
-        return "wss" + u[5:] + "/ws/devbox"
-    if u.startswith("http"):
-        return "ws" + u[4:] + "/ws/devbox"
-    return u + "/ws/devbox"
+    url = checked_server_url(server_url)
+    return "ws" + url[4:] + "/ws/devbox"
 
 
 class TransportSession:

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import json
 import logging
 from pathlib import Path
@@ -48,6 +49,7 @@ import tempfile
 from typing import Awaitable, Callable
 
 IS_WIN = sys.platform == "win32"
+MAX_QUEUED_TURNS = 16
 
 # Canonical event names (agent-agnostic). The browser renders on these.
 EV_STATUS = "status"          # session/init/system status
@@ -389,12 +391,18 @@ class StructuredAgentSession:
         self._streamed_assistant_text = False
         self._proc = None
         self._alive = False
+        self._killed = False
         self._stderr_tail: list[str] = []
         self._spawn_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._turn_pending = False
+        self._turn_queue: deque[tuple[str, object]] = deque()
+        self._turn_task: asyncio.Task | None = None
+        self._queue_notice_task: asyncio.Task | None = None
 
     async def _spawn_process(self, argv: list[str], prompt: str | None = None):
+        if self._killed:
+            raise RuntimeError("Session is closed")
         if self._custom_spawn is not None:
             if self._per_turn:
                 return await self._custom_spawn(prompt)
@@ -402,6 +410,8 @@ class StructuredAgentSession:
 
         resolved_argv = _resolve_spawn_argv(argv)
         for attempt in range(len(_SPAWN_RETRY_DELAYS) + 1):
+            if self._killed:
+                raise RuntimeError("Session is closed")
             try:
                 return await asyncio.create_subprocess_exec(
                     *resolved_argv, cwd=self.cwd,
@@ -430,15 +440,24 @@ class StructuredAgentSession:
         return list(self._command_builder(options, paths))
 
     async def start(self):
+        if self._killed:
+            raise RuntimeError("Session is closed")
+        self._alive = True
         if self._per_turn or self._lazy_start:
             # Logically live while waiting for the first full user turn.
-            self._alive = True
             self._proc = None
             await self._emit(_event(EV_STATUS, subtype="ready"))
             return
-        self._proc = await self._spawn_process(list(self.cmd))
-        self._alive = True
-        self._start_readers(self._proc)
+        try:
+            proc = await self._spawn_process(list(self.cmd))
+        except BaseException:
+            self._alive = False
+            raise
+        if not self._alive:
+            await _terminate_process(proc)
+            return
+        self._proc = proc
+        self._start_readers(proc)
 
     def _start_readers(self, proc):
         asyncio.create_task(self._read_stdout(proc))
@@ -724,6 +743,8 @@ class StructuredAgentSession:
                     f"Agent rejected {request['subtype']}: {detail}")
 
     async def _dispatch_turn(self, data: str, raw_options: object):
+        if not self._alive:
+            return
         self._turn_end_seen = False
         options = self._option_sanitizer(raw_options)
         if not self._per_turn and self._session_option_keys:
@@ -744,6 +765,8 @@ class StructuredAgentSession:
             EV_USER_ECHO, text=data,
             attachments=self._attachment_metadata(options)))
         try:
+            if not self._alive:
+                return
             attachments = self._decode_attachments(options)
             if self._per_turn:
                 await self._emit(_event(
@@ -751,27 +774,41 @@ class StructuredAgentSession:
                 await self._run_one_turn(data, options, attachments)
                 return
             async with self._write_lock:
+                if not self._alive:
+                    return
                 prompt = self._embed_text_attachments(data, attachments)
                 spawned = self._proc is None
                 if spawned:
-                    self._proc = await self._spawn_process(self._command(options))
-                    self._start_readers(self._proc)
+                    proc = await self._spawn_process(self._command(options))
+                    if not self._alive:
+                        await _terminate_process(proc)
+                        return
+                    self._proc = proc
+                    self._start_readers(proc)
                 stdin = self._proc.stdin
                 if stdin is None:
                     raise ValueError("Agent stdin is unavailable")
                 if not spawned:
                     await self._apply_live_controls(public_options)
+                if not self._alive:
+                    return
                 self._active_options = dict(public_options)
                 await self._emit(_event(
                     EV_SESSION_CONFIG, options=public_options))
+                if not self._alive:
+                    return
                 stdin.write(encode_user_message(prompt).encode())
                 drain = getattr(stdin, "drain", None)
                 if drain is not None:
                     await drain()
         except ValueError as exc:
+            if not self._alive:
+                return
             await self._emit(_event(EV_ERROR, message=str(exc)))
             await self._emit(_event(EV_TURN_END, subtype="input_error"))
         except OSError as exc:
+            if not self._alive:
+                return
             code = getattr(exc, "winerror", None) or exc.errno
             _LOG.warning(
                 "Agent process could not start (error code %s)",
@@ -797,37 +834,58 @@ class StructuredAgentSession:
             return False
         return True
 
-    def write_turn(self, data: str, options: object = None):
-        """Send one complete user turn plus declarative runtime options."""
-        if not self.is_alive() or not isinstance(data, str):
-            return
-        if self._per_turn:
-            if self._turn_pending or self._proc is not None:
-                return
-            self._turn_pending = True
+    def can_accept_turn(self) -> bool:
+        return self.is_alive() and len(self._turn_queue) < MAX_QUEUED_TURNS
 
-            async def run():
+    def write_turn(self, data: str, options: object = None):
+        """Queue a complete turn, returning False on rejection.
+
+        One bounded FIFO worker serializes inputs/controls. Per-turn processes
+        finish before the next queued turn starts. This local queue is not
+        durable; explicit close discards queued messages.
+        """
+        if not self.is_alive() or not isinstance(data, str):
+            return False
+        if len(self._turn_queue) >= MAX_QUEUED_TURNS:
+            if self._queue_notice_task is None or self._queue_notice_task.done():
+                self._queue_notice_task = asyncio.create_task(self._queue_full())
+            return False
+        self._turn_queue.append((data, options))
+        if self._turn_task is None or self._turn_task.done():
+            self._turn_pending = True
+            self._turn_task = asyncio.create_task(self._drain_turns())
+        return True
+
+    async def _queue_full(self):
+        if self._alive:
+            await self._emit(_event(
+                EV_ERROR, code="input.queue_full",
+                message="Too many queued messages. Wait for pending turns to finish, then resend this message."))
+
+    async def _drain_turns(self):
+        try:
+            while self._alive and self._turn_queue:
+                data, options = self._turn_queue.popleft()
                 try:
                     await self._dispatch_turn(data, options)
-                finally:
-                    self._turn_pending = False
-
-            asyncio.create_task(run())
-            return
-        asyncio.create_task(self._dispatch_turn(data, options))
+                except asyncio.CancelledError:
+                    if self._alive:
+                        raise
+                    break
+                except Exception:
+                    if self._alive:
+                        await self._emit(_event(
+                            EV_ERROR, code="runtime.unavailable",
+                            message="The runtime could not process this message. Check the local runtime and retry."))
+                        await self._emit(_event(
+                            EV_TURN_END, subtype="process_error", is_error=True))
+        finally:
+            self._turn_queue.clear()
+            self._turn_pending = False
+            self._turn_task = None
 
     def write(self, data: str):
-        # Keep the historical synchronous compatibility surface for direct
-        # callers/tests. The supervisor uses write_turn so browser turns still
-        # receive canonical user/config events and attachment handling.
-        if (self.is_alive() and not self._per_turn and self._proc is not None
-                and self._proc.stdin is not None):
-            try:
-                self._proc.stdin.write(encode_user_message(data).encode())
-            except Exception:
-                pass
-            return
-        self.write_turn(data, {})
+        return self.write_turn(data, {})
 
     def respond_permission(self, request_id: str, allow: bool):
         if not self.is_alive() or self._proc is None:
@@ -845,7 +903,11 @@ class StructuredAgentSession:
         self.rows = rows
 
     def kill(self):
+        self._killed = True
         self._alive = False
+        self._turn_queue.clear()
+        if self._queue_notice_task is not None:
+            self._queue_notice_task.cancel()
         for future in self._pending_controls.values():
             if not future.done():
                 future.cancel()
