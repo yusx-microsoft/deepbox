@@ -4,6 +4,7 @@ import importlib
 import threading
 import json
 import os
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -47,21 +48,16 @@ def _build_app(tmp_path, owner_emails="owner@example.com"):
         "DEEPBOX_SESSION_TTL_SECONDS": "3600",
         "DEEPBOX_RATE_LIMIT_ENABLED": "0",
     }
-    previous = {key: os.environ.get(key) for key in updates}
-    os.environ.update(updates)
-    try:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
+    env.update(updates)
+    with patch.dict(os.environ, env, clear=True):
         import server.app.config as config_module
         import server.app.models as models_module
         import server.app.main as main_module
         importlib.reload(config_module)
         importlib.reload(models_module)
         main_module = importlib.reload(main_module)
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
     return TestClient(main_module.app), main_module, models_module
 
 

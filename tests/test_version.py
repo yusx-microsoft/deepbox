@@ -7,6 +7,12 @@ from server.app import version
 
 
 class VersionTests(unittest.TestCase):
+    def setUp(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in {"AGENTBRIDGE_GIT_COMMIT", "DEEPBOX_GIT_COMMIT"}}
+        isolated = patch.dict(os.environ, env, clear=True)
+        isolated.start()
+        self.addCleanup(isolated.stop)
     def tearDown(self):
         version.git_commit.cache_clear()
         version.git_dirty.cache_clear()
@@ -26,7 +32,8 @@ class VersionTests(unittest.TestCase):
         with patch.dict(os.environ, {"DEEPBOX_GIT_COMMIT": "abc123def4567890"}):
             version.git_commit.cache_clear()
             pub = version.public_version()
-            self.assertEqual(set(pub.keys()), {"version", "commit"})
+            self.assertEqual(set(pub.keys()), {"product", "version", "commit"})
+            self.assertEqual(pub["product"], "agentbridge")
             self.assertNotIn("dirty", pub)
 
     def test_detailed_has_operator_fields(self):
@@ -39,7 +46,7 @@ class VersionTests(unittest.TestCase):
             self.assertEqual(det["version"], version.VERSION)
 
     def test_unknown_when_no_git(self):
-        env = {k: v for k, v in os.environ.items() if k != "DEEPBOX_GIT_COMMIT"}
+        env = {k: v for k, v in os.environ.items() if k not in {"AGENTBRIDGE_GIT_COMMIT", "DEEPBOX_GIT_COMMIT"}}
         with patch.dict(os.environ, env, clear=True):
             with patch.object(version, "_run_git", return_value=None):
                 version.git_commit.cache_clear()

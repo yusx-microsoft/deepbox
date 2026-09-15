@@ -16,8 +16,9 @@ _tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
 
 def build_app(bootstrap_token=None, registration_enabled=False):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DEEPBOX_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
     dbfile = tempfile.mktemp(suffix=".db", dir=_tmpdir.name)
+    env["DEEPBOX_DATA_DIR"] = tempfile.mkdtemp(dir=_tmpdir.name)
     env["DEEPBOX_DATABASE_URL"] = f"sqlite:///{dbfile.replace(os.sep, '/')}"
     env["DEEPBOX_REGISTRATION_ENABLED"] = "true" if registration_enabled else "false"
     if bootstrap_token is not None:
@@ -35,13 +36,17 @@ def build_app(bootstrap_token=None, registration_enabled=False):
 
 class WebInviteSecurityTests(unittest.TestCase):
     def test_invite_link_uses_fragment_and_is_removed_from_address_bar(self):
-        source = (Path(__file__).parents[1] / "web" / "app.js").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("#invite=${encodeURIComponent(res.token)}", source)
-        self.assertNotIn("?invite=${encodeURIComponent(res.token)}", source)
-        self.assertIn("history.replaceState(null, '', location.pathname)", source)
-        self.assertIn('value="${escapeHtml(inviteFromUrl)}"', source)
+        web = Path(__file__).parents[1] / "web"
+        app = (web / "app.js").read_text(encoding="utf-8")
+        helpers = (web / "ui.js").read_text(encoding="utf-8")
+        management = (web / "management.js").read_text(encoding="utf-8")
+        self.assertIn("/#invite=", helpers)
+        self.assertNotIn("/?invite=", helpers)
+        self.assertIn("accountInvitationUrl(location.origin, secret)", management)
+        self.assertIn("hash.get('invite')", app)
+        self.assertIn("search.delete('invite')", app)
+        self.assertIn("replaceState", app)
+        self.assertIn(".value = accountInvite", app)
 
 
 class MigrationTests(unittest.TestCase):

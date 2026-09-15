@@ -1,4 +1,4 @@
-"""Structured security audit helpers for the DeepBox server.
+"""Structured security audit helpers for the agentbridge server.
 
 Security-relevant actions (logins, permission changes, connector
 registration, administrative operations, ...) deserve a consistent,
@@ -45,7 +45,7 @@ from .logging import log_event
 
 # Dedicated logger name so operators can route/retain audit lines separately
 # from the noisier application logger tree.
-AUDIT_LOGGER = "deepbox.audit"
+AUDIT_LOGGER = "agentbridge.audit"
 
 _LOGGER = logging.getLogger(AUDIT_LOGGER)
 

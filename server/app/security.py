@@ -1,4 +1,4 @@
-"""Reusable, dependency-free security primitives for the deepbox server.
+"""Reusable, dependency-free security primitives for the agentbridge server.
 
 This module intentionally avoids any framework or global state so that it can
 be unit tested in isolation and composed by callers (middleware, routes) as

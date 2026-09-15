@@ -1,6 +1,15 @@
-# deepbox Product Design
+# AgentBridge Product Design
 
-> deepbox is a **durable session control plane** for AI coding agents. Users connect the
+**The user has authorized release of the current workbench.** Visual exploration
+continues separately and is not a reason to deploy the static candidates. See
+[review](review.md) and the [phased rename contract](agentbridge.md); existing
+external and data identities remain unchanged until separately approved migration.
+
+**AgentBridge** is the display name; `agentbridge` is the lowercase CLI/package
+identifier, with `AGENTBRIDGE_*` environment keys. Display polish changes no
+auth, cookie, hash, IPC, or persistent identity contract.
+
+> AgentBridge is a **durable session control plane** for AI coding agents. Users connect the
 > agent CLIs already running on their own devbox — Claude Code, Codex CLI, GitHub Copilot
 > CLI — to the platform, then view, drive, resume, and replay those sessions from any
 > browser.
@@ -13,9 +22,16 @@
 
 ## 1. Positioning
 
-**One-line positioning.** Keep the AI coding agent running on your own devbox alive and
-reachable from any device — the session does not disappear when a browser closes or the
-server restarts.
+**One-line positioning.** One place for people and teammates to find and operate
+agents distributed across many local or remote devices, with access shared through
+Workspaces instead of visiting every host separately.
+
+The design must work toward inventories such as 100 agents across multiple
+machines. Priorities are device/agent discoverability, search/filtering, online and
+session state, safe remote interaction, and shared Workspace permissions. This is
+not primarily a tool for agents to talk to or review one another. The current
+four-pane viewing cap is not a product inventory limit or proof of a 100-agent load test.
+Sessions should remain reachable when a browser closes or the server restarts.
 
 ### 1.1 What we provide
 
@@ -32,7 +48,7 @@ server restarts.
 - The server does not install or sign in to agent CLIs on the user's behalf.
 - The server does not read the user's filesystem; only the agent on the user's devbox can
   reach the working directory.
-- deepbox is not a cloud IDE, code editor, or general SSH replacement.
+- AgentBridge is not a cloud IDE, code editor, or general SSH replacement.
 
 ### 1.3 Core principle
 
@@ -41,9 +57,9 @@ server restarts.
 
 ### 1.4 Why not a plain web terminal
 
-Remote terminals are a solved commodity. deepbox's value is not "show a shell in a browser."
+Remote terminals are a solved commodity. AgentBridge's value is not "show a shell in a browser."
 
-| Plain web terminal | deepbox |
+| Plain web terminal | AgentBridge |
 |---|---|
 | Manages a connection | Manages an agent session lifecycle |
 | Depends on local shell/tmux after the window closes | Sessions live independently of any viewer |
@@ -150,7 +166,7 @@ or above. Read-only Viewer grants never gain input access.
 
 ## 5. Structured-first chat and terminal fallback
 
-deepbox is structured-first: when an adapter reports a structured capability, the browser
+AgentBridge is structured-first: when an adapter reports a structured capability, the browser
 opens a native chat before the first frame instead of scraping ANSI text.
 
 ### 5.1 Two local execution paths
@@ -183,7 +199,11 @@ not runtime names. Choosing **Terminal** never reuses a Chat or unknown-surface 
   Viewer remains read-only. New invitation forms explicitly select Operator; the API
   default is still Viewer, and existing Viewer grants are never automatically promoted.
 - **End session** is a separate confirmed action. The keyboard holder or an Admin/Owner
-  can terminate the runtime; shared chat access alone does not grant termination rights.
+  can terminate a structured runtime; shared chat access alone does not grant termination
+  rights. Terminal input, resize, and termination are holder-only, including for an
+  Admin/Owner. Closing a pane only detaches; New chat preserves the old shared session.
+- Membership role changes require explicit **Save**. Management dialogs capture their
+  user/workspace context and reject stale asynchronous results; no automatic grants.
 
 ### 5.3 Terminal experience (fallback)
 
@@ -209,7 +229,7 @@ Register / sign in
 
 The platform never pre-runs the connector, creates local processes, or touches local
 credentials on the user's behalf. Install once, then reconnect with
-`deepbox connect`; upgrades are the explicit `deepbox upgrade`. See
+`agentbridge connect` (`deepbox` remains an alias); upgrades are the explicit `agentbridge upgrade`. See
 [`install.md`](install.md) and [`onboarding.md`](onboarding.md).
 
 ### 6.2 Create an agent
@@ -270,28 +290,56 @@ Open History for an agent
 ### 7.1 Layout
 
 ```text
-Topbar (brand, search / ⌘K entry, owner entry, user menu, sign out)
-├── Left: Fleet panel (online/total summary, search, compact devbox → agent list)
-└── Right: Session stage (session header + native chat or xterm main area;
-           empty state with shortcut hints when no agent is selected)
+App shell
+├── Refined top navigation: workspace, management, theme and account
+├── Compact collapsible sidebar: Workspace → Devbox → Agent
+└── Workbench: one to four panes in a user-defined binary split tree
+    ├── Pane: quiet header and controls, chat / terminal / replay
+    └── Row/column separator + sibling pane or nested split
 ```
 
-A devbox is a compact panel showing name, status text, an opaque capability overview, and
-`+ Agent / Rotate token / Delete` actions. An agent row shows a monogram, handle, runtime
-label, and status text, revealing a History action on hover or selection.
+The current draft returns to the pre-tmux split workbench, with visible navigation
+and pane controls rather than a terminal-shaped shell. Restrained sans-serif UI
+type, monospace code/data, subtle borders and deliberate spacing support light and
+dark themes. No green tmux status bar or forced full-screen TUI. Conversations stay
+uncluttered, without dashboard cards, bubbles, or repeated role chrome.
+Each pane is independent: split right/below, select, maximize/restore, or close;
+drag a separator or focus it and use axis arrow keys (`Home` resets the ratio).
+The four-pane limit bounds complexity without imposing a fixed side-by-side layout.
+Unsent drafts remain pane-local across focus, resize, and split actions; they are
+not written into layout preferences or shared with another pane.
+
+User/workspace-scoped preferences retain layout geometry and target IDs/surface/kind,
+not messages, files, tokens, or roles. Restore never carries `forceNew` and never
+auto-creates sessions for missing or ended saved live targets. Pane teardown owns
+its socket/chat/terminal/replay resources; closing is not session termination.
+See [implementation](implementation.md#5-web-web) for the actual module boundaries.
 
 ### 7.2 Session control surface
 
-The stage header shows the agent handle, current surface label, collaboration/keyboard
-state, and connection status. Opening an agent resumes its newest live session or creates
+The pane header shows its name, surface and connection state, with compact controls
+and explicit permission/keyboard context. Opening an agent resumes
+its newest compatible live session or creates
 one when none is live. History lists recorded sessions with their creation time and derived
 state, and provides Replay.
 
-### 7.3 Command palette (⌘K / Ctrl+K)
+### 7.3 Optional tmux-style shortcuts and command prompt
 
-An overlay (no routing change) to filter and open an agent, open an agent's history, create
-a devbox, or enter the owner console (owner only). `↑` / `↓` move the selection, `Enter`
-executes, `Esc` closes. The Fleet search box filters devboxes and agents in real time.
+These are **opt-in and default off**, not the primary navigation or visual shell.
+Without user enablement, Control+B is not intercepted. When enabled, Ctrl+B
+activates a visible prefix state. `%`/`"` split, arrows select adjacent
+panes, `o` cycles, digits select a pane, `z` zooms, and `x` detaches a view without
+ending its agent. `w` opens the tree, `s` chooses workspace, and `?` lists bindings.
+Double Ctrl+B forwards one literal prefix byte only to an owned live terminal.
+The `:` prompt parses an allowlist of UI actions, never OS/model commands.
+See [the optional key contract](agentbridge.md#optional-tmux-style-interaction).
+
+Visible sidebar, pane, and management controls remain usable with shortcuts off.
+Ctrl+K outside editable areas remains a compatible shortcut for quick navigation.
+
+The optional tree picker filters panes, agents and machines without routing away.
+`↑` / `↓` select, `Enter` opens, and `Esc` closes. It supplements the collapsible
+sidebar rather than replacing it or forcing a full-screen workflow.
 
 ### 7.4 Modals and one-time tokens
 
@@ -324,11 +372,11 @@ Projects and skills are registered on the machine running the connector; absolut
 in the connector-local state store, and the server only receives stable IDs and display names.
 
 - **LocalProject** — register a project directory locally. The browser's Add-agent flow only
-  produces a copyable `deepbox project add …` command; it never browses the local filesystem.
+  produces a copyable `agentbridge project add …` command; it never browses the local filesystem.
 - **Skills** — a skill is a directory containing a UTF-8 `SKILL.md`, whose directory name
   must equal the lower-kebab-case `name` in the YAML frontmatter. Skills install to personal
   scope by default, or to a registered project scope with `--project`. The connector copies
-  content into its own skill store and each adapter family's skill roots; deepbox never
+  content into its own skill store and each adapter family's skill roots; AgentBridge never
   executes skill files, and the server only stores path-free inventory.
 
 Full schema, limits, scope resolution, and drift rules are in
@@ -420,11 +468,14 @@ admins and owners may change retention or securely erase payloads.
 - Devbox `online`/`offline`, agent `online`/`busy`/`offline`, and keyboard lease are all
   shown as **dot + text**, never color alone.
 - Browser connection state is shown as live/reconnecting/error without inventing a durable
-  session state; the WebSocket reconnect loop restores the active view.
+  session state; each pane's WebSocket reconnect loop restores that pane's view.
 - Runtime launch and protocol failures surface through connector error frames and visible
   UI status or error messages.
-- Structured cold-start event bursts are merged (single-flight), and a lazy chat mount
-  isolates stale views by epoch.
+- Local helper scripts load deterministically; pane lifecycle guards isolate stale
+  views and asynchronous responses. There is no lazy chat-mount gate. The existing
+  pinned jsDelivr xterm dependency loads only on terminal demand through
+  `terminal-assets.js`; chat/app boot never waits for it. Load failure is visible
+  before session creation. No vendor assets were downloaded during implementation.
 - Operations guidance — structured logs, connection visibility, readiness checks,
   backup/restore, capacity alerts, and version/smoke checks — is in
   [`operations.md`](operations.md).
@@ -433,11 +484,14 @@ admins and owners may change retention or securely erase payloads.
 
 ## 14. Accessibility and responsiveness
 
-- A token-driven dark theme with fine borders, a single low-saturation accent, and semantic
-  status colors is the single source of truth for styling.
+- Token-driven dark/light themes use fine borders and restrained semantic status
+  colors. Theme choice is optional and presentation-only.
 - Clear `:focus-visible` styles, a `prefers-reduced-motion` fallback, and a responsive
-  narrow-screen layout (≤820px) that stacks the fleet panel and terminal vertically.
-- The UI uses a sans font and the terminal uses mono; the terminal is always the visual lead.
+  narrow-screen layout keep compact navigation and pane controls usable. Separators
+  support keyboard adjustment as well as dragging; verify both during visual review.
+- UI text uses locally available sans-serif/system fallbacks; code/data use monospace.
+  There are no remote fonts or bubble/card conversation styling, and no forced
+  terminal-dominant landing page.
 - DOM-free presentation logic (fleet summary, filtering, command generation, status mapping,
   HTML escaping) lives in a testable module covered by unit tests.
 

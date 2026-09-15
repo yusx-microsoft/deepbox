@@ -1,4 +1,4 @@
-/* DeepBox structured chat surface.
+/* Agentbridge structured conversation renderer.
  *
  * Renders canonical structured events emitted by headless runtime adapters.
  * Loaded before app.js alongside the other local UI helpers.
@@ -296,20 +296,21 @@
   function renderChat(container, state, handlers) {
     if (!container) return;
     handlers = handlers || {};
-    container.innerHTML = '';
+    container.textContent = '';
     const log = el('div', 'chat-log');
     for (const it of state.items) {
       if (it.kind === 'user') {
-        log.appendChild(bubble('user', it.text, it.attachments));
+        log.appendChild(messageLine('user', it.text, it.attachments));
       } else if (it.kind === 'assistant') {
-        log.appendChild(bubble('assistant', it.text));
+        log.appendChild(messageLine('assistant', it.text));
       } else if (it.kind === 'tool') {
         log.appendChild(toolCard(it));
       } else if (it.kind === 'turn') {
-        if (it.result) log.appendChild(bubble('assistant', it.result));
-        log.appendChild(turnFooter(it));
+        // Keep canonical turn/cost history; only failed turns need a visible boundary.
+        if (it.is_error) log.appendChild(messageLine('error', 'Turn failed' + (it.result ? ': ' + it.result : '')));
+        else if (it.result) log.appendChild(messageLine('assistant', it.result));
       } else if (it.kind === 'error') {
-        log.appendChild(bubble('error', it.text));
+        log.appendChild(messageLine('error', it.text));
       }
     }
     container.appendChild(log);
@@ -320,12 +321,16 @@
     log.scrollTop = log.scrollHeight;
   }
 
-  function bubble(role, text, attachments) {
+  function messageLine(role, text, attachments) {
     const b = el('div', 'chat-msg chat-' + role);
-    b.appendChild(el('div', 'chat-role', role));
+    b.setAttribute('role', role === 'error' ? 'alert' : 'group');
+    b.setAttribute('aria-label', role === 'user' ? 'User message' : role === 'assistant' ? 'Agent output' : 'Error');
+    b.appendChild(el('div', 'chat-role', role === 'user' ? 'You' : role === 'assistant' ? 'Agent' : 'Error'));
     b.appendChild(el('div', 'chat-text', text || ''));
     if (Array.isArray(attachments) && attachments.length) {
       const row = el('div', 'chat-message-files');
+      row.setAttribute('role', 'group');
+      row.setAttribute('aria-label', 'Attachments');
       for (const file of attachments) {
         if (!file || typeof file.name !== 'string') continue;
         row.appendChild(el('span', 'chat-message-file', file.name));
@@ -337,6 +342,8 @@
 
   function toolCard(it) {
     const c = el('div', 'chat-tool' + (it.is_error ? ' chat-tool-error' : ''));
+    c.setAttribute('role', 'group');
+    c.setAttribute('aria-label', (it.is_error ? 'Tool error: ' : 'Tool: ') + (it.tool || 'tool'));
     c.appendChild(el('div', 'chat-tool-name', (it.tool || 'tool') +
       (it.streaming && it.result == null ? ' \u2026' : '')));
     if (it.input != null) {
@@ -349,16 +356,10 @@
     return c;
   }
 
-  function turnFooter(it) {
-    const parts = [];
-    if (it.is_error) parts.push('error');
-    if (it.cost_usd != null) parts.push('$' + Number(it.cost_usd).toFixed(4));
-    const f = el('div', 'chat-turn', parts.join('  \u00b7  ') || 'turn complete');
-    return f;
-  }
-
   function permissionModal(p, handlers) {
     const m = el('div', 'chat-perm');
+    m.setAttribute('role', 'group');
+    m.setAttribute('aria-label', 'Permission request');
     m.appendChild(el('div', 'chat-perm-title',
       'Allow ' + (p.tool || 'tool') + '?'));
     if (p.input != null) {
@@ -368,6 +369,7 @@
     const row = el('div', 'chat-perm-actions');
     const allow = el('button', 'chat-perm-allow', 'Allow');
     const deny = el('button', 'chat-perm-deny', 'Deny');
+    allow.type = deny.type = 'button';
     allow.addEventListener('click', () => handlers.onPermission &&
       handlers.onPermission(p.request_id, true));
     deny.addEventListener('click', () => handlers.onPermission &&
@@ -383,5 +385,5 @@
     controlsFromCapability, reconcileControlValues, buildTurnOptions,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
-  global.DeepboxChat = api;
+  global.AgentBridgeChat = global.DeepboxChat = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

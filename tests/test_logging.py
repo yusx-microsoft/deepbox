@@ -9,7 +9,7 @@ from server.app.logging import JsonFormatter, configure_logging, log_event
 class JsonFormatterTests(unittest.TestCase):
     def _record(self, **extra):
         rec = logging.LogRecord(
-            name="deepbox", level=logging.INFO, pathname=__file__, lineno=1,
+            name="agentbridge", level=logging.INFO, pathname=__file__, lineno=1,
             msg="hello", args=(), exc_info=None,
         )
         for k, v in extra.items():
@@ -22,7 +22,7 @@ class JsonFormatterTests(unittest.TestCase):
         data = json.loads(out)
         self.assertEqual(data["message"], "hello")
         self.assertEqual(data["level"], "INFO")
-        self.assertEqual(data["logger"], "deepbox")
+        self.assertEqual(data["logger"], "agentbridge")
         self.assertTrue(data["ts"].endswith("Z"))
 
     def test_surfaces_extra_fields(self):

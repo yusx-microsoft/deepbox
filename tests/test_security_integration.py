@@ -12,9 +12,10 @@ from fastapi.testclient import TestClient
 _tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
 
-def build_app(*, production=False, login_limit=10):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DEEPBOX_")}
+def build_app(*, production=False, login_limit=10, prefix="DEEPBOX_"):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
     dbfile = tempfile.mktemp(suffix=".db", dir=_tmpdir.name)
+    env["DEEPBOX_DATA_DIR"] = tempfile.mkdtemp(dir=_tmpdir.name)
     env.update({
         "DEEPBOX_DATABASE_URL": f"sqlite:///{dbfile.replace(os.sep, '/')}",
         "DEEPBOX_BOOTSTRAP_TOKEN": "bootstrap-secret",
@@ -29,6 +30,9 @@ def build_app(*, production=False, login_limit=10):
             "DEEPBOX_RATE_LIMIT_ENABLED": "true",
             "DEEPBOX_COOKIE_SECURE": "true",
         })
+    if prefix != "DEEPBOX_":
+        env = {(prefix + k[len("DEEPBOX_"):] if k.startswith("DEEPBOX_") else k): v
+               for k, v in env.items()}
     with patch.dict(os.environ, env, clear=True):
         config_loaded = "server.app.config" in sys.modules
         import server.app.config as config
@@ -51,6 +55,60 @@ def bootstrap(client):
     })
     assert response.status_code == 200
     return response.json()
+
+
+def test_display_title_keeps_machine_service_and_logger_identifiers(monkeypatch, tmp_path):
+    from agentbridge import product
+
+    main, client = build_app()
+    assert main.app.title == product.DISPLAY_NAME == "AgentBridge"
+    assert client.get("/openapi.json").json()["info"]["title"] == product.DISPLAY_NAME
+    assert main.logger.name == product.NAME == "agentbridge"
+    assert main.NAME == product.NAME
+    monkeypatch.setattr(main, "WEB_DIR", tmp_path / "missing-web")
+    fallback = client.get("/")
+    assert fallback.status_code == 200
+    assert "<h1>AgentBridge</h1>" in fallback.text
+
+
+def test_canonical_config_accepts_existing_cookie_and_persisted_device_token():
+    from itsdangerous import URLSafeTimedSerializer
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    main, client = build_app(prefix="AGENTBRIDGE_")
+    bootstrap(client)
+    assert main.app.title == "AgentBridge"
+    with main.models.SessionLocal() as session:
+        owner = session.query(main.User).filter_by(username="owner").one()
+        # Construct pre-rename data independently of the new branding helper.
+        old_signer = URLSafeTimedSerializer(
+            "test-session-secret-at-least-32-bytes", salt="deepbox-session")
+        cookie = old_signer.dumps({"uid": owner.id})
+        request = Request({"type": "http", "headers": [
+            (b"cookie", f"deepbox_session={cookie}".encode("ascii")),
+        ]})
+        assert main.current_user(request, session).id == owner.id
+        response = Response()
+        main._set_session_cookie(response, owner)
+        assert response.headers["set-cookie"].startswith("deepbox_session=")
+        assert "agentbridge_session=" not in response.headers["set-cookie"]
+
+        opaque_device_id = "deepbox_persisted_opaque_device"
+        session.add(main.Devbox(id=opaque_device_id, owner_user_id=owner.id,
+                               name="Synthetic existing device"))
+        session.flush()
+        old_token = "hpc_box_" + "01" * 32
+        session.add(main.Token(
+            id="persisted-token-row", devbox_id=opaque_device_id,
+            hash=hashlib.sha256(old_token.encode()).hexdigest(), preview="hpc_box_010101…"))
+        session.commit()
+        request = Request({"type": "http", "headers": [
+            (b"authorization", f"Bearer {old_token}".encode("ascii")),
+        ]})
+        assert main.devbox_from_bearer(request, session).id == opaque_device_id
+        assert session.query(main.Devbox).count() == 1
+        assert session.query(main.Token).one().last_used_at is not None
 
 
 def test_legacy_password_is_upgraded_on_successful_login():

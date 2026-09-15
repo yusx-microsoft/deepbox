@@ -9,8 +9,9 @@ _tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
 def build_app():
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith("DEEPBOX_")}
+           if not key.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
     dbfile = tempfile.mktemp(suffix=".db", dir=_tmpdir.name)
+    env["DEEPBOX_DATA_DIR"] = tempfile.mkdtemp(dir=_tmpdir.name)
     env.update({
         "DEEPBOX_DATABASE_URL": f"sqlite:///{dbfile.replace(os.sep, '/')}",
         "DEEPBOX_REGISTRATION_ENABLED": "true",

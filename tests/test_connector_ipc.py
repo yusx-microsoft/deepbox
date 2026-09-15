@@ -129,17 +129,20 @@ class LocalIpcTransportTests(unittest.IsolatedAsyncioTestCase):
     """Real OS-backed IPC: named pipe on Windows, Unix socket on POSIX."""
 
     def setUp(self):
-        self._tmp = tempfile.mkdtemp(prefix="deepbox-ipc-test-")
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="agentbridge-ipc-test-")
+        self.addCleanup(self._temp_dir.cleanup)
+        self._tmp = self._temp_dir.name
+        isolated_env = mock.patch.dict(os.environ, {
+            "XDG_RUNTIME_DIR": self._tmp, "LOCALAPPDATA": self._tmp,
+        })
+        isolated_env.start()
+        self.addCleanup(isolated_env.stop)
         uniq = str(os.getpid()) + str(id(self))
         self._suffix = "iputest" + uniq
-        os.environ["XDG_RUNTIME_DIR"] = self._tmp
         if IS_WIN:
             self._endpoint = r"\\.\pipe\deepbox-iputest-" + uniq
         else:
             self._endpoint = os.path.join(self._tmp, "sessiond-test.sock")
-
-    def tearDown(self):
-        os.environ.pop("XDG_RUNTIME_DIR", None)
 
     async def test_auth_handshake_and_reconnect(self):
         ensure_secret(self._suffix)

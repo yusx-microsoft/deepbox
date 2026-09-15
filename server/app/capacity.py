@@ -1,4 +1,4 @@
-"""Capacity monitoring for the DeepBox server.
+"""Capacity monitoring for the agentbridge server.
 
 Two finite resources can take the service down: the SQLite database file growing
 without bound, and the recording directory filling the disk. This module turns

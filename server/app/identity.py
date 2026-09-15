@@ -1,7 +1,7 @@
 """Microsoft identity header parsing and account-name helpers.
 
 Azure App Service Authentication (Easy Auth) validates Microsoft tokens before
-requests reach deepbox.  This module deliberately only parses the trusted
+requests reach agentbridge.  This module deliberately only parses the trusted
 headers; it never accepts browser-supplied bearer tokens or stores OAuth tokens.
 """
 from __future__ import annotations

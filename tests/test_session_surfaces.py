@@ -10,7 +10,7 @@ import pytest
 def app_client(tmp_path, monkeypatch):
     # Reload the app with a disposable database, never the developer's data.
     for key in list(os.environ):
-        if key.startswith("DEEPBOX_"):
+        if key.startswith(("AGENTBRIDGE_", "DEEPBOX_")):
             monkeypatch.delenv(key)
     monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
     monkeypatch.setenv("DEEPBOX_DATABASE_URL", f"sqlite:///{(tmp_path / 'test.db').as_posix()}")

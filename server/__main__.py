@@ -1,4 +1,4 @@
-"""Run the configured deepbox server with `python -m server`."""
+"""Run the configured agentbridge server with `python -m server`."""
 import uvicorn
 
 from server.app.config import settings

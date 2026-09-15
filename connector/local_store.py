@@ -24,7 +24,7 @@ class LocalStoreBusyError(RuntimeError):
 
 
 def default_state_root() -> str:
-    """Return the per-user deepbox state directory for this platform."""
+    """Return the stable per-user state root; see agentbridge.product."""
     if IS_WIN:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     else:

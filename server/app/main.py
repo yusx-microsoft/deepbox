@@ -1,4 +1,4 @@
-"""deepbox server — FastAPI app: auth, management REST, runtime REST, and two
+"""AgentBridge server — FastAPI app: auth, management REST, runtime REST, and two
 WebSocket endpoints (human terminal + devbox connector)."""
 from __future__ import annotations
 
@@ -57,12 +57,14 @@ from .identity import (
     MicrosoftPrincipal, build_microsoft_principal, normalize_email,
     normalize_username_hint,
 )
+from agentbridge.product import DISPLAY_NAME, NAME, env
+
 from . import version as version_info
 
 import logging as _logging
 
-configure_logging(os.getenv("DEEPBOX_LOG_LEVEL", "INFO"))
-logger = _logging.getLogger("deepbox")
+configure_logging(env("LOG_LEVEL", "INFO"))
+logger = _logging.getLogger(NAME)
 _capacity_status = "ok"
 _api_limiter = RateLimiter(RateLimitRule(settings.rate_limit_api_per_minute, 60))
 _login_limiter = RateLimiter(RateLimitRule(settings.rate_limit_login_per_minute, 60))
@@ -109,7 +111,7 @@ def observe_capacity(report, *, source: str) -> None:
 
 signer = URLSafeTimedSerializer(settings.secret, salt="deepbox-session")
 
-app = FastAPI(title="deepbox")
+app = FastAPI(title=DISPLAY_NAME)
 
 @app.middleware("http")
 async def security_baseline(request: Request, call_next):
@@ -454,7 +456,7 @@ async def microsoft_logout():
 async def register(request: Request, s: OrmSession = Depends(db)):
     """Development-only self-registration.
 
-    Production keeps DEEPBOX_REGISTRATION_ENABLED=false; invitations are the
+    Production keeps AGENTBRIDGE_REGISTRATION_ENABLED=false; invitations are the
     onboarding mechanism there. When an invite code is supplied it is redeemed
     atomically and the created user is a member.
     """
@@ -2445,4 +2447,4 @@ async def index():
     f = WEB_DIR / "index.html"
     if f.exists():
         return f.read_text(encoding="utf-8")
-    return "<h1>deepbox</h1><p>web/index.html missing</p>"
+    return f"<h1>{DISPLAY_NAME}</h1><p>web/index.html missing</p>"

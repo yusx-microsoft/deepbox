@@ -1,4 +1,4 @@
-"""Structured JSON logging for the DeepBox server.
+"""Structured JSON logging for the agentbridge server.
 
 The server runs behind Azure App Service and on local machines. In both
 environments operators want machine-parseable logs that can be shipped to a log

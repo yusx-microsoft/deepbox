@@ -1,4 +1,4 @@
-"""deepbox connector - connects a devbox to the server and bridges local
+"""agentbridge connector - connects a devbox to the server and bridges local
 agent runtimes through structured events or a terminal fallback.
 
 The connector has two halves:
@@ -24,14 +24,14 @@ over a Unix socket / Windows named pipe:
 The default remains all-in-one; the split is opt-in.
 
 Run after one-time installation:
-    set DEEPBOX_SERVER_URL=http://localhost:8077
-    set DEEPBOX_TOKEN=hpc_box_...
-    deepbox connect                         # all-in-one (default)
-    deepbox connect --mode supervisor       # long-lived session owner (sessiond)
-    deepbox connect --mode transport        # WS owner, reconnects to sessiond
+    set AGENTBRIDGE_SERVER_URL=http://localhost:8077
+    set AGENTBRIDGE_TOKEN=hpc_box_...
+    agentbridge connect                         # all-in-one (default)
+    agentbridge connect --mode supervisor       # long-lived session owner (sessiond)
+    agentbridge connect --mode transport        # WS owner, reconnects to sessiond
 
-From a source checkout, ``python -m connector`` remains the equivalent developer
-entry point.
+From a source checkout, use ``python -m agentbridge``. ``python -m connector``
+remains a supported developer entry point; legacy DEEPBOX_* settings still work.
 """
 from __future__ import annotations
 
@@ -42,6 +42,8 @@ import os
 
 import httpx
 import websockets
+
+from agentbridge.product import NAME, env
 
 from .diagnostics import checked_server_url, explain_connection_error, run_doctor
 from .ipc import (
@@ -114,7 +116,7 @@ class Connector:
             raise RuntimeError(
                 f"protocol mismatch: connector={PROTOCOL_VERSION}, server={server_protocol}")
         self.supervisor.replace_agents(data["agents"])
-        print(f"[connector] devbox={data['name']} agents={[a['handle'] for a in data['agents']]}")
+        print(f"[agentbridge] devbox={data['name']} agents={[a['handle'] for a in data['agents']]}")
         return data
 
     def probe_runtimes(self, devbox_id: str = "local", *,
@@ -167,7 +169,7 @@ class Connector:
     # -- main run loop -----------------------------------------------------
 
     async def run(self):
-        print(f"[connector] authenticating with {self.server_url} (protocol {PROTOCOL_VERSION})")
+        print(f"[agentbridge] authenticating with {self.server_url} (protocol {PROTOCOL_VERSION})")
         me = await self.fetch_me()
         await self.report_projects(me["devbox_id"])
         await self.report_skills(me["devbox_id"])
@@ -177,8 +179,8 @@ class Connector:
             f"{cap['runtime']}:{cap['installation']['status']}"
             for cap in caps
         ]
-        print(f"[connector] runtime capabilities: {summary}")
-        print(f"[connector] opening WebSocket {ws_url(self.server_url)}")
+        print(f"[agentbridge] runtime capabilities: {summary}")
+        print(f"[agentbridge] opening WebSocket {ws_url(self.server_url)}")
 
         # New loopback channel per WS connection. Attaching/detaching the
         # transport never disturbs the supervisor's local sessions.
@@ -199,7 +201,7 @@ class Connector:
                 self.ws = ws
                 self.connect_count += 1
                 hello = await ws.recv()
-                print(f"[connector] connected (attempt #{self.connect_count}): {hello}")
+                print(f"[agentbridge] connected (attempt #{self.connect_count}): {hello}")
                 transport = TransportSession(tx_end)
                 await transport.run(ws)
                 self.last_heartbeat_ack = transport.last_heartbeat_ack
@@ -280,7 +282,7 @@ class SupervisorService:
 
     async def serve(self) -> None:
         self._server = await serve_channel(self._on_channel, endpoint=self.endpoint)
-        print(f"[sessiond] serving IPC at {self.endpoint}")
+        print(f"[agentbridge sessiond] serving IPC at {self.endpoint}")
         try:
             await self._stop.wait()
         finally:
@@ -326,18 +328,18 @@ async def _watch_project_inventory(connector: Connector, devbox_id: str,
             try:
                 await connector.report_projects(devbox_id)
             except Exception as exc:
-                print(f"[sessiond] project metadata refresh failed: {exc}")
+                print(f"[agentbridge sessiond] project metadata refresh failed: {exc}")
             else:
                 reported = current
-                print("[sessiond] local project metadata refreshed")
+                print("[agentbridge sessiond] local project metadata refreshed")
         if current_skills != reported_skills:
             try:
                 await connector.report_skills(devbox_id)
             except Exception as exc:
-                print(f"[sessiond] skill metadata refresh failed: {exc}")
+                print(f"[agentbridge sessiond] skill metadata refresh failed: {exc}")
             else:
                 reported_skills = current_skills
-                print("[sessiond] local skill metadata refreshed")
+                print("[agentbridge sessiond] local skill metadata refreshed")
 
 
 async def run_supervisor(server_url: str, token: str,
@@ -354,14 +356,14 @@ async def run_supervisor(server_url: str, token: str,
         await bootstrap.report_skills(me["devbox_id"])
         caps = bootstrap.probe_runtimes()
         await bootstrap.report_runtimes(me["devbox_id"], caps)
-        print("[sessiond] runtimes available: " + ", ".join(
+        print("[agentbridge sessiond] runtimes available: " + ", ".join(
             str(cap.get("runtime", "unknown")) for cap in caps))
 
         address = endpoint or default_endpoint()
         if endpoint_exists(address):
             # A previous supervisor may have died leaving a stale POSIX socket.
             if cleanup_stale_endpoint(endpoint=address):
-                print(f"[sessiond] removed stale endpoint state for {address}")
+                print(f"[agentbridge sessiond] removed stale endpoint state for {address}")
         service = SupervisorService(
             dict(bootstrap.supervisor.agents), endpoint=address,
             spool=open_spool(server_url, token), local_store=local_store)
@@ -420,9 +422,10 @@ async def run_transport(server_url: str, token: str,
                 pass
 
 
-def _status_payload(server_url: str, mode: str) -> dict:
-    endpoint = default_endpoint()
+def _status_payload(server_url: str, mode: str, endpoint: str | None = None) -> dict:
+    endpoint = endpoint or default_endpoint()
     return {
+        "product": NAME,
         "protocol_version": PROTOCOL_VERSION,
         "server_url": server_url.rstrip("/"),
         "mode": mode,
@@ -465,7 +468,7 @@ def _resolve_skill_project(
     if len(named) > 1:
         raise SkillError(f"project name is ambiguous: {selector}")
     raise SkillError(
-        f"local project is not registered: {selector}; run 'deepbox project add' first"
+        f"local project is not registered: {selector}; run 'agentbridge project add' first"
     )
 
 
@@ -522,7 +525,7 @@ async def _skill_command(args) -> None:
                 force=args.force,
             ):
                 raise SkillError(f"unknown {scope} skill: {args.name}")
-            print(f"[connector] skill removed: {args.name} ({scope})")
+            print(f"[agentbridge] skill removed: {args.name} ({scope})")
         else:
             raise SkillError("choose a skill action: install, list, inspect, or remove")
     except SkillError as exc:
@@ -537,11 +540,11 @@ async def _project_command(args) -> None:
         project = None
         if args.project_action == "add":
             project = store.add(args.path, args.name)
-            print(f"[connector] project added: {project.name} ({project.id}) -> {project.path}")
+            print(f"[agentbridge] project added: {project.name} ({project.id}) -> {project.path}")
         elif args.project_action == "remove":
             if not store.remove(args.project_id):
                 raise SystemExit(f"unknown project id: {args.project_id}")
-            print(f"[connector] project removed: {args.project_id}")
+            print(f"[agentbridge] project removed: {args.project_id}")
         elif args.project_action == "list":
             projects = store.list_projects()
             if not projects:
@@ -555,14 +558,14 @@ async def _project_command(args) -> None:
             args.project_action in {"add", "remove"} and bool(args.token))
         if should_sync:
             if not args.token:
-                raise SystemExit("DEEPBOX_TOKEN or --token is required to sync projects")
+                raise SystemExit("AGENTBRIDGE_TOKEN or --token is required to sync projects")
             connector = Connector(
                 args.server_url, args.token, local_store=store)
             me = await connector.fetch_me()
             await connector.report_projects(me["devbox_id"])
-            print("[connector] project metadata synced (local paths stayed on this machine)")
+            print("[agentbridge] project metadata synced (local paths stayed on this machine)")
         elif args.project_action in {"add", "remove"}:
-            print("[connector] local change will sync the next time the connector starts")
+            print("[agentbridge] local change will sync the next time the connector starts")
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
     finally:
@@ -570,16 +573,16 @@ async def _project_command(args) -> None:
 
 
 async def main(argv: list[str] | None = None):
-    ap = argparse.ArgumentParser("deepbox-connector")
-    ap.add_argument("--server-url", default=os.environ.get("DEEPBOX_SERVER_URL",
-                                                            "http://localhost:8077"))
-    ap.add_argument("--token", default=os.environ.get("DEEPBOX_TOKEN"))
+    ap = argparse.ArgumentParser(f"{NAME}-connector")
+    ap.add_argument("--server-url", default=env("SERVER_URL",
+                                              "http://localhost:8077"))
+    ap.add_argument("--token", default=env("TOKEN"))
     ap.add_argument("--mode", choices=["all-in-one", "supervisor", "transport"],
-                    default=os.environ.get("DEEPBOX_MODE", "all-in-one"),
+                    default=env("MODE", "all-in-one"),
                     help="all-in-one (default): supervisor+transport in one process; "
                          "supervisor: long-lived sessiond owning sessions; "
                          "transport: WS owner that reconnects to a local sessiond")
-    ap.add_argument("--endpoint", default=os.environ.get("DEEPBOX_IPC_ENDPOINT"),
+    ap.add_argument("--endpoint", default=env("IPC_ENDPOINT"),
                     help="override the local IPC endpoint (advanced)")
     ap.add_argument("--state-path", default=None, help=argparse.SUPPRESS)
     command_parsers = ap.add_subparsers(dest="command")
@@ -617,11 +620,14 @@ async def main(argv: list[str] | None = None):
                     help="print connector/IPC configuration as JSON, then exit")
     args = ap.parse_args(argv)
 
-    mode_label = {
+    mode_labels = {
         "all-in-one": "all-in-one (supervisor+transport via loopback)",
         "supervisor": "supervisor (sessiond; owns sessions, serves IPC)",
         "transport": "transport (owns WS; connects to sessiond)",
-    }[args.mode]
+    }
+    if args.mode not in mode_labels:
+        ap.error("--mode or AGENTBRIDGE_MODE must be all-in-one, supervisor, or transport")
+    mode_label = mode_labels[args.mode]
 
     if args.command == "project":
         await _project_command(args)
@@ -631,7 +637,7 @@ async def main(argv: list[str] | None = None):
         return
 
     if args.status:
-        print(json.dumps(_status_payload(args.server_url, mode_label), indent=2))
+        print(json.dumps(_status_payload(args.server_url, mode_label, args.endpoint), indent=2))
         raise SystemExit(0)
 
     if args.doctor:
@@ -647,7 +653,7 @@ async def main(argv: list[str] | None = None):
         raise SystemExit(0 if all(check.ok for check in checks) else 1)
 
     if not args.token:
-        raise SystemExit("Set DEEPBOX_TOKEN or pass --token")
+        raise SystemExit("Set AGENTBRIDGE_TOKEN or pass --token")
     try:
         args.server_url = checked_server_url(args.server_url)
     except ValueError as exc:
@@ -671,7 +677,7 @@ async def main(argv: list[str] | None = None):
             try:
                 await c.run()
             except Exception as exc:
-                print(f"[connector] disconnected: {explain_connection_error(exc)}; retry in 3s")
+                print(f"[agentbridge] disconnected: {explain_connection_error(exc)}; retry in 3s")
                 await asyncio.sleep(3)
     finally:
         local_store.close()

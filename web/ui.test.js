@@ -78,15 +78,15 @@ test('capability report helpers preserve legacy arrays and sanitize skills', () 
 test('local setup command helpers are copyable and keep paths browser-local', () => {
   assert.equal(
     ui.projectAddCommand('C:\\Code\\deepbox', 'Deepbox'),
-    'deepbox project add "C:\\Code\\deepbox" --name "Deepbox"'
+    'agentbridge project add "C:\\Code\\deepbox" --name "Deepbox"'
   );
   assert.equal(
     ui.skillInstallCommand('C:\\skills\\review-code', 'Deepbox'),
-    'deepbox skill install "C:\\skills\\review-code" --project "Deepbox"'
+    'agentbridge skill install "C:\\skills\\review-code" --project "Deepbox"'
   );
   assert.equal(
     ui.skillRemoveCommand('review-code'),
-    'deepbox skill remove "review-code"'
+    'agentbridge skill remove "review-code"'
   );
 });
 
@@ -103,7 +103,7 @@ test('install commands are explicit one-time setup commands', () => {
   assert.equal(
     ui.unixInstallCommand(),
     'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash && ' +
-      'export PATH="$HOME/.deepbox/bin:$PATH"'
+      'export PATH="${AGENTBRIDGE_HOME-${DEEPBOX_HOME-$HOME/.agentbridge}}/bin:$HOME/.deepbox/bin:$PATH"'
   );
 });
 
@@ -111,9 +111,9 @@ test('windowsConnectorCommand reconnects without invoking the installer', () => 
   const command = ui.windowsConnectorCommand('https://deepbox.example', 'hpc_box_test');
   assert.equal(
     command,
-    '$env:DEEPBOX_SERVER_URL = "https://deepbox.example"\n' +
-      '$env:DEEPBOX_TOKEN = "hpc_box_test"\n' +
-      'deepbox connect'
+    '$env:AGENTBRIDGE_SERVER_URL = "https://deepbox.example"\n' +
+      '$env:AGENTBRIDGE_TOKEN = "hpc_box_test"\n' +
+      'agentbridge connect'
   );
   assert.doesNotMatch(command, /install\.ps1|Invoke-WebRequest|\birm\b/);
 });
@@ -122,9 +122,9 @@ test('unixConnectorCommand reconnects without invoking the installer', () => {
   const command = ui.unixConnectorCommand('https://deepbox.example', 'hpc_box_test');
   assert.equal(
     command,
-    'export DEEPBOX_SERVER_URL="https://deepbox.example"\n' +
-      'export DEEPBOX_TOKEN="hpc_box_test"\n' +
-      'deepbox connect'
+    'export AGENTBRIDGE_SERVER_URL="https://deepbox.example"\n' +
+      'export AGENTBRIDGE_TOKEN="hpc_box_test"\n' +
+      'agentbridge connect'
   );
   assert.doesNotMatch(command, /install\.sh|curl|wget/);
 });
@@ -399,4 +399,13 @@ test('an explicit terminal capability never inherits structured controls', () =>
   const capability = {features: {structured: true, controls: [{key: 'model'}]}};
   assert.equal(ui.supportsStructuredChat(capability, 'terminal'), false);
   assert.equal(ui.supportsStructuredChat(capability, 'structured'), true);
+});
+
+test('account invitation links keep the secret in the fragment, never the query', () => {
+  const url = new URL(ui.accountInvitationUrl('https://agentbridge.example/path?ignored=1', 'test&token'));
+  assert.equal(url.origin, 'https://agentbridge.example');
+  assert.equal(url.pathname, '/');
+  assert.equal(url.search, '');
+  assert.equal(new URLSearchParams(url.hash.slice(1)).get('invite'), 'test&token');
+  assert.throws(()=>ui.accountInvitationUrl('javascript:bad','test'), /HTTP origin/);
 });

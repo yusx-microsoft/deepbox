@@ -1,4 +1,4 @@
-"""Environment-backed deepbox server configuration.
+"""Environment-backed agentbridge server configuration.
 
 Development defaults keep local setup simple. Production mode deliberately
 fails closed when the signing secret or browser origin allowlist is missing.
@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from agentbridge.product import env
 
 load_dotenv()
 
@@ -26,8 +28,8 @@ PLATFORM_AZURE = "azure-app-service"
 VALID_PLATFORMS = {PLATFORM_LOCAL, PLATFORM_AZURE}
 
 
-def _bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
+def _bool(stem: str, default: bool = False) -> bool:
+    raw = env(stem)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -105,21 +107,21 @@ class Settings:
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
-            raise RuntimeError("DEEPBOX_ENV must be development, test, or production")
+            raise RuntimeError("AGENTBRIDGE_ENV must be development, test, or production")
         if self.platform not in VALID_PLATFORMS:
             raise RuntimeError(
-                "DEEPBOX_PLATFORM must be local or azure-app-service"
+                "AGENTBRIDGE_PLATFORM must be local or azure-app-service"
             )
-        if self.production and self.secret == DEFAULT_SECRET:
-            raise RuntimeError("DEEPBOX_SECRET must be set in production")
+        if self.production and (not self.secret or self.secret == DEFAULT_SECRET):
+            raise RuntimeError("AGENTBRIDGE_SECRET must be set in production")
         if self.production and not self.allowed_origins:
-            raise RuntimeError("DEEPBOX_ALLOWED_ORIGINS must be set in production")
+            raise RuntimeError("AGENTBRIDGE_ALLOWED_ORIGINS must be set in production")
         if self.production and not self.cookie_secure:
-            raise RuntimeError("DEEPBOX_COOKIE_SECURE must be true in production")
+            raise RuntimeError("AGENTBRIDGE_COOKIE_SECURE must be true in production")
         if self.cookie_samesite not in {"lax", "strict", "none"}:
-            raise RuntimeError("DEEPBOX_COOKIE_SAMESITE must be lax, strict, or none")
+            raise RuntimeError("AGENTBRIDGE_COOKIE_SAMESITE must be lax, strict, or none")
         if self.auth_mode not in {"local", "microsoft", "hybrid"}:
-            raise RuntimeError("DEEPBOX_AUTH_MODE must be local, microsoft, or hybrid")
+            raise RuntimeError("AGENTBRIDGE_AUTH_MODE must be local, microsoft, or hybrid")
         if self.production and self.microsoft_auth_enabled and not self.is_azure:
             raise RuntimeError("Microsoft authentication requires azure-app-service in production")
         if (
@@ -128,145 +130,144 @@ class Settings:
             and not self.microsoft_allowed_tenant_ids
         ):
             raise RuntimeError(
-                "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS is required when Microsoft "
+                "AGENTBRIDGE_MICROSOFT_ALLOWED_TENANT_IDS is required when Microsoft "
                 "authentication is enabled in production"
             )
         if self.session_ttl_seconds < 300:
-            raise RuntimeError("DEEPBOX_SESSION_TTL_SECONDS must be at least 300")
+            raise RuntimeError("AGENTBRIDGE_SESSION_TTL_SECONDS must be at least 300")
         if not 1 <= self.workspace_invitation_ttl_days <= 30:
             raise RuntimeError(
-                "DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS must be between 1 and 30")
+                "AGENTBRIDGE_WORKSPACE_INVITATION_TTL_DAYS must be between 1 and 30")
         if self.auth_mode == "microsoft":
             if not self.microsoft_owner_emails:
                 raise RuntimeError(
-                    "DEEPBOX_MICROSOFT_OWNER_EMAILS is required in microsoft mode")
+                    "AGENTBRIDGE_MICROSOFT_OWNER_EMAILS is required in microsoft mode")
             if not self.public_url:
                 raise RuntimeError(
-                    "DEEPBOX_PUBLIC_URL is required in microsoft mode")
+                    "AGENTBRIDGE_PUBLIC_URL is required in microsoft mode")
         # Loopback-only in production, except on Azure App Service where the
         # managed front end terminates TLS and forwards to the container's
         # published port. That platform must bind 0.0.0.0 to be reachable.
         if self.production and self.host not in {"127.0.0.1", "localhost", "::1"}:
             if not (self.is_azure and self.host in {"0.0.0.0", "::"}):
                 raise RuntimeError(
-                    "DEEPBOX_HOST must be loopback in production "
+                    "AGENTBRIDGE_HOST must be loopback in production "
                     "(0.0.0.0 only allowed on azure-app-service)"
                 )
         if self.production and any(not origin.startswith("https://") for origin in self.allowed_origins):
             raise RuntimeError("production origins must use HTTPS")
         if not (1 <= self.port <= 65535):
-            raise RuntimeError("DEEPBOX_PORT must be between 1 and 65535")
+            raise RuntimeError("AGENTBRIDGE_PORT must be between 1 and 65535")
         for name, value in (
-            ("DEEPBOX_DB_SIZE_WARN_MB", self.db_size_warn_mb),
-            ("DEEPBOX_DB_SIZE_ALERT_MB", self.db_size_alert_mb),
-            ("DEEPBOX_DISK_FREE_WARN_MB", self.disk_free_warn_mb),
-            ("DEEPBOX_DISK_FREE_ALERT_MB", self.disk_free_alert_mb),
+            ("AGENTBRIDGE_DB_SIZE_WARN_MB", self.db_size_warn_mb),
+            ("AGENTBRIDGE_DB_SIZE_ALERT_MB", self.db_size_alert_mb),
+            ("AGENTBRIDGE_DISK_FREE_WARN_MB", self.disk_free_warn_mb),
+            ("AGENTBRIDGE_DISK_FREE_ALERT_MB", self.disk_free_alert_mb),
         ):
             if value < 0:
                 raise RuntimeError(f"{name} must be non-negative")
         # A database that must alert before it warns is a misconfiguration.
         if self.db_size_alert_mb < self.db_size_warn_mb:
             raise RuntimeError(
-                "DEEPBOX_DB_SIZE_ALERT_MB must be >= DEEPBOX_DB_SIZE_WARN_MB"
+                "AGENTBRIDGE_DB_SIZE_ALERT_MB must be >= AGENTBRIDGE_DB_SIZE_WARN_MB"
             )
         # Free-disk thresholds count down: alert triggers at a lower free
         # figure than warn, so the alert bound must not exceed the warn bound.
         for name, value in (
-            ("DEEPBOX_RATE_LIMIT_API_PER_MINUTE", self.rate_limit_api_per_minute),
-            ("DEEPBOX_RATE_LIMIT_LOGIN_PER_MINUTE", self.rate_limit_login_per_minute),
-            ("DEEPBOX_RATE_LIMIT_TOKEN_PER_MINUTE", self.rate_limit_token_per_minute),
+            ("AGENTBRIDGE_RATE_LIMIT_API_PER_MINUTE", self.rate_limit_api_per_minute),
+            ("AGENTBRIDGE_RATE_LIMIT_LOGIN_PER_MINUTE", self.rate_limit_login_per_minute),
+            ("AGENTBRIDGE_RATE_LIMIT_TOKEN_PER_MINUTE", self.rate_limit_token_per_minute),
         ):
             if value < 1:
                 raise RuntimeError(f"{name} must be at least 1")
         if self.disk_free_alert_mb > self.disk_free_warn_mb:
             raise RuntimeError(
-                "DEEPBOX_DISK_FREE_ALERT_MB must be <= DEEPBOX_DISK_FREE_WARN_MB"
+                "AGENTBRIDGE_DISK_FREE_ALERT_MB must be <= AGENTBRIDGE_DISK_FREE_WARN_MB"
             )
 
 
-def _float(name: str, default: float) -> float:
-    raw = os.getenv(name)
+def _float(stem: str, default: float) -> float:
+    raw = env(stem)
     if raw is None or not raw.strip():
         return default
     return float(raw.strip())
 
 
 def _port() -> int:
-    # Azure App Service (and many PaaS hosts) inject the listening port via
-    # PORT / WEBSITES_PORT. Prefer the explicit deepbox variable, then the
-    # platform-provided ones, then the local default.
-    for name in ("DEEPBOX_PORT", "PORT", "WEBSITES_PORT"):
-        raw = os.getenv(name)
+    # Azure App Service (and many PaaS hosts) inject PORT / WEBSITES_PORT.
+    # These follow the explicit product setting (new or legacy).
+    # An empty canonical setting skips legacy and uses the platform/default.
+    for raw in (env("PORT"), os.getenv("PORT"), os.getenv("WEBSITES_PORT")):
         if raw and raw.strip():
             return int(raw.strip())
     return 8077
 
 
 def load_settings() -> Settings:
-    public_url = os.getenv("DEEPBOX_PUBLIC_URL", "").strip().rstrip("/") or None
-    allowed = _origins(os.getenv("DEEPBOX_ALLOWED_ORIGINS", ""))
+    public_url = env("PUBLIC_URL", "").strip().rstrip("/") or None
+    allowed = _origins(env("ALLOWED_ORIGINS", ""))
     # A configured public URL is also an allowed browser origin unless the
     # operator explicitly supplies additional origins.
     if public_url:
         allowed = frozenset({*allowed, public_url})
-    platform = os.getenv("DEEPBOX_PLATFORM", PLATFORM_LOCAL).strip().lower()
+    platform = env("PLATFORM", PLATFORM_LOCAL).strip().lower()
     # forwarded_allow_ips defaults to loopback; on Azure the reverse proxy is
     # an internal, platform-managed hop so trusting it is required for correct
     # client IP / scheme handling. Operators can override explicitly.
     default_fwd = "*" if platform == PLATFORM_AZURE else "127.0.0.1"
-    forwarded_allow_ips = os.getenv("DEEPBOX_FORWARDED_ALLOW_IPS", default_fwd).strip()
-    environment = os.getenv("DEEPBOX_ENV", "development").strip().lower()
+    forwarded_allow_ips = env("FORWARDED_ALLOW_IPS", default_fwd).strip()
+    environment = env("ENV", "development").strip().lower()
     # Registration is open by default for local development but fails closed
     # in production unless an operator explicitly enables it.
     registration_default = environment != "production"
     # The bootstrap token is used exactly once to create the first owner. We
     # never retain the plaintext: only its SHA-256 hash lives in Settings, and
-    # the plaintext env var is cleared from the process environment.
-    bootstrap_raw = os.getenv("DEEPBOX_BOOTSTRAP_TOKEN", "").strip()
+    # both plaintext aliases are cleared from the process environment.
+    bootstrap_raw = env("BOOTSTRAP_TOKEN", "").strip()
     bootstrap_token_hash = (
         hashlib.sha256(bootstrap_raw.encode()).hexdigest() if bootstrap_raw else None
     )
-    if "DEEPBOX_BOOTSTRAP_TOKEN" in os.environ:
-        del os.environ["DEEPBOX_BOOTSTRAP_TOKEN"]
+    for key in ("AGENTBRIDGE_BOOTSTRAP_TOKEN", "DEEPBOX_BOOTSTRAP_TOKEN"):
+        os.environ.pop(key, None)
     result = Settings(
         environment=environment,
         platform=platform,
-        secret=os.getenv("DEEPBOX_SECRET", DEFAULT_SECRET),
-        database_url=os.getenv("DEEPBOX_DATABASE_URL", "sqlite:///deepbox.db"),
-        data_dir=Path(os.getenv("DEEPBOX_DATA_DIR", str(PROJECT_DIR / "data"))).resolve(),
+        secret=env("SECRET", DEFAULT_SECRET),
+        database_url=env("DATABASE_URL", "sqlite:///deepbox.db"),
+        data_dir=Path(env("DATA_DIR", str(PROJECT_DIR / "data"))).resolve(),
         public_url=public_url,
         allowed_origins=allowed,
-        cookie_secure=_bool("DEEPBOX_COOKIE_SECURE", False),
-        cookie_samesite=os.getenv("DEEPBOX_COOKIE_SAMESITE", "lax").strip().lower(),
-        host=os.getenv("DEEPBOX_HOST", "127.0.0.1").strip(),
+        cookie_secure=_bool("COOKIE_SECURE", False),
+        cookie_samesite=env("COOKIE_SAMESITE", "lax").strip().lower(),
+        host=env("HOST", "127.0.0.1").strip(),
         port=_port(),
         forwarded_allow_ips=forwarded_allow_ips,
-        registration_enabled=_bool("DEEPBOX_REGISTRATION_ENABLED", registration_default),
+        registration_enabled=_bool("REGISTRATION_ENABLED", registration_default),
         bootstrap_token_hash=bootstrap_token_hash,
-        db_size_warn_mb=_float("DEEPBOX_DB_SIZE_WARN_MB", 256.0),
-        db_size_alert_mb=_float("DEEPBOX_DB_SIZE_ALERT_MB", 1024.0),
-        disk_free_warn_mb=_float("DEEPBOX_DISK_FREE_WARN_MB", 1024.0),
-        disk_free_alert_mb=_float("DEEPBOX_DISK_FREE_ALERT_MB", 256.0),
-        rate_limit_enabled=_bool("DEEPBOX_RATE_LIMIT_ENABLED", environment == "production"),
-        rate_limit_api_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_API_PER_MINUTE", "300")),
-        rate_limit_login_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_LOGIN_PER_MINUTE", "10")),
-        rate_limit_token_per_minute=int(os.getenv("DEEPBOX_RATE_LIMIT_TOKEN_PER_MINUTE", "20")),
-        auth_mode=os.getenv("DEEPBOX_AUTH_MODE", "local").strip().lower(),
-        session_ttl_seconds=int(os.getenv("DEEPBOX_SESSION_TTL_SECONDS", str(8 * 60 * 60))),
+        db_size_warn_mb=_float("DB_SIZE_WARN_MB", 256.0),
+        db_size_alert_mb=_float("DB_SIZE_ALERT_MB", 1024.0),
+        disk_free_warn_mb=_float("DISK_FREE_WARN_MB", 1024.0),
+        disk_free_alert_mb=_float("DISK_FREE_ALERT_MB", 256.0),
+        rate_limit_enabled=_bool("RATE_LIMIT_ENABLED", environment == "production"),
+        rate_limit_api_per_minute=int(env("RATE_LIMIT_API_PER_MINUTE", "300")),
+        rate_limit_login_per_minute=int(env("RATE_LIMIT_LOGIN_PER_MINUTE", "10")),
+        rate_limit_token_per_minute=int(env("RATE_LIMIT_TOKEN_PER_MINUTE", "20")),
+        auth_mode=env("AUTH_MODE", "local").strip().lower(),
+        session_ttl_seconds=int(env("SESSION_TTL_SECONDS", str(8 * 60 * 60))),
         microsoft_owner_emails=frozenset(
             value.strip().casefold()
-            for value in os.getenv("DEEPBOX_MICROSOFT_OWNER_EMAILS", "").split(",")
+            for value in env("MICROSOFT_OWNER_EMAILS", "").split(",")
             if value.strip()
         ),
         microsoft_allowed_tenant_ids=frozenset(
             value.strip().casefold()
-            for value in os.getenv(
-                "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS", ""
+            for value in env(
+                "MICROSOFT_ALLOWED_TENANT_IDS", ""
             ).split(",")
             if value.strip()
         ),
-        workspace_invitation_ttl_days=int(os.getenv(
-            "DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS", "7")),
+        workspace_invitation_ttl_days=int(env(
+            "WORKSPACE_INVITATION_TTL_DAYS", "7")),
     )
     result.validate()
     return result

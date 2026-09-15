@@ -523,7 +523,7 @@ class StructuredAgentSession:
         return f"{index:02d}-{safe or 'attachment'}"
 
     def _materialize(self, attachments: list[dict]):
-        temp = tempfile.TemporaryDirectory(prefix="deepbox-attachments-")
+        temp = tempfile.TemporaryDirectory(prefix="agentbridge-attachments-")
         paths = []
         for index, item in enumerate(attachments, 1):
             path = Path(temp.name) / self._safe_filename(index, item["name"])

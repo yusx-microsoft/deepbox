@@ -1,1 +1,1 @@
-"""Operator tooling for DeepBox (backup/restore, smoke checks)."""
+"""Operator tooling for agentbridge (backup/restore, smoke checks)."""

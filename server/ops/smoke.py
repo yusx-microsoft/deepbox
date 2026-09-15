@@ -1,4 +1,4 @@
-"""Post-restart smoke check for the DeepBox server.
+"""Post-restart smoke check for the agentbridge server.
 
 After a deploy or a process restart an operator wants a single command that says
 "is it actually up and healthy?" without hand-crafting curl calls. This script
@@ -100,7 +100,7 @@ def evaluate_smoke(fetch: Fetcher, base_url: str) -> list[CheckResult]:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="DeepBox post-restart smoke check")
+    parser = argparse.ArgumentParser(prog="agentbridge-smoke", description="agentbridge post-restart smoke check")
     parser.add_argument(
         "--base-url",
         default="http://127.0.0.1:8077",

@@ -1,7 +1,7 @@
 (function(root, factory){
   const api = factory();
   if(typeof module === 'object' && module.exports) module.exports = api;
-  if(root) root.DeepboxCollaboration = api;
+  if(root) root.AgentBridgeCollaboration = root.DeepboxCollaboration = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function(){
   // Roles that are allowed to type when they hold the keyboard lease.
   const OPERATOR_ROLES = ['operator', 'admin', 'owner'];

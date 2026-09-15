@@ -10,8 +10,9 @@ _tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
 def build_app(registration_enabled: bool):
     """Reload the app with a fresh file DB and the given registration flag."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DEEPBOX_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
     dbfile = tempfile.mktemp(suffix=".db", dir=_tmpdir.name)
+    env["DEEPBOX_DATA_DIR"] = tempfile.mkdtemp(dir=_tmpdir.name)
     env["DEEPBOX_DATABASE_URL"] = f"sqlite:///{dbfile.replace(os.sep, '/')}"
     env["DEEPBOX_REGISTRATION_ENABLED"] = "true" if registration_enabled else "false"
     with patch.dict(os.environ, env, clear=True):

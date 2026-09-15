@@ -51,7 +51,7 @@ PROD_ENV = {
 
 
 def clean_env(extra=None):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DEEPBOX_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
     env.pop("PORT", None)
     env.pop("WEBSITES_PORT", None)
     if extra:
@@ -67,7 +67,7 @@ class SettingsTests(unittest.TestCase):
 
     def test_production_requires_secret_origin_and_secure_cookie(self):
         settings = make_settings(environment="production")
-        with self.assertRaisesRegex(RuntimeError, "DEEPBOX_SECRET"):
+        with self.assertRaisesRegex(RuntimeError, "AGENTBRIDGE_SECRET"):
             settings.validate()
 
     def test_public_url_becomes_allowed_origin(self):
@@ -88,7 +88,7 @@ class SettingsTests(unittest.TestCase):
 
 class PlatformTests(unittest.TestCase):
     def test_invalid_platform_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "DEEPBOX_PLATFORM"):
+        with self.assertRaisesRegex(RuntimeError, "AGENTBRIDGE_PLATFORM"):
             make_settings(platform="gcp").validate()
 
     def test_production_local_rejects_non_loopback_host(self):
@@ -135,7 +135,7 @@ class MicrosoftAuthSettingsTests(unittest.TestCase):
             auth_mode="hybrid",
         )
         with self.assertRaisesRegex(
-            RuntimeError, "DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS"
+            RuntimeError, "AGENTBRIDGE_MICROSOFT_ALLOWED_TENANT_IDS"
         ):
             settings.validate()
 

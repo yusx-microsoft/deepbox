@@ -1,11 +1,22 @@
-# DeepBox Implementation Guide
+# AgentBridge Implementation Guide
 
-This is a current, practical map of the DeepBox codebase: how the parts fit
+This is a practical map of the local AgentBridge draft: how the parts fit
 together, what each module does, the protocol surfaces, and how to run the
 tests. For product intent see [`design.md`](design.md) and
 [`product-design.md`](product-design.md); for persistence internals see
 [`persistence.md`](persistence.md); for operations see
 [`operations.md`](operations.md) and [`remote-deployment.md`](remote-deployment.md).
+
+**Status:** the user has authorized release of this implementation to the existing
+`deepbox-webdata-du` app. Static design exploration remains separate. Verify the
+deployment and `/api/version` rather than inferring a rollout from this module map.
+Integration results belong in the [review record](review.md).
+
+**AgentBridge** is the human-facing display name (`DISPLAY_NAME`), including the
+FastAPI title. `NAME = "agentbridge"` remains the lowercase CLI/package and
+service/logger identifier, with `AGENTBRIDGE_*` environment keys. `LEGACY_NAME`
+and auth/cookie/hash/IPC/storage identities remain unchanged. This is not a migration.
+External repository, Azure, and domain changes still need separate approval.
 
 ## 1. Architecture at a glance
 
@@ -22,7 +33,16 @@ Three cooperating parts:
   terminal bytes or canonical events are relayed through the server.
 - **Web** (`web/`) — a static single-page app. Native structured chat for
   runtimes that support JSON output, with an xterm.js terminal fallback for
-  everything else. The browser holds no connector token and no model key.
+  TUI runtimes or an explicit Terminal choice. Independent panes share a small
+  workbench shell, not a singleton session controller. Model keys stay local;
+  one-time connector tokens appear only in management dialog memory/DOM.
+
+`agentbridge/product.py` centralizes product naming, `AGENTBRIDGE_*`/`DEEPBOX_*`
+lookup, and install-home compatibility. Canonical variables win by presence,
+including explicit empties; existing `.deepbox` and custom roots are not moved.
+See [the exact compatibility contract](agentbridge.md#environment-and-home-compatibility).
+This is not a server micro-framework rewrite: the FastAPI routes, Hub, leases,
+durability pipeline, and provider registry remain.
 
 Wire protocol version is `3` (`PROTOCOL_VERSION` in `server/app/models.py` and
 `connector/transport.py`); the server validates it during the WebSocket hello,
@@ -56,7 +76,8 @@ Browser  <--WSS /ws/term-->  Server  <--WSS /ws/devbox-->  Connector  -->  CLI a
   `wal_autocheckpoint`). Holds `PROTOCOL_VERSION`, retention constants, and the
   additive `_migrate()` / workspace backfill. `Session.surface` stores `terminal`
   or `structured`; migrated sessions remain unknown until a validated ready or
-  snapshot establishes their surface. No runtime-name inference is needed.
+  snapshot establishes their surface. No runtime-name inference is needed. The
+  SQL table is still **`session`**; `/api/devboxes` retains its domain identity.
 - **`hub.py`** — in-memory `Hub`: routes frames between connected browsers and
   connectors, per-devbox bounded send queues, hello ordering, duplicate-connection
   retirement, and presence.
@@ -117,11 +138,11 @@ WebSockets:
 Session create/list and ready/snapshot frames carry the generic `surface` value.
 An attach cannot silently change an existing session's surface. Structured
 `stdin`/`input`, permission replies, and interrupts require Operator or above,
-but not the terminal keyboard lease. Terminal input and resize retain exclusive
-keyboard ownership. Structured keyboard REST requests return 400; browser keyboard
-frames return `keyboard_not_required`. Closing a process is separate: the keyboard
-holder or workspace Admin/Owner can terminate it (an Operator cannot terminate a
-structured process merely by being able to chat).
+but not the terminal keyboard lease. Terminal input, resize, and termination
+require the keyboard holder, including for an Admin/Owner. Structured keyboard
+REST requests return 400; browser keyboard frames return `keyboard_not_required`.
+Structured termination requires the holder or workspace Admin/Owner; shared-chat
+permission alone cannot end the session. Closing a pane only detaches its viewer.
 
 Every input checks current identity, membership, and attachment. Every connector
 session frame checks the current devbox connection, session's owning agent, and
@@ -131,6 +152,9 @@ the connection. Valid legacy wire forms remain supported at this boundary.
 
 ## 4. Connector (`connector/`)
 
+- **`cli.py`** — installed `agentbridge` command and legacy `deepbox` alias:
+  explicit connect, diagnostics, project/skill management, and upgrade actions.
+  Shared product helpers select compatible environment values and install roots.
 - **`client.py` / `Connector.run()`** — top-level loop: `GET /api/me`, report
   projects/skills/runtimes, run a ~2s inventory watcher, open `/ws/devbox`,
   handle handshake and heartbeats (every 20s), and reconnect with backoff after
@@ -214,22 +238,54 @@ the connection. Valid legacy wire forms remain supported at this boundary.
 
 ## 5. Web (`web/`)
 
-- **`index.html`** — mounts xterm.js (CDN) and declares the external stylesheet
-  once; `styles.css` is the single source of truth for themes.
-- **`app.js`** — UI controller: auth config, fleet rendering
-  (`Workspace → Devbox → Agent`), workspace management affordances, one-time
-  token display, session content area, DOM/WebSocket/FileReader wiring, and
-  replay UI. Role checks are always re-enforced on the server.
+- **`index.html`, `styles.css`** — restored pre-tmux workbench with refined top
+  navigation, a compact collapsible sidebar, flexible panes, and quiet controls.
+  Restrained sans-serif UI and monospace code/data, subtle borders/spacing, and
+  light/dark themes; no green tmux status bar or forced full-screen TUI.
+- **`api.js`** — credentialed same-origin JSON requests and consistent error handling.
+- **`dialogs.js`** — shared modal, form, prompt, and confirmation lifecycle with
+  cancellation, Escape, and focus restoration.
+- **`management.js`** — account/workspace/member administration, devbox/agent,
+  project/skill, and one-time-token dialogs. Captured user/workspace context guards
+  asynchronous responses. Role edits require an explicit **Save**; no auto-grants.
+- **`layout.js`** — DOM-free binary split-tree operations, validation, ratio
+  clamping, normalized pane geometry/neighbors, and a four-pane maximum.
+- **`workbench.js`** — pane hosts, select/split/close/maximize, draggable and
+  keyboard-operable row/column separators, DFS pane numbering, geometric/cyclic
+  focus, resize notification, and layout
+  preferences keyed by user + workspace. Saved targets are whitelisted
+  IDs/surface/kind alongside geometry, never messages, files, tokens, or roles.
+- **`pane.js`** — each pane's session/socket lifecycle, chat, terminal, replay,
+  reconnect, file reads, stale-response guards, and teardown. Closing detaches;
+  it never terminates the backend session. New chat leaves the old session alive.
+  Unsent drafts remain independent in memory and never enter layout storage.
+- **`app.js`** — shell composition, signed-in/workspace context, top navigation,
+  collapsible sidebar, management, and optional keyboard/command affordances.
+  **`main.js`** is the small bootstrap entry point.
+- **`tmux.js`** — optional, allowlisted key/command parsing, not a shell evaluator
+  or the primary visual shell. The mode is **opt-in, default off**: Control+B must
+  not be captured before user enablement, and disabling clears pending prefix state.
+  When enabled, literal Ctrl+B uses only the pane's checked `sendPrefix()` path;
+  dialogs, IME composition, and unprefixed editing/terminal keys are respected.
+  Visible navigation and pane controls do not depend on this mode; see the
+  [optional key contract](agentbridge.md#optional-tmux-style-interaction).
 - **`ui.js`, `chat.js`, `replay.js`, `collaboration.js`** — shared helpers:
   fleet aggregation, filtering, command building, runtime label/option handling,
   the canonical event reducer, JSONL parsing, replay seek/checkpoint logic, and
-  collaboration view state, plus the transcript renderer. Loaded in fixed deferred
-  script order before `app.js`; there are no lazy-loader promises or single-flight
-  chat-mount gates. Explicit Terminal selects only a matching live terminal;
-  New session retains the selected surface. Chat and structured replay never
-  initialize xterm. Terminal replay mounts xterm inside its host without replacing
-  the replay toolbar. Route/socket guards reject late responses from old views;
-  replacing an overlay resolves cancellation and removes its Escape handler.
+  collaboration view state, plus the transcript renderer.
+- **`terminal-assets.js`** — on-demand, retryable loader for the existing pinned
+  jsDelivr xterm CSS/JS and fit addon. Chat/app boot never wait for the CDN;
+  terminal load failure is visible before any session-creation request. Terminal
+  replay keeps its toolbar when mounting xterm. No vendor downloads were performed
+  during implementation; xterm has not been vendored or removed.
+
+Local deferred script order is `ui → chat → collaboration → replay → api → dialogs →
+layout → terminal-assets → pane → workbench → management → tmux → app → main`.
+There is no lazy chat-mount gate. Explicit Terminal reuses only a known matching
+live terminal; New session retains its selected surface. Layout restore never
+persists `forceNew`: a missing agent/session or an ended saved live target does not
+cause a create request. Layout storage is not a recording or permission cache;
+all authorization remains enforced by the existing server.
 
 The reducer merges `session.config`, `user.echo`, assistant messages, tool cards,
 permissions, turn and error state; optimistic user turns are de-duplicated against
@@ -239,6 +295,10 @@ final result. Live and restored events go through the same reducer.
 ## 6. Configuration and deployment
 
 `config.py` loads from environment/`.env`; `python -m server` starts Uvicorn.
+Use canonical `AGENTBRIDGE_*` names (for example `AGENTBRIDGE_DATABASE_URL`,
+`AGENTBRIDGE_SERVER_URL`, and `AGENTBRIDGE_TOKEN`). A corresponding `DEEPBOX_*`
+value is used only when the canonical key is absent, not when it is explicitly
+empty. Defaults and caller validation still apply; see [compatibility](agentbridge.md).
 The recommended small deployment keeps Uvicorn on `127.0.0.1:8077` behind
 Tailscale Serve for Tailnet HTTPS/WSS; the app does not terminate TLS itself, and
 Funnel / direct public exposure is out of scope. `/ws/term` validates Origin;
@@ -254,13 +314,19 @@ pytest; pure helpers and actual app orchestration run with `node --test`.
 
 ```bat
 :: Python suites
-.venv\Scripts\python -m pytest -q
+cd /d C:\Code\deepbox && .venv\Scripts\python -m pytest -q
 :: A single suite
-.venv\Scripts\python -m pytest tests\test_server_recording.py -q
+cd /d C:\Code\deepbox && .venv\Scripts\python -m pytest tests\test_server_recording.py -q
 
 :: Browser (node:test) suites
-node --test web\ui.test.js web\chat.test.js web\replay.test.js web\collaboration.test.js web\app.test.js
+cd /d C:\Code\deepbox && node --test web/*.test.js
 ```
+
+The installed Node supports this glob in CMD. On older versions, enumerate all
+`web/*.test.js` files, including tmux, pane, dialog and workbench tests, explicitly.
+Use isolated fixtures, not live setup or real model agents. Final integrated
+evidence and user acceptance for this polish pass remain pending in [`review.md`](review.md);
+the earlier tmux iteration's counts are historical, not validation for this pass.
 
 Representative coverage:
 
@@ -278,7 +344,9 @@ Representative coverage:
 | DB / migrations / pragmas | `test_models_migration.py`, `test_db_pragmas.py` |
 | Ops | `test_backup.py`, `test_capacity.py`, `test_smoke.py`, `test_version.py`, `test_logging.py` |
 | Security / config | `test_security.py`, `test_security_integration.py`, `test_config.py`, `test_password_hashing.py` |
+| Display / identifier separation | `test_product.py`, title/OpenAPI/logger checks in `test_security_integration.py` |
 | Browser logic | `web/ui.test.js`, `web/chat.test.js`, `web/replay.test.js`, `web/collaboration.test.js` |
+| Pane isolation, split/restore, management context | `web/pane.test.js`, `web/layout.test.js`, `web/workbench.test.js`, `web/management.test.js`, `web/app.test.js` |
 
 ## 8. Current boundaries
 
@@ -287,5 +355,5 @@ Representative coverage:
 - The app itself does not terminate TLS; a deployment front end such as Azure App
   Service or Tailscale Serve must provide HTTPS/WSS.
 - Two-process supervisor/transport (real ConPTY / Windows service durability)
-  passes automated simulations but still needs manual on-hardware verification
+  has simulation coverage but still needs manual on-hardware verification
   before being treated as production-proven.

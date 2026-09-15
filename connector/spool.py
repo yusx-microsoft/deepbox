@@ -57,6 +57,8 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
+from .local_store import default_state_root
+
 IS_WIN = sys.platform.startswith("win")
 
 # Bound on client_input_id to keep the dedup ledger sane and reject abuse.
@@ -133,13 +135,7 @@ def spool_namespace(server_url: str, token: str) -> str:
 
 
 def default_spool_root() -> str:
-    if IS_WIN:
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "deepbox", "spool")
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(
-        os.path.expanduser("~"), ".local", "state"
-    )
-    return os.path.join(base, "deepbox", "spool")
+    return os.path.join(default_state_root(), "spool")
 
 
 def spool_path(server_url: str, token: str, root: str | None = None) -> str:

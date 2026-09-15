@@ -1,4 +1,4 @@
-"""SQLite backup and restore tooling for DeepBox operators.
+"""SQLite backup and restore tooling for agentbridge operators.
 
 The server stores everything in a single SQLite database. This module provides
 safe, scriptable backup and restore primitives plus a CLI:
@@ -18,12 +18,14 @@ local file around.
 from __future__ import annotations
 
 import argparse
-import datetime as _dt
 import os
+import datetime as _dt
 import shutil
 import sqlite3
 import sys
 from pathlib import Path
+
+from agentbridge.product import NAME, env
 from typing import Optional
 
 
@@ -88,7 +90,7 @@ def backup_database(database_url: str, dest_dir: Path) -> Path:
         raise BackupError(f"database file does not exist: {src}")
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"deepbox-backup-{_timestamp()}.db"
+    dest = dest_dir / f"{NAME}-backup-{_timestamp()}.db"
 
     source = sqlite3.connect(os.fspath(src))
     try:
@@ -157,18 +159,15 @@ def restore_database(
 def _load_database_url(explicit: Optional[str]) -> str:
     if explicit:
         return explicit
-    env = os.getenv("DEEPBOX_DATABASE_URL")
-    if env:
-        return env
-    # Match the server default (config.py): a file next to the repo root.
-    return "sqlite:///deepbox.db"
+    # Match the server default without falling through an explicit empty alias.
+    return env("DATABASE_URL", "sqlite:///deepbox.db")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="DeepBox SQLite backup/restore")
+    parser = argparse.ArgumentParser(prog=f"{NAME}-backup", description=f"{NAME} SQLite backup/restore")
     parser.add_argument(
         "--database-url",
-        help="SQLite URL (default: $DEEPBOX_DATABASE_URL or sqlite:///deepbox.db)",
+        help="SQLite URL (default: AGENTBRIDGE_DATABASE_URL, DEEPBOX_DATABASE_URL, or sqlite:///deepbox.db)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

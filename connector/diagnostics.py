@@ -34,7 +34,7 @@ def explain_connection_error(exc: BaseException) -> str:
     if isinstance(exc, socket.gaierror) or "getaddrinfo failed" in message or "name or service" in message:
         return "DNS lookup failed. Check Tailscale status, MagicDNS, and the server hostname."
     if isinstance(exc, (ConnectionRefusedError, httpx.ConnectError)) and "refused" in message:
-        return "Connection refused. Check that deepbox Server and Tailscale Serve are running."
+        return "Connection refused. Check that agentbridge Server and Tailscale Serve are running."
     if isinstance(exc, (TimeoutError, httpx.TimeoutException)) or "timed out" in message:
         return "Connection timed out. Check Tailnet connectivity and Tailscale ACLs."
     if isinstance(exc, httpx.HTTPStatusError):
@@ -93,7 +93,7 @@ def run_doctor(server_url: str, token: str, protocol_version: int) -> list[Check
             ))
 
             if not token:
-                checks.append(Check("authentication", False, "DEEPBOX_TOKEN is missing"))
+                checks.append(Check("authentication", False, "AGENTBRIDGE_TOKEN is missing"))
             else:
                 me_response = client.get("/api/me", headers=headers)
                 me_response.raise_for_status()

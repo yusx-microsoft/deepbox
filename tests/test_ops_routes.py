@@ -10,7 +10,7 @@ _tmpdir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
 
 def build_app(extra_env=None):
-    env = {k: v for k, v in os.environ.items() if not k.startswith("DEEPBOX_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENTBRIDGE_", "DEEPBOX_"))}
     dbfile = tempfile.mktemp(suffix=".db", dir=_tmpdir.name)
     env["DEEPBOX_DATABASE_URL"] = f"sqlite:///{dbfile.replace(os.sep, '/')}"
     env["DEEPBOX_DATA_DIR"] = tempfile.mkdtemp(dir=_tmpdir.name)
@@ -48,7 +48,8 @@ class VersionRouteTests(unittest.TestCase):
         r = client.get("/api/version")
         self.assertEqual(r.status_code, 200)
         data = r.json()
-        self.assertEqual(set(data.keys()), {"version", "commit"})
+        self.assertEqual(set(data.keys()), {"product", "version", "commit"})
+        self.assertEqual(data["product"], "agentbridge")
         self.assertNotIn("dirty", data)
 
     def test_detailed_version_requires_owner(self):

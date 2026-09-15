@@ -1,6 +1,12 @@
-# deepbox — Design
+# agentbridge — Design
 
-> **In one line:** deepbox is an "agent switchboard / control plane". Users connect
+**Local draft, awaiting user visual/code review.** Production remains
+`deepbox-webdata-du` at `1fab322`; that release's approval does not cover this work.
+The protocol/domain design below is retained, not a server rewrite. For current
+module responsibilities see [implementation](implementation.md); for name/home
+compatibility and the separate final external rename see [agentbridge](agentbridge.md).
+
+> **In one line:** agentbridge is an "agent switchboard / control plane". Users connect
 > the agent CLIs on their own devbox (Claude Code, GitHub Copilot CLI, Codex CLI,
 > and similar) to the server, sign in to the web UI, and interact with those agents
 > as if they were at the local terminal.
@@ -21,7 +27,7 @@ Human ── Membership(role) ──▶ Workspace ── owns ──▶ Devbox �
 
 - **Human** — A browser user. Signs in with a local password or with a Microsoft
   identity via Azure App Service Easy Auth, then carries a short-lived
-  `deepbox_session` cookie that deepbox issues itself.
+  `deepbox_session` compatibility cookie that agentbridge issues itself.
 - **Workspace** — The visible collaboration and authorization boundary. A user can
   belong to many workspaces, and a workspace can contain many devboxes.
 - **Membership** — A human's `viewer / operator / admin / owner` role within a
@@ -306,7 +312,7 @@ and fail-closed handling of payload-hash conflicts.
 
 ### 5.6 LocalProjects and user skills
 
-- `deepbox project add <path> --name <name>` writes a canonical absolute path into
+- `agentbridge project add <path> --name <name>` writes a canonical absolute path into
   the connector-state `state.db`. The default root is `%LOCALAPPDATA%/deepbox` on
   Windows and `${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The
   server's `DevboxProject` holds only ID, name, and non-sensitive `runtime_config`.
@@ -319,7 +325,7 @@ and fail-closed handling of payload-hash conflicts.
   `description`, with the directory basename equal to `name`. The tree is capped at
   256 regular files / 10 MiB; traversal, symlink/junction/reparse, and any change
   during reads are rejected. Scripts are only flagged as `contains_scripts`;
-  deepbox never executes them.
+  agentbridge never executes them.
 - A skill's scope is `personal` or a registered LocalProject. `--project` resolves
   by ID, unique case-insensitive name, or exact normalized path; no value is
   equivalent to `--project .`, resolving to the longest containing project by
@@ -349,7 +355,7 @@ and fail-closed handling of payload-hash conflicts.
 | `GET` | `/api/auth/config` | none | Enabled local/Microsoft sign-in methods |
 | `POST` | `/api/auth/login` | none | Password sign-in for `local/hybrid` |
 | `GET` | `/api/auth/microsoft/start` | none | Redirect to `/.auth/login/aad` |
-| `GET` | `/api/auth/microsoft/callback` | Easy Auth headers | tenant+subject upsert, issue Deepbox cookie |
+| `GET` | `/api/auth/microsoft/callback` | Easy Auth headers | tenant+subject upsert, issue compatible session cookie |
 | `GET` | `/api/auth/microsoft/logout` | none | Clear cookie, redirect to `/.auth/logout` |
 | `GET` | `/api/me/user` | Cookie | Current user profile and accessible workspaces |
 | `GET` | `/api/me` | Bearer devbox token | Devbox identity, protocol version, projects, and agents |
@@ -373,11 +379,13 @@ The trust boundary for Microsoft sign-in is Azure App Service Easy Auth: the
 platform verifies OAuth/OIDC and then injects `X-MS-CLIENT-PRINCIPAL*` headers. The
 app never receives a browser Microsoft bearer token and never stores
 access/refresh tokens; deployments that are not on App Service, or that have not
-correctly enabled Easy Auth, must keep `DEEPBOX_AUTH_MODE=local`. When Microsoft
-sign-in is enabled in production, `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS` must be
+correctly enabled Easy Auth, must keep `AGENTBRIDGE_AUTH_MODE=local`. When Microsoft
+sign-in is enabled in production, `AGENTBRIDGE_MICROSOFT_ALLOWED_TENANT_IDS` must be
 set, and the app re-checks the platform principal's tenant claim against that
 allowlist; `microsoft` mode also requires an explicit owner-email allowlist and
-`DEEPBOX_PUBLIC_URL`.
+`AGENTBRIDGE_PUBLIC_URL`. Legacy `DEEPBOX_*` values remain valid when the matching
+canonical key is absent; an explicit empty canonical value never reveals a legacy
+value. This does not change the existing Azure/domain/Entra callback identities.
 
 The workspace invitation token lives in the URL fragment
 `#workspace-invite=...`, so it is not sent with the first HTTP request. The
@@ -389,18 +397,12 @@ access logs.
 
 ## 7. Connector package (`connector/`, Python)
 
-A user-launched process. In normal use you install the local `deepbox` command
-once, then start it with:
-
-```text
-DEEPBOX_SERVER_URL=http://localhost:8077 DEEPBOX_TOKEN=hpc_box_... deepbox connect
-# On PowerShell, use the corresponding $env:... assignments
-```
-
-The stable `deepbox` shim lives in `~/.deepbox/bin` and launches `connector.cli`
-from the caller's current directory. Only `deepbox upgrade` re-runs the installer
-and refreshes `~/.deepbox/app`; `deepbox connect` runs no install logic. During
-source development you can still run `python -m connector`.
+A user-launched process, installed once and started with `agentbridge connect`
+only after explicit user setup. `deepbox` remains a CLI alias. The launcher runs
+`connector.cli` from the caller's current directory; normal connects run no install
+logic. Only explicit install/upgrade refreshes the application. Existing `.deepbox`
+or custom roots are reused under the [home compatibility rules](agentbridge.md#environment-and-home-compatibility),
+not moved. See [install](install.md); source development can use `python -m connector`.
 
 Startup flow:
 
@@ -425,33 +427,45 @@ Startup flow:
 
 ## 8. Web client (`web/`)
 
-The single-page switchboard provides Fleet, sessions/collaboration, native chat,
-and the terminal fallback:
+The single-page workbench provides compact navigation, native chat, terminal, and
+replay. `app.js`/`main.js` compose the shell; API/dialogs/management are separate
+from the split-tree/workbench/pane lifecycle. Each pane owns its socket and surface,
+not a singleton session stage. See the [module map](implementation.md#5-web-web).
+
+Users split right/below in a binary tree (maximum four panes), adjust row/column
+ratios by pointer or keyboard, and select/maximize/close independently. Close only
+detaches. User/workspace layout preferences store geometry and whitelisted target
+IDs/surface/kind, never conversation/file/token/role data or `forceNew`. Restoring
+missing or ended live targets never implicitly creates sessions.
+
+Surface behavior retains the existing capability and backend authorization rules:
 
 - when a capability reports `features.structured`, it enters chat before the first
   frame, and canonical events drive the reducer/render;
 - generic `select`/`file` descriptors generate model, reasoning, and attachment
-  widgets; once a session locks, `New chat` reopens them;
+  widgets; once a session locks, `New chat` reopens them without ending the old session;
 - Add-agent refreshes the runtime/project inventory, picks a LocalProject, and only
-  generates a copyable `deepbox project add ...` command;
+  generates a copyable `agentbridge project add ...` command;
 - the Skills modal shows only the path-free inventory and connector-local CLI
   commands;
-- re-attaching a tab folds durable event JSONL, then continues with live events;
-- non-structured runtimes continue to render raw PTY bytes with xterm.js.
+- re-attaching a pane folds durable event JSONL, then continues with live events;
+- non-structured runtimes continue to render raw PTY bytes with xterm.js. Its
+  existing pinned jsDelivr assets load on demand through `terminal-assets.js`, not
+  during chat/app boot. Failure is visible before session creation; no new vendor
+  downloads or remote fonts were introduced. Local helpers load deterministically.
 
 ---
 
 ## 9. Status and roadmap
 
-- **Landed foundation and reliability:** local account lifecycle, Microsoft Easy
+- **Existing baseline foundation and reliability:** local account lifecycle, Microsoft Easy
   Auth identity mapping, email-bound workspace invitations, Workspace → Devbox →
   Agent navigation, connector hot registration, Protocol v3 durable
   spool/ACK/resend/fence, DVR/retention, workspace RBAC and keyboard lease, and
   Azure deployment.
-- **Current line:** headless structured adapters plus the native chat UI.
-  Capability-driven controls, LocalProjects, and connector-managed user skills are
-  in place; work continues on attachments, real multi-machine validation, and
-  connector transport stability. PTY/xterm is a compatibility fallback only.
+- **Current local draft:** phased agentbridge naming, a plain transcript/list UI,
+  and independent user-controlled panes on the retained structured/PTY architecture.
+  Visual/code acceptance and integrated verification are pending in [review](review.md).
 - **Next:** real multi-machine end-to-end tests, more adapters, auditable runtime
   permissions, long-running tasks/notifications, and production capacity controls.
 

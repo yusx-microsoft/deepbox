@@ -1,22 +1,31 @@
-# deepbox — Roadmap and Current State
+# AgentBridge — Roadmap and Current State
 
-> deepbox is an **agent switchboard / control plane**: it connects agent CLIs
+> AgentBridge is an **agent switchboard / control plane**: it connects agent CLIs
 > (Claude Code, GitHub Copilot CLI, Codex CLI, and a `mock` runtime) running on a
 > user's own devbox to a server, so users can log in and interact with them from a
-> browser. The server never runs models and never holds credentials; intelligence
+> browser. The server never runs models and never holds model credentials; intelligence
 > and secrets stay on the devbox.
 
-This document describes what is actually implemented today (the v1 baseline), the
-architectural invariants that keep the platform coherent, how the codebase is
-validated, and the remaining known work. For deeper detail see
+The user has authorized release of the current AgentBridge workbench to the
+existing `deepbox-webdata-du` service. Future design choices remain separate from
+this release. A code map or Git push is not a deployment record; use runtime,
+health, version and byte verification. For detail see
 [`product-design.md`](product-design.md), [`design.md`](design.md), and
 [`implementation.md`](implementation.md).
 
+**AgentBridge** is the display name (`DISPLAY_NAME`); `agentbridge` (`NAME`) stays
+the lowercase CLI/package/service/log identifier, with `AGENTBRIDGE_*` environment
+keys. `LEGACY_NAME`, storage, and auth/cookie/hash/IPC compatibility remain unchanged.
+
 ---
 
-## 1. v1 baseline — what is implemented
+## 1. Retained foundation and local draft
 
 ### Server (`server/app/`, FastAPI + WebSocket + SQLite)
+
+The product goal is centralized human/team management of agents distributed
+across many machines, with shared Workspace access—not an agent-to-agent workflow.
+Fleet-size validation (for example, 100 agents) is separate from a four-pane UI limit.
 
 - Local password sign-in with Argon2id hashing (transparent upgrade from legacy
   hashes on successful login) plus signed session cookies.
@@ -51,9 +60,11 @@ validated, and the remaining known work. For deeper detail see
 
 ### Connector (`connector/`, user-launched process)
 
-- Bridges local agent CLIs to the server. Installed once as a stable `deepbox`
-  CLI; day-to-day `connect` / `status` / `doctor` / `project` / `skill` / `upgrade`
-  do not refresh the install directory. Upgrades are explicit.
+- Bridges local agent CLIs to the server. The local draft exposes `agentbridge`
+  with the `deepbox` CLI alias; ordinary `connect` / `status` / `doctor` / `project` /
+  `skill` commands do not refresh the install directory. Upgrades are explicit.
+  Product/environment/home compatibility lives in `agentbridge/product.py`; old
+  `.deepbox` and custom roots and persistent identities are not auto-migrated.
 - Runtime registry (`runtimes.py`) is connector-only: a shared builder constructs
   and validates argv for Claude Code, Copilot CLI, Codex CLI, and `mock`; the
   server and web treat capabilities as opaque JSON.
@@ -81,20 +92,40 @@ validated, and the remaining known work. For deeper detail see
   project actions generate copy-only commands.
 - User Skills (`skills.py`): directories with a UTF-8 `SKILL.md`; the connector
   validates boundaries, refuses links / reparse / oversize / mid-read drift, copies
-  content into its state root, and reports only path-free inventory. deepbox never
+  content into its state root, and reports only path-free inventory. AgentBridge never
   executes skill files.
 
-### Web (`web/`, structured-first switchboard SPA)
+### Web (`web/`, local workbench draft — acceptance pending)
 
 - Native chat for structured runtimes with capability-driven model / reasoning
-  controls and **New chat**; xterm.js terminal only on legacy/TUI runtimes.
-- Left rail navigates Workspace → Devbox → Agent. Add-agent refreshes runtime and
-  project inventory and generates copy-only local `deepbox project add ...`
+  controls and **New chat**, preserving the old session. Terminal is a TUI fallback
+  or an explicit surface choice. Existing backend role/lease/durability and the
+  connector's provider registry remain, not a server micro-framework rewrite.
+- Refined top navigation and a compact collapsible sidebar return to the pre-tmux
+  workbench. The sidebar navigates Workspace → Devbox → Agent. Add-agent refreshes runtime and
+  project inventory and generates copy-only local `agentbridge project add ...`
   commands; the Skills view shows only connector-reported metadata.
 - One-time tokens are shown only in memory / DOM. Auto-reconnect, structured event
   recovery, terminal screen restore, and session DVR history are all preserved.
-- DOM-free logic lives in the UMD module `web/ui.js`, covered by node:test suites
-  (`ui.test.js`, `chat.test.js`, `collaboration.test.js`, `replay.test.js`).
+- Compact plain transcripts/lists, restrained sans-serif UI and monospace code/data,
+  subtle borders/spacing, and light/dark themes. No green tmux status bar, forced
+  full-screen TUI, bubbles/dashboard cards, or remote fonts. Local helpers load in fixed
+  order; the existing pinned jsDelivr xterm dependency loads only on terminal
+  demand, not chat/app boot. No vendor downloads were performed.
+- Tmux-style keyboard/navigation remains an **optional opt-in, default off** layer,
+  not the primary shell. Control+B is untouched until enabled; visible navigation
+  and pane controls remain available without it. See the [optional key contract](agentbridge.md#optional-tmux-style-interaction).
+- `layout.js`/`workbench.js` implement a user-selected binary split tree capped at
+  four panes, pointer/keyboard ratios, selection/maximize/close, and user/workspace
+  layout preferences. `pane.js` owns each socket/chat/terminal/replay lifecycle;
+  close detaches, and missing/ended saved targets never auto-create sessions.
+- Independent unsent drafts survive focus, resize, and split actions without crossing
+  panes; draft text is not persisted in layout preferences. New chat preserves the old
+  shared session, and ending a session remains a separate permission-checked action.
+- API/dialogs/management are separate from app/main shell composition. Management
+  is context-safe, requires explicit role Save, and never auto-grants access. See
+  [implementation](implementation.md#5-web-web) for the current module map and
+  [review](review.md) for the full test/acceptance plan.
 
 ---
 
@@ -127,31 +158,51 @@ validated, and the remaining known work. For deeper detail see
 
 ## 3. Validation status
 
-The maintenance pass has passed user review and is approved for release. See
-[`review.md`](review.md) for changed behavior, regression evidence, and verification
-limits. Verify Azure rollout status and `/api/version` separately; a Git push or
-local test run does not imply a deployment or a live-machine upgrade.
+The completed maintenance release at `1fab322` is the historical baseline, not
+approval for this draft. Its prior review remains in Git at `1fab322:docs/review.md`.
+Current user visual/code review and final integrated suite evidence are **pending**
+in [review](review.md). No local test result implies a deployment or live-machine
+upgrade; no new pass counts or deployed cut are asserted here.
+The prior tmux-shell iteration's counts are historical, not evidence for the restored
+workbench or its default-off keyboard mode.
 
 Automated coverage lives in `tests/` (server, connector, security, persistence,
 recording) and in the browser `*.test.js` node:test suites. It is organized into a
 few categories:
 
 - **Unit / pure logic** — session and lifecycle state mapping, runtime argv
-  builders and probes, spool sequencing and dedupe, DOM-free UI logic.
+  builders and probes, spool sequencing and dedupe, DOM-free UI and split-tree logic.
 - **Integration** — REST and WebSocket routes for auth, workspaces, invitations,
   collaboration and keyboard lease, recording and replay, ops endpoints, and model
   migration.
 - **Durability / fault injection** — connector spool behavior across
   persist-before-ACK, reconnect replay, duplicate frames, gaps, and conflicts.
-- **Real-runtime end-to-end** — mock-runtime deterministic E2E plus real Claude
-  Code PTY fallback verification driven from the connector.
+- **Browser lifecycle** — shell/management context, pane isolation, layout
+  persistence, restore-without-create, and terminal-demand/error behavior.
+- **Runtime acceptance** — deterministic mock/fake-connector fixtures are the local
+  review scope. Historical real-runtime checks are not evidence for this cut;
+  live CLI/multi-machine runs require a separate, explicit manual acceptance step.
 
-Exact suite and case counts are intentionally omitted here; run `pytest` and the
-node test suites to get current numbers.
+Use the [verification commands](implementation.md#7-testing), including **all**
+`web/*.test.js` suites, not only the historical UI/chat/replay helpers. Integration
+will supply final results; do not run live setup or real agents automatically.
 
 ---
 
 ## 4. Remaining known work
+
+### Local draft and rename gates
+
+- Complete local code/visual review and isolated regression evidence, then obtain
+  explicit user acceptance before any publication, staged installation, or release.
+- Review restored top navigation/sidebar, minimal typography/spacing, light/dark
+  themes, and default-off/opt-in shortcuts without weakening pane isolation or roles.
+- Verify canonical/legacy/empty environment precedence, old/custom root continuity,
+  pane teardown/restore privacy, collaboration permissions, and dialog role Save.
+- **Final external rename is a separate approval step**: existing GitHub repo URLs,
+  checkout path, Azure resource/domain, Entra callbacks, cookies/tokens/IPC, and
+  installed data remain unchanged. Follow the [migration gates](agentbridge.md#migration-gates),
+  including continuity and rollback planning; local branding is not that migration.
 
 ### Real multi-machine end-to-end
 
@@ -161,11 +212,13 @@ node test suites to get current numbers.
   [`azure-deployment.md`](azure-deployment.md).
 - Real supervisor/transport two-process form on a Windows service with a long-lived
   `sessiond` driving a real ConPTY / agent still needs a human-run soak test; see
-  [`implementation.md`](implementation.md) §8a.
+  [`implementation.md`](implementation.md#8-current-boundaries).
 - Real multi-browser / multi-machine collaboration validation of the keyboard lease
   and multi-viewer broadcast under network churn.
 
 ### Hardening and maintainability
+
+These are later candidate work, not work authorized or validated by this draft.
 
 - Optional automatic recovery of agent processes after a full devbox reboot (a
   supervised session host or managed tmux/ConPTY backend), beyond current transport
@@ -184,7 +237,7 @@ node test suites to get current numbers.
 ## 5. Non-goals
 
 - The server will not run models, proxy provider APIs, or store API keys or CLI
-  login state. deepbox is a platform, not an AI product.
+  login state. AgentBridge is a platform, not an AI product.
 - The server will not parse ANSI/terminal text to reconstruct agent semantics; that
   belongs to structured runtime events on the connector.
 - Absolute paths, local directory browsing, and skill execution are not server or
@@ -193,6 +246,6 @@ node test suites to get current numbers.
   multi-node API/WS) is deliberately out of scope until the single-node lifecycle
   and protocol are proven; the current SQLite + single-process hub is a single-node
   deployment target, not a scale-out design.
-- deepbox is not a public multi-tenant SaaS. The current baseline is an
+- AgentBridge is not a public multi-tenant SaaS. The current baseline is an
   operator-owned, access-controlled deployment, even when its authenticated HTTPS
   endpoint is publicly reachable.

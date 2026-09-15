@@ -2,6 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const C = require('./chat.js');
+const { createBrowser } = require('./test-dom.js');
 
 test('message.delta accretes into one assistant bubble', () => {
   let s = C.initialChatState();
@@ -194,4 +195,98 @@ test('duplicate adjacent turn boundaries render once', () => {
   C.applyEvent(state, { ev: 'turn.end', result: 'ok' });
   C.applyEvent(state, { ev: 'turn.end', result: 'ok' });
   assert.equal(state.items.filter((item) => item.kind === 'turn').length, 1);
+});
+
+function render(state, handlers) {
+  const browser = createBrowser({ terminal: false });
+  const root = browser.document.createElement('div');
+  browser.document.body.appendChild(root);
+  browser.loadModule('chat.js').renderChat(root, state, handlers);
+  return root;
+}
+
+test('flat transcript uses semantic role captions and unprefixed plain text without changing canonical history', () => {
+  const state = C.initialChatState();
+  C.appendUserTurn(state, 'read <img src=x onerror=alert(1)>\nnext line', [
+    { name: '<notes>.txt', data: 'PRIVATE_ATTACHMENT_BYTES' },
+  ]);
+  C.applyEvent(state, { ev: 'message.delta', text: '<script>unsafe()</script>\nplain output' });
+  C.applyEvent(state, { ev: 'turn.end', result: 'duplicate summary', cost_usd: 0.25 });
+  const before = JSON.stringify(state), root = render(state);
+  assert.equal(root.querySelector('.chat-user .chat-role').textContent, 'You');
+  assert.equal(root.querySelector('.chat-assistant .chat-role').textContent, 'Agent');
+  assert.equal(root.querySelector('.chat-user .chat-text').textContent, 'read <img src=x onerror=alert(1)>\nnext line');
+  assert.equal(root.querySelector('.chat-assistant .chat-text').textContent, '<script>unsafe()</script>\nplain output');
+  assert.equal(root.querySelector('.chat-assistant').getAttribute('aria-label'), 'Agent output');
+  assert.equal(root.querySelector('.chat-user').getAttribute('aria-label'), 'User message');
+  assert.equal(root.querySelector('.chat-message-files').getAttribute('aria-label'), 'Attachments');
+  assert.equal(root.querySelector('.chat-message-file').textContent, '<notes>.txt');
+  assert.equal(root.querySelector('img, script, .chat-turn'), null);
+  assert.equal(root.querySelectorAll('.chat-role').length, 2);
+  assert.doesNotMatch(root.textContent, /turn complete|duplicate summary|PRIVATE_ATTACHMENT_BYTES|\$0\.2500/);
+  assert.equal(JSON.stringify(state), before);
+  assert.equal(state.items.at(-1).kind, 'turn');
+  assert.equal(state.items.at(-1).cost_usd, 0.25);
+});
+
+test('echoes and restored turns keep authored text and captions without duplicating local messages', () => {
+  const text = '> an authored quote\n\tsecond line & <plain text>';
+  const state = C.initialChatState();
+  C.appendUserTurn(state, text);
+  C.applyEvent(state, { ev: 'user.echo', text });
+  C.applyEvent(state, { ev: 'message.delta', text: 'first' });
+  C.applyEvent(state, { ev: 'message.delta', text: '\nsecond' });
+  C.applyEvent(state, { ev: 'turn.end', result: 'first\nsecond' });
+  const restored = C.foldEventPayload(C.initialChatState(), [
+    { ev: 'user.echo', text }, { ev: 'message', role: 'assistant', text: 'first\nsecond' },
+    { ev: 'turn.end', result: 'first\nsecond' },
+  ].map(JSON.stringify).join('\n'), true).state;
+  for (const history of [state, restored]) {
+    const before = JSON.stringify(history), root = render(history);
+    assert.equal(root.querySelectorAll('.chat-user').length, 1);
+    assert.equal(root.querySelector('.chat-user .chat-text').textContent, text, 'only generated prefixes are removed');
+    assert.equal(root.querySelector('.chat-assistant .chat-text').textContent, 'first\nsecond');
+    assert.deepEqual(root.querySelectorAll('.chat-role').map(node => node.textContent), ['You', 'Agent']);
+    assert.equal(root.querySelector('.chat-turn'), null);
+    assert.equal(JSON.stringify(history), before);
+  }
+});
+
+test('failed turns, event errors and tool failures remain visibly accessible in the flat transcript', () => {
+  const state = C.initialChatState();
+  C.applyEvent(state, { ev: 'turn.end', is_error: true, result: 'runtime <failed>' });
+  C.appendUserTurn(state, 'try again');
+  C.applyEvent(state, { ev: 'message.delta', text: 'partial output' });
+  C.applyEvent(state, { ev: 'turn.end', is_error: true, result: 'already streamed' });
+  C.applyEvent(state, { ev: 'error', message: 'Connection <error>' });
+  C.applyEvent(state, { ev: 'tool.call', tool_id: 'tool-1', tool: 'Read', input: { path: '<file>' } });
+  C.applyEvent(state, { ev: 'tool.result', tool_id: 'tool-1', content: 'access <denied>', is_error: true });
+  const before = JSON.stringify(state), root = render(state);
+  const errors = root.querySelectorAll('.chat-error');
+  assert.deepEqual(errors.map(node => node.querySelector('.chat-text').textContent), ['Turn failed: runtime <failed>', 'Turn failed', 'Connection <error>']);
+  for (const node of errors) {
+    assert.equal(node.hidden, false);
+    assert.equal(node.getAttribute('role'), 'alert');
+    assert.equal(node.querySelector('.chat-role').textContent, 'Error');
+  }
+  assert.match(root.querySelector('.chat-tool-error').textContent, /access <denied>/);
+  assert.equal(root.querySelector('.chat-tool-error').getAttribute('aria-label'), 'Tool error: Read');
+  assert.equal(root.querySelector('.chat-turn'), null);
+  assert.equal(root.querySelector('file, denied, failed, error'), null);
+  assert.equal(JSON.stringify(state), before);
+});
+
+test('fallback output and permission details remain text-only with operable labeled replies', () => {
+  const state = C.initialChatState(), replies = [];
+  C.applyEvent(state, { ev: 'turn.end', result: 'fallback <output>' });
+  C.applyEvent(state, { ev: 'permission.ask', request_id: 'request-1', tool: '<Read>', input: { path: '<img src=x>' } });
+  const root = render(state, { onPermission: (...args) => replies.push(args) });
+  assert.equal(root.querySelector('.chat-assistant .chat-text').textContent, 'fallback <output>');
+  assert.equal(root.querySelector('.chat-assistant .chat-role').textContent, 'Agent');
+  assert.equal(root.querySelector('.chat-perm').getAttribute('aria-label'), 'Permission request');
+  assert.match(root.querySelector('.chat-perm').textContent, /Allow <Read>\?/);
+  assert.match(root.querySelector('.chat-perm pre').textContent, /<img src=x>/);
+  assert.equal(root.querySelector('img'), null);
+  root.querySelector('.chat-perm-allow').click(); root.querySelector('.chat-perm-deny').click();
+  assert.deepEqual(replies, [['request-1', true], ['request-1', false]]);
 });

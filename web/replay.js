@@ -1,7 +1,7 @@
 (function(root, factory){
   const api = factory();
   if(typeof module === 'object' && module.exports) module.exports = api;
-  if(root) root.DeepboxReplay = api;
+  if(root) root.AgentBridgeReplay = root.DeepboxReplay = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function(){
   function nearestCheckpointIndex(checkpoints, targetTime){
     let found = -1;

@@ -1,7 +1,8 @@
 (function(root, factory){
   const api = factory();
   if(typeof module === 'object' && module.exports) module.exports = api;
-  if(root) root.DeepboxUI = api;
+  // Keep the old global only at this boundary for cached clients during rollout.
+  if(root) root.AgentBridgeUI = root.DeepboxUI = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function(){
   'use strict';
 
@@ -77,22 +78,27 @@
   }
 
   function projectAddCommand(path, name){
-    return `deepbox project add ${_commandValue(path, '<local-folder>')} --name ${_commandValue(name, '<project-name>')}`;
+    return `agentbridge project add ${_commandValue(path, '<local-folder>')} --name ${_commandValue(name, '<project-name>')}`;
   }
 
   function skillInstallCommand(path, project){
-    const base = `deepbox skill install ${_commandValue(path, '<skill-folder>')}`;
+    const base = `agentbridge skill install ${_commandValue(path, '<skill-folder>')}`;
     return project ? `${base} --project ${_commandValue(project, '<project>')}` : base;
   }
 
   function skillRemoveCommand(name, project){
-    const base = `deepbox skill remove ${_commandValue(name, '<skill-name>')}`;
+    const base = `agentbridge skill remove ${_commandValue(name, '<skill-name>')}`;
     return project ? `${base} --project ${_commandValue(project, '<project>')}` : base;
   }
 
   function isCapabilityV2(capability){
     return !!(capability && Number(capability.schema_version) >= 2
       && Array.isArray(capability.surfaces));
+  }
+
+  function capabilitySurfaces(capability){
+    return isCapabilityV2(capability)
+      ? capability.surfaces.filter(surface=>surface && typeof surface.id === 'string') : [];
   }
 
   function findRuntimeCapability(capabilities, runtimeId){
@@ -194,32 +200,35 @@
     return `/api/agents/${encodeURIComponent(String(agentId || ''))}`;
   }
 
+  function accountInvitationUrl(origin, token){
+    const url = new URL(origin);
+    if(!['http:','https:'].includes(url.protocol)) throw new TypeError('Invitation links need an HTTP origin');
+    return url.origin + '/#invite=' + encodeURIComponent(String(token));
+  }
+
   function resumableSession(sessions, surface){
     return sessions.find(session=>session.state === 'live'
       && (!surface || session.surface === surface));
   }
 
-  // Generate the exact Windows connector bootstrap command shown after a
-  // devbox token is minted. Keeping this pure makes wrapping/copy regressions
-  // testable without a browser. Emits a single self-contained PowerShell block:
-  // export the two env vars, then pipe the hosted one-line installer. The
-  // installer sets up ~/.deepbox (venv + deps) on first run and reuses it after,
-  // so the user never clones the repo or installs dependencies by hand.
+  // Installation and connection are separate. Product naming does not rename
+  // the source repository; these URLs remain valid until that external migration.
+  // Fresh installs use ~/.agentbridge; existing legacy/custom roots are reused.
   const INSTALL_PS1_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1';
   const INSTALL_SH_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh';
   function windowsInstallCommand(){
     return 'irm ' + INSTALL_PS1_URL + ' | iex';
   }
   function unixInstallCommand(){
-    return 'curl -fsSL ' + INSTALL_SH_URL + ' | bash && export PATH="$HOME/.deepbox/bin:$PATH"';
+    return 'curl -fsSL ' + INSTALL_SH_URL + ' | bash && export PATH="${AGENTBRIDGE_HOME-${DEEPBOX_HOME-$HOME/.agentbridge}}/bin:$HOME/.deepbox/bin:$PATH"';
   }
   function windowsConnectorCommand(serverUrl, token){
     const server = String(serverUrl == null ? '' : serverUrl).trim();
     const secret = String(token == null ? '' : token).trim();
     return [
-      '$env:DEEPBOX_SERVER_URL = "' + server + '"',
-      '$env:DEEPBOX_TOKEN = "' + secret + '"',
-      'deepbox connect',
+      '$env:AGENTBRIDGE_SERVER_URL = "' + server + '"',
+      '$env:AGENTBRIDGE_TOKEN = "' + secret + '"',
+      'agentbridge connect',
     ].join('\n');
   }
   // macOS / Linux equivalent. Connecting never runs the installer.
@@ -227,9 +236,9 @@
     const server = String(serverUrl == null ? '' : serverUrl).trim();
     const secret = String(token == null ? '' : token).trim();
     return [
-      'export DEEPBOX_SERVER_URL="' + server + '"',
-      'export DEEPBOX_TOKEN="' + secret + '"',
-      'deepbox connect',
+      'export AGENTBRIDGE_SERVER_URL="' + server + '"',
+      'export AGENTBRIDGE_TOKEN="' + secret + '"',
+      'agentbridge connect',
     ].join('\n');
   }
 
@@ -425,10 +434,10 @@
   function commandItems(context){
     context = context || {};
     const items = [];
-    items.push({id: 'devbox.create', kind: 'action', title: 'Create devbox',
-      subtitle: 'Register a new devbox', keywords: 'new add box'});
+    items.push({id: 'devbox.create', kind: 'action', title: 'Connect a machine',
+      subtitle: 'Create an explicit machine connection', keywords: 'new add machine devbox'});
     if(context.isOwner){
-      items.push({id: 'owner.open', kind: 'action', title: 'Open owner console',
+      items.push({id: 'owner.open', kind: 'action', title: 'Account administration',
         subtitle: 'Invitations and members', keywords: 'admin invite member'});
     }
     const agents = flattenAgents(context.devboxes);
@@ -439,7 +448,7 @@
         kind: 'agent',
         agentId: agent.id,
         title: '@' + (agent.handle || agent.display_name || agent.id),
-        subtitle: (agent.devbox_name || 'devbox') + ' \u00b7 ' +
+        subtitle: (agent.devbox_name || 'machine') + ' \u00b7 ' +
           runtimeLabel(agent.runtime) + ' \u00b7 ' + status.label,
         keywords: [agent.display_name, agent.handle, agent.runtime,
           agent.devbox_name].filter(Boolean).join(' '),
@@ -449,7 +458,7 @@
         kind: 'history',
         agentId: agent.id,
         title: 'History: @' + (agent.handle || agent.display_name || agent.id),
-        subtitle: 'Replay recorded sessions on ' + (agent.devbox_name || 'devbox'),
+        subtitle: 'Replay recorded sessions on ' + (agent.devbox_name || 'machine'),
         keywords: ['history replay', agent.display_name, agent.handle,
           agent.devbox_name].filter(Boolean).join(' '),
       });
@@ -495,6 +504,7 @@
     skillInstallCommand: skillInstallCommand,
     skillRemoveCommand: skillRemoveCommand,
     isCapabilityV2: isCapabilityV2,
+    capabilitySurfaces: capabilitySurfaces,
     findRuntimeCapability: findRuntimeCapability,
     runtimeOptions: runtimeOptions,
     localProjectOptions: localProjectOptions,
@@ -502,6 +512,7 @@
     preferredSurface: preferredSurface,
     capabilityForSurface: capabilityForSurface,
     agentApiPath: agentApiPath,
+    accountInvitationUrl: accountInvitationUrl,
     resumableSession: resumableSession,
     windowsInstallCommand: windowsInstallCommand,
     unixInstallCommand: unixInstallCommand,

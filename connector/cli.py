@@ -1,4 +1,4 @@
-"""Command dispatcher for the user-installed ``deepbox`` launcher."""
+"""Command dispatcher for the user-installed ``agentbridge`` launcher."""
 
 from __future__ import annotations
 
@@ -6,29 +6,31 @@ import asyncio
 import sys
 from collections.abc import Sequence
 
+from agentbridge.product import NAME
+
 from . import client
 
 
-HELP = """usage: deepbox <command> [options]
+HELP = f"""usage: {NAME} <command> [options]
 
 Commands:
-  connect    Connect this machine to a deepbox server
+  connect    Connect this machine to an {NAME} server
   doctor     Check server reachability and connector credentials
   status     Show local connector status
   project    Manage connector-local project paths
   skill      Install and manage connector-local Agent Skills
   upgrade    Refresh the installed connector explicitly
 
-Run 'deepbox <command> --help' for connector command options.
+Run '{NAME} <command> --help' for connector command options.
 """
 
 
 class CommandError(ValueError):
-    """Raised when a top-level deepbox command is not recognized."""
+    """Raised when a top-level agentbridge command is not recognized."""
 
 
 def connector_argv(argv: Sequence[str]) -> list[str] | None:
-    """Translate a deepbox command into the existing connector argument shape.
+    """Translate a agentbridge command into the existing connector argument shape.
 
     ``None`` means that top-level help should be printed instead of starting the
     connector. Leading options remain supported for compatibility with the old
@@ -50,7 +52,7 @@ def connector_argv(argv: Sequence[str]) -> list[str] | None:
         return args
     if command == "upgrade":
         raise CommandError(
-            "upgrade must be run through the installed deepbox command"
+            f"upgrade must be run through the installed {NAME} command"
         )
     if command.startswith("-"):
         return args
@@ -62,7 +64,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         routed = connector_argv(args)
     except CommandError as exc:
-        print(f"deepbox: {exc}", file=sys.stderr)
+        print(f"{NAME}: {exc}", file=sys.stderr)
         print(HELP, file=sys.stderr, end="")
         return 2
 
