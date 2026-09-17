@@ -122,6 +122,16 @@ class LocalProject:
 
 
 @dataclass(frozen=True)
+class NativeContext:
+    agent_id: str
+    session_id: str
+    runtime_id: str
+    cwd: str | None
+    established_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class LocalSkill:
     """A skill installed into the connector-local store.
 
@@ -188,6 +198,19 @@ class LocalProjectStore:
                     path TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS native_context (
+                    agent_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    runtime_id TEXT NOT NULL,
+                    cwd TEXT,
+                    established_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, session_id)
                 )
                 """
             )
@@ -325,6 +348,63 @@ class LocalProjectStore:
 
     def public_projects(self) -> list[dict]:
         return [project.public_json() for project in self.list_projects()]
+
+    def native_context(self, agent_id: str, session_id: str) -> NativeContext | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT agent_id, session_id, runtime_id, cwd, "
+                "established_at, updated_at FROM native_context "
+                "WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            ).fetchone()
+        return NativeContext(**dict(row)) if row else None
+
+    def forget_native_context(self, agent_id: str, session_id: str) -> None:
+        """Drop a local resume marker. The provider transcript is untouched."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM native_context WHERE agent_id = ? AND session_id = ?",
+                (agent_id, session_id),
+            )
+            self._conn.commit()
+
+    def native_context_sessions(self, agent_id: str) -> list[str]:
+        """Return the recorded session ids for one agent on this device."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id FROM native_context WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchall()
+        return [row["session_id"] for row in rows]
+
+    def establish_native_context(self, agent_id: str, session_id: str,
+                                 runtime_id: str, cwd: str | None) -> NativeContext:
+        """Persist a provider transcript only after the CLI confirms it exists."""
+        for label, value in (("agent id", agent_id), ("session id", session_id),
+                             ("runtime id", runtime_id)):
+            if (not isinstance(value, str) or not value
+                    or any(ord(ch) < 0x20 for ch in value)):
+                raise ValueError(f"invalid {label}")
+        normalized_cwd = self._canonical_path(cwd) if cwd is not None else None
+        existing = self.native_context(agent_id, session_id)
+        if existing is not None and (
+                existing.runtime_id != runtime_id or existing.cwd != normalized_cwd):
+            raise ValueError(
+                "native context already belongs to another runtime or project")
+        now = str(time.time())
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO native_context "
+                "(agent_id, session_id, runtime_id, cwd, established_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(agent_id, session_id) DO UPDATE "
+                "SET updated_at = excluded.updated_at",
+                (agent_id, session_id, runtime_id, normalized_cwd, now, now),
+            )
+            self._conn.commit()
+        value = self.native_context(agent_id, session_id)
+        assert value is not None
+        return value
 
     def resolve_agents(self, agents: Iterable[dict]) -> tuple[dict[str, dict], list[dict]]:
         """Resolve project ids locally and migrate legacy server-provided cwd values.

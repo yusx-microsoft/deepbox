@@ -233,6 +233,16 @@ the connection. Valid legacy wire forms remain supported at this boundary.
 - File input is base64 over the wire; the connector re-validates count/size, and
   only file name/type/size (never bytes or temp paths) enter echoes and durable
   history.
+- Structured adapters may declare a `ContextControl` (`connector/runtimes.py`)
+  naming the flags that create and resume a provider-owned conversation. The
+  supervisor passes AgentBridge's own session ID: the first turn uses the create
+  flag, later turns use the resume flag. A marker is written to the connector's
+  `native_context` table only after a turn completes without error, so a failed
+  first turn never claims a transcript exists. Persistent and per-turn runtimes
+  both spawn through the adapter's command builder, so continuity flags apply to
+  each process. Resume is refused when the recorded runtime changed, or when a
+  `cwd`-scoped runtime's project directory changed; the turn ends with a visible
+  error instead of an empty conversation.
 - Adding a new runtime is one registry entry plus an adapter — no server or
   browser changes.
 

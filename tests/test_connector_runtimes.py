@@ -311,3 +311,60 @@ class TestStructuredControls:
         assert control is not None
         assert control.flag is None
         assert control.max_total_bytes == 1024 * 1024
+
+
+class TestNativeContextContinuity:
+    """Continuity is declared per runtime, so a new adapter needs no new code."""
+
+    @pytest.mark.parametrize("runtime_id,scope", [
+        ("claude-code-structured", "cwd"),
+        ("copilot-cli-structured", "machine"),
+    ])
+    def test_structured_runtimes_declare_native_resume_and_its_scope(
+            self, runtime_id, scope):
+        context = runtimes.get(runtime_id).capabilities(
+            installed=True, version="1.2.3")["features"]["context"]
+        assert context == {
+            "continuity": "native_resume", "available": True, "resume_scope": scope}
+
+    def test_capabilities_report_no_resume_when_the_runtime_is_missing(self):
+        context = runtimes.get("claude-code-structured").capabilities(
+            installed=False)["features"]["context"]
+        assert context["available"] is False
+
+    def test_terminal_runtimes_report_process_scoped_context(self):
+        # A terminal keeps its context only while its process lives, so the
+        # capability must not claim the transcript can be resumed later.
+        context = runtimes.get("claude-code").capabilities(
+            installed=True, version="1.2.3")["features"]["context"]
+        assert context["continuity"] == "process"
+        assert context["resume_scope"] == "process"
+
+    @pytest.mark.parametrize("runtime_id,flag", [
+        ("claude-code-structured", "--session-id"),
+        ("copilot-cli-structured", "--session-id"),
+    ])
+    def test_first_turn_names_the_session_and_later_turns_resume_it(
+            self, runtime_id, flag):
+        session_id = "018f9c1e-3b7a-7c21-9f0b-2f4c9e51a7d3"
+        assert runtimes.control_argv(
+            runtime_id, {}, session_id=session_id) == [flag, session_id]
+        assert runtimes.control_argv(
+            runtime_id, {}, session_id=session_id, resume_context=True) == [
+                "--resume", session_id]
+
+    def test_turn_options_and_context_flags_compose(self):
+        argv = runtimes.control_argv(
+            "copilot-cli-structured", {"reasoning_effort": "high"},
+            ("C:/tmp/a.txt",), session_id="abc", resume_context=True)
+        assert argv == ["--reasoning-effort", "high",
+                        "--attachment", "C:/tmp/a.txt", "--resume", "abc"]
+
+    def test_a_session_id_can_never_inject_extra_arguments(self):
+        for hostile in ("", "ok\nrm -rf /", "a\tb", "x\x00y"):
+            with pytest.raises(runtimes.InvalidCommandError):
+                runtimes.control_argv(
+                    "claude-code-structured", {}, session_id=hostile)
+
+    def test_runtimes_without_context_support_ignore_session_ids(self):
+        assert runtimes.control_argv("mock", {}, session_id="abc") == []

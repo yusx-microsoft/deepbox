@@ -111,6 +111,14 @@ and DB are created `0700`/`0600` where possible.
 - `local_skill` — records local source/store/binding paths. Skill content lives
   only on the connector; the server keeps at most a sanitized inventory and
   never receives paths.
+- `native_context(agent_id, session_id, runtime_id, cwd, established_at,
+  updated_at)` — records that a runtime CLI already owns the conversation for a
+  session, so the next process resumes it instead of starting an empty one. It
+  stores no prompts, replies, or provider transcript identifiers; the history
+  itself stays inside the CLI. `cwd` is kept only to refuse resuming a
+  directory-scoped conversation from a different project, and it never leaves
+  the connector. Rows are written after the first successful turn and dropped
+  when the agent is deleted.
 
 ## 4. Server-side persistence (`server/app/`)
 

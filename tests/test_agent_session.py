@@ -539,3 +539,148 @@ def test_kill_during_windows_retry_backoff_prevents_later_spawn(monkeypatch):
 
     asyncio.run(run())
 
+
+def _context_transcript(session_id):
+    return [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": session_id}).encode() + b"\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "is_error": False}).encode() + b"\n",
+    ]
+
+
+def test_confirmed_native_context_is_recorded_once_for_the_session():
+    async def run():
+        recorded = []
+
+        async def context_started():
+            recorded.append(True)
+
+        exited = []
+        sess = A.StructuredAgentSession(
+            ["claude"], None, _noop, lambda code: exited.append(code) or _noop(),
+            spawn=lambda: _spawn_fake(
+                _context_transcript("sess-1") + _context_transcript("sess-1")),
+            context_started=context_started)
+        await sess.start()
+        for _ in range(50):
+            if recorded:
+                break
+            await asyncio.sleep(0.01)
+        # The marker is written once, even across repeated turns.
+        assert recorded == [True]
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_context_is_recorded_even_when_the_runtime_reports_no_identifier():
+    """Copilot completes turns without ever emitting a transcript id.
+
+    Continuity must therefore key off a completed turn, not a provider id,
+    otherwise the next turn would silently start a new conversation.
+    """
+    async def run():
+        got = []
+        recorded = []
+
+        async def on_output(payload):
+            got.append(json.loads(payload))
+
+        async def context_started():
+            recorded.append(True)
+
+        sess = A.StructuredAgentSession(
+            ["claude"], None, on_output, _noop,
+            spawn=lambda: _spawn_fake([
+                json.dumps({"type": "result", "subtype": "success",
+                            "is_error": False}).encode() + b"\n"]),
+            context_started=context_started)
+        await sess.start()
+        for _ in range(50):
+            if recorded:
+                break
+            await asyncio.sleep(0.01)
+        assert recorded == [True]
+        assert not [e for e in got if e["ev"] == A.EV_ERROR]
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_a_persistent_session_spawns_through_the_command_builder():
+    """Regression: persistent runtimes once spawned with the base command.
+
+    That bypassed session-continuity flags entirely, so Claude silently began a
+    brand new conversation while the UI still showed the old transcript.
+    """
+    async def run():
+        spawned = []
+
+        sess = A.StructuredAgentSession(
+            ["claude"], None, _noop, _noop,
+            spawn=lambda: _spawn_fake([]),
+            command_builder=lambda options, paths: ["claude", "--resume", "s-1"])
+
+        original = sess._spawn_process
+
+        async def recording(argv, prompt=None):
+            spawned.append(argv)
+            return await original(argv, prompt)
+
+        sess._spawn_process = recording
+        await sess.start()
+        assert spawned == [["claude", "--resume", "s-1"]]
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_a_failed_turn_never_marks_the_context_as_established():
+    """If the first turn fails there is no transcript to resume later."""
+    async def run():
+        recorded = []
+
+        async def context_started():
+            recorded.append(True)
+
+        sess = A.StructuredAgentSession(
+            ["claude"], None, _noop, _noop,
+            spawn=lambda: _spawn_fake([
+                json.dumps({"type": "result", "subtype": "error_during_execution",
+                            "is_error": True}).encode() + b"\n"]),
+            context_started=context_started)
+        await sess.start()
+        await asyncio.sleep(0.2)
+        assert recorded == []
+        sess.kill()
+
+    asyncio.run(run())
+
+
+def test_a_failed_context_record_never_silently_continues():
+    async def run():
+        got = []
+
+        async def on_output(payload):
+            got.append(json.loads(payload))
+
+        async def context_started():
+            raise OSError("private local disk failure")
+
+        sess = A.StructuredAgentSession(
+            ["claude"], None, on_output, _noop,
+            spawn=lambda: _spawn_fake(_context_transcript("sess-1")),
+            context_started=context_started)
+        await sess.start()
+        for _ in range(50):
+            if any(e["ev"] == A.EV_ERROR for e in got):
+                break
+            await asyncio.sleep(0.01)
+        errors = [e for e in got if e["ev"] == A.EV_ERROR]
+        assert errors and errors[0]["code"] == "context_persist_failed"
+        assert "private local disk failure" not in json.dumps(got)
+        sess.kill()
+
+    asyncio.run(run())
+

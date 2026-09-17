@@ -228,6 +228,25 @@ The connector's registry is the extension boundary. Each adapter describes:
 - the scope, choices, default, and bounds of generic `select` / `file` controls;
 - an adapter-local mapping from per-turn options to a persistent runtime's native
   live `control_request`.
+- an optional `ContextControl` naming the flags that create and resume a
+  provider-owned conversation, plus whether that transcript is bound to the
+  working directory (`cwd`) or to the whole machine.
+
+#### Provider-owned context continuity
+
+Conversation history belongs to the runtime CLI, not to AgentBridge. The
+connector never replays stored messages into a prompt: it passes its own session
+ID to the CLI, which creates the conversation on the first turn and restores it
+afterwards. The first completed turn records a local marker in the connector's
+SQLite store, so later turns resume even after the connector restarts. Provider
+transcript identifiers are deliberately ignored, because runtimes differ: Claude
+Code reports a fresh identifier on every resume and Copilot CLI reports none.
+
+Resuming fails closed. When the recorded runtime or, for a `cwd`-scoped runtime,
+the project directory no longer matches, the turn stops with an explicit error
+rather than silently starting an empty conversation under a visible transcript.
+Runtimes without a `ContextControl` report `context.continuity="process"`, which
+tells the reader that history survives only as long as that process does.
 
 After probing, the connector reports a display-safe capability object. A stable
 revision ignores probe timestamps; a dynamically discovered model catalog is

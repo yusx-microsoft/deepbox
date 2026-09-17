@@ -5,6 +5,7 @@ restart/detach must NOT close PTYs, and buffered output survives to the next
 transport attach. Uses a fake PTY so no real process/ConPTY is spawned.
 """
 import asyncio
+import dataclasses
 import os
 import tempfile
 import unittest
@@ -478,6 +479,128 @@ class SupervisorSplitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sessions), 1)
         self.assertGreaterEqual(len(calls), 2)
         self.assertEqual(calls[-1]["permission_mode"], "plan")
+
+
+class StructuredContextContinuityTests(unittest.IsolatedAsyncioTestCase):
+    """Provider-owned transcripts are resumed, never silently recreated.
+
+    The CLI owns conversation history. AgentBridge only passes its own session
+    id back so the provider can restore it, and refuses to resume when that
+    would attach a stale transcript to a different runtime or project.
+    """
+
+    def setUp(self):
+        self.built = []
+        self.sessions = []
+        test = self
+
+        class FakeStructuredSession:
+            def __init__(self, *args, command_builder=None, option_sanitizer=None,
+                         context_started=None, **kwargs):
+                self.command_builder = command_builder
+                self.option_sanitizer = option_sanitizer
+                self.context_started = context_started
+                self.alive = True
+                test.sessions.append(self)
+
+            async def start(self):
+                test.built.append(self.command_builder(self.option_sanitizer({}), []))
+
+            def is_alive(self):
+                return self.alive
+
+            def kill(self):
+                self.alive = False
+
+        self.session_class = FakeStructuredSession
+
+    def _patched(self):
+        return (
+            mock.patch.object(supervisor_mod, "resolve_cmd",
+                              lambda runtime, launch, **kwargs: ["claude"]),
+            mock.patch.object(supervisor_mod, "StructuredAgentSession",
+                              self.session_class),
+            mock.patch.object(supervisor_mod, "probe_family", return_value={}),
+            mock.patch.object(supervisor_mod, "availability",
+                              return_value=(True, None)),
+        )
+
+    async def _open(self, sup, agent="a", session="s"):
+        for patcher in self._patched():
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        await sup.open_pty(agent, session, surface="structured")
+
+    def _supervisor(self, runtime="claude-code", cwd=None):
+        agent = {"id": "a", "runtime": runtime}
+        if cwd is not None:
+            agent["cwd"] = cwd
+        return SessionSupervisor({"a": agent})
+
+    async def test_first_turn_creates_named_session_then_resumes_it(self):
+        sup = self._supervisor()
+        await self._open(sup)
+        self.assertIn("--session-id", self.built[0])
+        self.assertIn("s", self.built[0])
+        self.assertNotIn("--resume", self.built[0])
+
+        # The CLI confirms the transcript exists; the next process must resume.
+        await self.sessions[0].context_started()
+        sup.ptys.pop(("a", "s"), None)
+        await self._open(sup)
+        self.assertIn("--resume", self.built[1])
+        self.assertNotIn("--session-id", self.built[1])
+
+    async def test_resume_is_refused_after_the_project_directory_changes(self):
+        sup = self._supervisor(cwd=os.getcwd())
+        await self._open(sup)
+        await self.sessions[0].context_started()
+        sup.ptys.pop(("a", "s"), None)
+
+        moved = dict(sup.agents["a"])
+        moved["cwd"] = tempfile.gettempdir()
+        sup.agents["a"] = moved
+        await self._open(sup)
+        with self.assertRaisesRegex(ValueError, "local project changed"):
+            self.sessions[-1].command_builder({}, [])
+
+    async def test_resume_is_refused_after_the_runtime_changes(self):
+        sup = self._supervisor()
+        await self._open(sup)
+        await self.sessions[0].context_started()
+        sup.ptys.pop(("a", "s"), None)
+
+        switched = dict(sup.agents["a"])
+        switched["runtime"] = "copilot-cli"
+        sup.agents["a"] = switched
+        await self._open(sup)
+        with self.assertRaisesRegex(ValueError, "runtime changed"):
+            self.sessions[-1].command_builder({}, [])
+
+    async def test_context_marker_is_scoped_to_one_session(self):
+        sup = self._supervisor()
+        await self._open(sup)
+        await self.sessions[0].context_started()
+        await self._open(sup, session="other")
+        # A different session must start its own conversation.
+        self.assertIn("--session-id", self.built[-1])
+        self.assertIn("other", self.built[-1])
+
+    async def test_a_structured_runtime_without_native_resume_gets_no_marker(self):
+        adapter = supervisor_mod.runtimes.get("claude-code-structured")
+        without = dataclasses.replace(adapter, context_control=None)
+        original = supervisor_mod.runtimes.get_for_surface
+        with mock.patch.object(
+                supervisor_mod.runtimes, "get_for_surface",
+                lambda family, surface: (
+                    without if family == adapter.family_id
+                    else original(family, surface))):
+            sup = self._supervisor()
+            await self._open(sup)
+            self.assertIsNone(self.sessions[0].context_started)
+            # Without native support the command carries no session flags.
+            self.assertNotIn("--session-id", self.built[-1])
+            self.assertNotIn("--resume", self.built[-1])
 
 
 class SupervisorBootstrapTests(unittest.IsolatedAsyncioTestCase):

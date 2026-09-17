@@ -182,6 +182,29 @@ class RuntimeControl:
 
 
 @dataclass(frozen=True)
+class ContextControl:
+    """Provider-owned context continuity exposed through one generic contract."""
+
+    new_session_flag: str
+    resume_session_flag: str
+    resume_scope: str  # ``cwd`` or ``machine``
+
+    def argv(self, session_id: str, *, resume: bool) -> list[str]:
+        if (not isinstance(session_id, str) or not session_id
+                or any(ord(ch) < 0x20 for ch in session_id)):
+            raise InvalidCommandError("invalid native session id")
+        flag = self.resume_session_flag if resume else self.new_session_flag
+        return [flag, session_id]
+
+    def public(self, installed: bool) -> dict:
+        return {
+            "continuity": "native_resume",
+            "available": installed,
+            "resume_scope": self.resume_scope,
+        }
+
+
+@dataclass(frozen=True)
 class RuntimeLiveControl:
     """Map a turn option to one structured-runtime control request.
 
@@ -254,6 +277,7 @@ class RuntimeAdapter:
     # ``prompt_argv`` + the prompt text to argv for each turn.
     per_turn: bool = False
     prompt_argv: tuple[str, ...] = ()
+    context_control: ContextControl | None = None
     # Controls are rendered generically by the browser and validated again by
     # the connector. Model remains a first-class adapter field because it is
     # shared by terminal and structured runtimes.
@@ -312,6 +336,13 @@ class RuntimeAdapter:
                 "per_turn": self.per_turn,
                 "skills": bool(self.personal_skill_roots or self.project_skill_roots),
                 "controls": controls,
+                "context": (
+                    self.context_control.public(installed)
+                    if self.context_control else {
+                        "continuity": "process",
+                        "available": installed,
+                        "resume_scope": "process",
+                    }),
             },
         }
 
@@ -346,6 +377,19 @@ def register(adapter: RuntimeAdapter, *, replace: bool = False) -> RuntimeAdapte
                      adapter.model_discovery_argv):
         if declared:
             validate_argv([adapter.executable, *declared])
+    if adapter.context_control is not None:
+        context = adapter.context_control
+        if not adapter.structured:
+            raise InvalidCommandError(
+                "native context continuity requires a structured runtime")
+        if context.resume_scope not in {"cwd", "machine"}:
+            raise InvalidCommandError(
+                f"runtime {adapter.id!r} has invalid context resume scope")
+        validate_argv([
+            adapter.executable,
+            context.new_session_flag,
+            context.resume_session_flag,
+        ])
     for mode, extra in adapter.permission_modes.items():
         for tok in extra:
             if not isinstance(tok, str) or tok == "":
@@ -526,7 +570,9 @@ def sanitize_options(runtime_id: str, raw: object) -> dict:
 
 
 def control_argv(runtime_id: str, options: dict,
-                 attachment_paths: tuple[str, ...] = ()) -> list[str]:
+                 attachment_paths: tuple[str, ...] = (), *,
+                 session_id: str | None = None,
+                 resume_context: bool = False) -> list[str]:
     """Translate sanitized adapter controls (other than model) to argv."""
     adapter = get(runtime_id)
     argv = []
@@ -538,6 +584,9 @@ def control_argv(runtime_id: str, options: dict,
         elif control.kind == "file" and control.flag:
             for path in attachment_paths:
                 argv.extend((control.flag, path))
+    if adapter.context_control is not None and session_id is not None:
+        argv.extend(adapter.context_control.argv(
+            session_id, resume=resume_context))
     return argv
 
 
@@ -658,6 +707,7 @@ register(RuntimeAdapter(
     structured=True,
     allow_custom_models=False,
     model_scope="turn",
+    context_control=ContextControl("--session-id", "--resume", "cwd"),
     controls=(
         RuntimeControl(
             key="reasoning_effort", label="Reasoning", kind="select",
@@ -693,8 +743,8 @@ register(RuntimeAdapter(
     family="copilot-cli", surface="structured", default_surface=True,
     # Copilot's ``-p`` runs one prompt then exits, emitting newline-delimited
     # JSON. Each user turn spawns a fresh process (per_turn=True); the prompt
-    # text is appended after ``prompt_argv``. With ``per_turn=True``, context
-    # is not preserved across turns.
+    # text is appended after ``prompt_argv``. Native ``--resume`` restores the
+    # provider-owned transcript between those processes.
     base_argv=(
         "copilot",
         "--output-format", "json",
@@ -707,6 +757,7 @@ register(RuntimeAdapter(
     per_turn=True,
     prompt_argv=("-p",),
     model_scope="turn",
+    context_control=ContextControl("--session-id", "--resume", "machine"),
     controls=(
         RuntimeControl(
             key="reasoning_effort", label="Reasoning", kind="select",

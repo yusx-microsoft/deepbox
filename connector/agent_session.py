@@ -361,7 +361,8 @@ class StructuredAgentSession:
                  attachment_max_bytes: int = 0,
                  session_option_keys: tuple[str, ...] = (),
                  live_control_builder=None,
-                 control_timeout: float = 10.0):
+                 control_timeout: float = 10.0,
+                 context_started: Callable[[], Awaitable[None]] | None = None):
         self.cmd = cmd
         self.cwd = cwd or None
         self.on_output = on_output
@@ -384,6 +385,8 @@ class StructuredAgentSession:
         self._session_options: dict[str, object] | None = None
         self._live_control_builder = live_control_builder
         self._control_timeout = max(0.1, float(control_timeout))
+        self._context_started = context_started
+        self._context_ready_reported = False
         self._active_options: dict[str, object] | None = None
         self._control_counter = 0
         self._pending_controls: dict[str, asyncio.Future] = {}
@@ -449,7 +452,9 @@ class StructuredAgentSession:
             await self._emit(_event(EV_STATUS, subtype="ready"))
             return
         try:
-            proc = await self._spawn_process(list(self.cmd))
+            # Persistent runtimes must also go through the command builder so
+            # session-continuity flags apply; ``cmd`` is only the base command.
+            proc = await self._spawn_process(self._command({}))
         except BaseException:
             self._alive = False
             raise
@@ -673,6 +678,9 @@ class StructuredAgentSession:
             await self._emit(_event(EV_ERROR, message="Agent emitted invalid JSON"))
             return
 
+        if not isinstance(obj, dict):
+            await self._emit(_event(EV_ERROR, message="Agent emitted invalid JSON"))
+            return
         native_type = obj.get("type")
         if native_type == "control_response":
             response = obj.get("response")
@@ -707,6 +715,26 @@ class StructuredAgentSession:
                 if self._turn_end_seen:
                     continue
                 self._turn_end_seen = True
+                # A completed turn is the runtime-neutral proof that the
+                # conversation we named now exists on this device, so later
+                # turns must resume it instead of creating it again. Provider
+                # transcript ids are deliberately not used: Claude reports a
+                # fresh one per resume and Copilot reports none at all.
+                if (self._context_started is not None
+                        and not self._context_ready_reported
+                        and not event.get("is_error")):
+                    self._context_ready_reported = True
+                    try:
+                        await self._context_started()
+                    except Exception:
+                        _LOG.exception(
+                            "Could not record the local agent context marker")
+                        await self._emit(_event(
+                            EV_ERROR,
+                            message="This agent's context could not be saved, so "
+                                    "the next message may not remember this one.",
+                            code="context_persist_failed",
+                        ))
             await self._emit(event)
 
     async def _emit(self, ev: dict):

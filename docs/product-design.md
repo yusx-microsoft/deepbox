@@ -181,7 +181,21 @@ opens a native chat before the first frame instead of scraping ANSI text.
 The browser uses the session's explicit `surface` and generic reported capabilities,
 not runtime names. Choosing **Terminal** never reuses a Chat or unknown-surface session.
 
-### 5.2 Structured chat controls
+### 5.2 Whose memory is it?
+
+A conversation's history lives inside the agent's own CLI on the user's machine.
+AgentBridge keeps the transcript people read, but it never rebuilds the model's
+memory from those stored messages: doing so would resend other teammates' text
+and drift from what the CLI actually knows. Instead the connector hands the CLI
+the session identifier and asks it to continue its own conversation, which keeps
+one source of truth and one bill.
+
+This also means continuity has limits worth showing honestly. A conversation can
+belong to a specific project directory, so moving an agent to another project
+ends it. When continued memory is impossible, the product says so and offers a
+new session rather than answering as if the earlier turns never happened.
+
+### 5.3 Structured chat controls
 
 - Controls are capability-driven. Generic `select` / `file` descriptors render the model,
   reasoning, and attachment widgets; the UI always offers a **Runtime default** and only
@@ -205,7 +219,7 @@ not runtime names. Choosing **Terminal** never reuses a Chat or unknown-surface 
 - Membership role changes require explicit **Save**. Management dialogs capture their
   user/workspace context and reject stale asynchronous results; no automatic grants.
 
-### 5.3 Terminal experience (fallback)
+### 5.4 Terminal experience (fallback)
 
 The terminal surface must preserve: native ANSI/truecolor, cursor and resize, mouse and
 shortcuts when the runtime supports them, bounded scrollback restore on attach, a visible

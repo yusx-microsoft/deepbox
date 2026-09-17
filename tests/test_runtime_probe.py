@@ -118,6 +118,12 @@ def test_probe_missing_runtime_is_reported_without_host_paths(monkeypatch):
             "choices": ["fallback-model"],
             "allow_custom": True,
         }],
+        # A runtime that is not installed cannot resume anything yet.
+        "context": {
+            "continuity": "process",
+            "available": False,
+            "resume_scope": "process",
+        },
     }
     assert capability["models"]["status"] == "partial"
     assert capability["models"]["source"] == "adapter"

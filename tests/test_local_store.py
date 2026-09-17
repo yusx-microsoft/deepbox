@@ -54,6 +54,64 @@ class LocalProjectStoreTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     store.add(Path(directory) / "missing")
 
+    def test_native_context_markers_survive_reopen_and_stay_local(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "repo"
+            project.mkdir()
+            db_path = root / "projects.db"
+
+            with LocalProjectStore(db_path) as store:
+                self.assertIsNone(store.native_context("agent", "session"))
+                record = store.establish_native_context(
+                    "agent", "session", "claude-code", str(project))
+                self.assertEqual(record.runtime_id, "claude-code")
+                self.assertEqual(record.cwd, str(project.resolve()))
+                # Re-establishing the same context is idempotent.
+                store.establish_native_context(
+                    "agent", "session", "claude-code", str(project))
+
+            with LocalProjectStore(db_path) as reopened:
+                # A connector restart must still know the transcript exists.
+                record = reopened.native_context("agent", "session")
+                self.assertIsNotNone(record)
+                self.assertEqual(record.runtime_id, "claude-code")
+                # Local paths never appear in anything sent to the server.
+                self.assertNotIn(str(project), repr(reopened.public_projects()))
+
+    def test_native_context_refuses_to_move_between_runtimes_or_projects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            with LocalProjectStore(root / "projects.db") as store:
+                store.establish_native_context(
+                    "agent", "session", "claude-code", str(first))
+                with self.assertRaises(ValueError):
+                    store.establish_native_context(
+                        "agent", "session", "copilot-cli", str(first))
+                with self.assertRaises(ValueError):
+                    store.establish_native_context(
+                        "agent", "session", "claude-code", str(second))
+                with self.assertRaises(ValueError):
+                    store.establish_native_context("", "session", "claude-code", None)
+
+    def test_forgetting_context_is_scoped_to_one_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with LocalProjectStore(Path(directory) / "projects.db") as store:
+                store.establish_native_context("a", "one", "claude-code", None)
+                store.establish_native_context("a", "two", "claude-code", None)
+                store.establish_native_context("b", "three", "claude-code", None)
+                self.assertEqual(
+                    sorted(store.native_context_sessions("a")), ["one", "two"])
+
+                store.forget_native_context("a", "one")
+                self.assertIsNone(store.native_context("a", "one"))
+                self.assertIsNotNone(store.native_context("a", "two"))
+                self.assertIsNotNone(store.native_context("b", "three"))
+
     def test_running_connector_and_cli_store_can_write_same_database(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -52,6 +52,9 @@ class SessionSupervisor:
         self.ptys: dict[tuple[str, str], PtySession | StructuredAgentSession] = {}
         self.pty_instances: dict[tuple[str, str], str] = {}
         self.pty_surfaces: dict[tuple[str, str], str] = {}
+        # Test/embedded callers may omit the local store. Production persists
+        # these records in LocalProjectStore so a sessiond restart can resume.
+        self._memory_native_contexts: dict[tuple[str, str], tuple[str, str | None]] = {}
         self._open_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._open_users: dict[tuple[str, str], int] = {}
         self._stopped = False
@@ -117,6 +120,38 @@ class SessionSupervisor:
             agent_id = migration.get("agent_id")
             if self._project_migrations.get(agent_id) == migration:
                 self._project_migrations.pop(agent_id, None)
+
+    # -- provider-owned context markers ------------------------------------
+
+    def _recorded_context(self, agent_id: str,
+                          session_id: str) -> tuple[str, str | None] | None:
+        """Return ``(runtime_id, cwd)`` when this session already has context."""
+        if self.local_store is not None:
+            record = self.local_store.native_context(agent_id, session_id)
+            return (record.runtime_id, record.cwd) if record else None
+        return self._memory_native_contexts.get((agent_id, session_id))
+
+    def _record_context(self, agent_id: str, session_id: str,
+                        runtime_id: str, cwd: str | None) -> None:
+        if self.local_store is not None:
+            self.local_store.establish_native_context(
+                agent_id, session_id, runtime_id, cwd)
+        else:
+            self._memory_native_contexts[(agent_id, session_id)] = (runtime_id, cwd)
+
+    def _recorded_context_keys(
+            self, agent_ids: set[str]) -> list[tuple[str, str]]:
+        if self.local_store is None:
+            return []
+        keys: list[tuple[str, str]] = []
+        for agent_id in agent_ids:
+            try:
+                sessions = self.local_store.native_context_sessions(agent_id)
+            except Exception:
+                log.exception("Could not list local agent context markers")
+                continue
+            keys.extend((agent_id, session_id) for session_id in sessions)
+        return keys
 
     # -- transport attach/detach ------------------------------------------
 
@@ -321,6 +356,20 @@ class SessionSupervisor:
                         self.ptys.pop(key, None)
                         self.pty_instances.pop(key, None)
                         self.pty_surfaces.pop(key, None)
+                for key in list(self._memory_native_contexts):
+                    if key[0] in removed_agent_ids:
+                        self._memory_native_contexts.pop(key, None)
+                if self.local_store is not None:
+                    # Local resume markers for deleted agents are meaningless.
+                    # The provider transcript itself is never touched here.
+                    for agent_id, session_id in self._recorded_context_keys(
+                            removed_agent_ids):
+                        try:
+                            self.local_store.forget_native_context(
+                                agent_id, session_id)
+                        except Exception:
+                            log.exception(
+                                "Could not clear a local agent context marker")
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
@@ -610,6 +659,34 @@ class SessionSupervisor:
 
         if structured:
             attachment = runtimes.attachment_control(runtime_id)
+            context_control = adapter.context_control
+            context_error = None
+            resume_context = False
+            if context_control is not None:
+                # A recorded transcript means this session already exists inside
+                # the provider CLI, so the next process must resume instead of
+                # creating it. Mismatches fail closed: silently starting a fresh
+                # context under an existing conversation would mislead the user.
+                recorded = self._recorded_context(agent_id, session_id)
+                if recorded is not None:
+                    resume_context = True
+                    recorded_runtime, recorded_cwd = recorded
+                    if recorded_runtime != runtime_id:
+                        context_error = (
+                            "This session's agent runtime changed, so its earlier "
+                            "context cannot be resumed. Start a new session.")
+                    elif (context_control.resume_scope == "cwd"
+                          and recorded_cwd != info.get("cwd")):
+                        context_error = (
+                            "This session's local project changed, so its earlier "
+                            "context cannot be resumed. Restore the original "
+                            "project or start a new session.")
+
+            async def context_started() -> None:
+                """The runtime accepted our session, so later turns must resume."""
+                nonlocal resume_context
+                self._record_context(agent_id, session_id, runtime_id, info.get("cwd"))
+                resume_context = True
 
             def sanitize_options(value):
                 merged = dict(runtime_config)
@@ -618,6 +695,8 @@ class SessionSupervisor:
                 return runtimes.sanitize_options(runtime_id, merged)
 
             def build_turn_command(options, attachment_paths):
+                if context_error is not None:
+                    raise ValueError(context_error)
                 model = (options.get("model") or runtime_config.get("model")
                          or info.get("model"))
                 base = resolve_cmd(
@@ -625,7 +704,9 @@ class SessionSupervisor:
                     permission_mode=(options.get("permission_mode")
                                      or info.get("permission_mode")))
                 return base + runtimes.control_argv(
-                    runtime_id, options, attachment_paths)
+                    runtime_id, options, attachment_paths,
+                    session_id=session_id if context_control is not None else None,
+                    resume_context=resume_context)
 
             from .agent_session import TRANSLATORS
             p = StructuredAgentSession(
@@ -649,7 +730,9 @@ class SessionSupervisor:
                 live_control_builder=(
                     (lambda previous, current: runtimes.live_control_requests(
                         adapter.id, previous, current))
-                    if adapter.live_controls else None))
+                    if adapter.live_controls else None),
+                context_started=(context_started
+                                 if context_control is not None else None))
         else:
             p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
                            cols=cols, rows=rows)
