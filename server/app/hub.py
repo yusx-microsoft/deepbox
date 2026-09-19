@@ -360,6 +360,18 @@ class Hub:
                 self.remove_human(conn)
                 asyncio.create_task(self._close_stale_human(conn))
 
+    async def to_users(self, user_ids: set[str], frame: dict) -> None:
+        """Workspace-authorized notifications using the same bounded writers."""
+        for conn in list(self.humans):
+            if conn.user_id not in user_ids:
+                continue
+            queue = self._ensure_human_sender(conn)
+            try:
+                queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                self.remove_human(conn)
+                asyncio.create_task(self._close_stale_human(conn))
+
     async def _close_stale_human(self, conn: HumanConn) -> None:
         try:
             await asyncio.wait_for(

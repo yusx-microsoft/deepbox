@@ -8,6 +8,12 @@
  */
 (function (global) {
   'use strict';
+  const Runtime = typeof module === 'object' && module.exports
+    ? require('./integrations/deeporca/runtime.js') : global.AgentBridgeDeepOrcaRuntime;
+  const standardRuntime = Object.freeze({interactiveApproval:true});
+  function runtimeContract(agent, capability, renderer) {
+    return Runtime?.matches(agent, capability, renderer) ? Runtime : standardRuntime;
+  }
 
   function parseEventPayload(data) {
     const events = [];
@@ -29,6 +35,8 @@
       status: null,       // last status note
       config: {},          // connector-confirmed model/reasoning values
       configured: false,   // true once a session.config event is observed
+      renderer: null,
+      run: null,
       _openAssistant: null, // index of the assistant bubble accreting deltas
     };
   }
@@ -37,14 +45,32 @@
   // (callers treat it as owned) — cheap and enough for our append-only UI.
   function applyEvent(state, ev) {
     if (!ev || typeof ev !== 'object') return state;
+    if (Runtime?.foldEvent(state, ev)) return state;
     switch (ev.ev) {
+      case 'turn.start':
+        state._openAssistant = null;
+        state.run = {state:'running', turn_id:ev.turn_id};
+        break;
+      case 'thinking.delta': {
+        let item = state.items[state.items.length - 1];
+        if (!item || item.kind !== 'thinking' || item.turn_id !== ev.turn_id) {
+          item = {kind:'thinking', text:'', turn_id:ev.turn_id}; state.items.push(item);
+        }
+        item.text += ev.text || '';
+        break;
+      }
       case 'status':
         state.status = ev.subtype || ev.note || ev.model || 'status';
         break;
       case 'message.delta': {
         let idx = state._openAssistant;
+        if (ev.message_id) {
+          const found = state.items.findIndex(item => item.kind === 'assistant' &&
+            item.message_id === ev.message_id && item.turn_id === ev.turn_id);
+          idx = found < 0 ? null : found;
+        }
         if (idx == null) {
-          state.items.push({ kind: 'assistant', text: '' });
+          state.items.push({ kind: 'assistant', text: '', ...(ev.message_id ? {message_id:ev.message_id, turn_id:ev.turn_id} : {}) });
           idx = state.items.length - 1;
           state._openAssistant = idx;
         }
@@ -74,7 +100,8 @@
         if (ev.tool_id) {
           for (let i = state.items.length - 1; i >= 0; i--) {
             const it = state.items[i];
-            if (it.kind === 'tool' && it.tool_id === ev.tool_id && it.result == null) {
+            if (it.kind === 'tool' && it.tool_id === ev.tool_id && it.result == null &&
+                (!ev.turn_id || it.turn_id === ev.turn_id)) {
               pending = it; break;
             }
           }
@@ -86,6 +113,7 @@
         } else {
           state.items.push({
             kind: 'tool', tool: ev.tool, tool_id: ev.tool_id,
+            ...(ev.turn_id ? {turn_id:ev.turn_id} : {}),
             input: ev.input, streaming: !!ev.streaming, result: null,
             is_error: false,
           });
@@ -97,17 +125,25 @@
         let matched = null;
         for (let i = state.items.length - 1; i >= 0; i--) {
           const it = state.items[i];
-          if (it.kind === 'tool' && it.tool_id === ev.tool_id && it.result == null) {
+          if (it.kind === 'tool' && it.tool_id === ev.tool_id && it.result == null &&
+              (!ev.turn_id || it.turn_id === ev.turn_id)) {
             matched = it; break;
           }
         }
         if (matched) {
           matched.result = ev.content || '';
           matched.is_error = !!ev.is_error;
+          if (ev.code) matched.code = ev.code;
+          if (ev.status) matched.status = ev.status;
+          if (ev.truncated) matched.truncated = true;
+          if (Number.isFinite(ev.original_bytes)) matched.original_bytes = ev.original_bytes;
         } else {
           state.items.push({
             kind: 'tool', tool: null, tool_id: ev.tool_id,
+            ...(ev.turn_id ? {turn_id:ev.turn_id} : {}),
             input: null, result: ev.content || '', is_error: !!ev.is_error,
+            ...(ev.code ? {code:ev.code} : {}), ...(ev.status ? {status:ev.status} : {}),
+            ...(ev.truncated ? {truncated:true, original_bytes:ev.original_bytes} : {}),
           });
         }
         break;
@@ -119,6 +155,8 @@
         break;
       case 'turn.end': {
         state._openAssistant = null;
+        if (ev.turn_id || state.run) state.run = {state:ev.status || ev.subtype || 'completed', turn_id:ev.turn_id};
+        if (ev.turn_id && state.items.some(item => item.kind === 'turn' && item.turn_id === ev.turn_id)) break;
         if (state.items.length && state.items[state.items.length - 1].kind === 'turn') break;
         let hasAssistant = false;
         for (let i = state.items.length - 1; i >= 0; i--) {
@@ -130,6 +168,10 @@
         }
         state.items.push({
           kind: 'turn', is_error: !!ev.is_error, cost_usd: ev.cost_usd,
+          ...(ev.usage ? {usage:ev.usage} : {}),
+          ...(ev.native ? {native:ev.native} : {}),
+          ...(ev.turn_id ? {turn_id:ev.turn_id} : {}),
+          ...(ev.status ? {status:ev.status} : {}), ...(ev.subtype ? {subtype:ev.subtype} : {}),
           // Some native protocols repeat the completed assistant text in the
           // lifecycle result. Keep it only as a fallback when no message arrived.
           result: hasAssistant ? null : (ev.result || null),
@@ -137,6 +179,8 @@
         break;
       }
       case 'session.config':
+        if (typeof ev.renderer === 'string') state.renderer = ev.renderer;
+        if (!runtimeContract(null, null, state.renderer).interactiveApproval) state.pendingPermission = null;
         // Each event is the connector-confirmed effective scalar set for this
         // turn. Replace rather than merge so returning to a runtime default can
         // clear a previously selected option.
@@ -150,9 +194,11 @@
         // connector echo with that optimistic row; a restore has no local row
         // and therefore appends the durable user event.
         let local = null;
+        if (ev.client_input_id) local = state.items.find(item => item.kind === 'user' && item.client_input_id === ev.client_input_id);
         for (let i = state.items.length - 1; i >= 0; i--) {
+          if (local) break;
           const item = state.items[i];
-          if (item.kind === 'user' && item.local && item.text === text) {
+          if (item.kind === 'user' && item.local && item.text === text && !ev.client_input_id && !item.client_input_id) {
             local = item;
             break;
           }
@@ -165,6 +211,7 @@
             kind: 'user', text,
             attachments: Array.isArray(ev.attachments) ? ev.attachments : [],
             local: false,
+            ...(ev.client_input_id ? {client_input_id:ev.client_input_id} : {}),
           });
         }
         break;
@@ -188,12 +235,13 @@
   }
 
   // Append a local user turn immediately (0-RTT echo) before the agent replies.
-  function appendUserTurn(state, text, attachments) {
+  function appendUserTurn(state, text, attachments, clientInputId) {
     state._openAssistant = null;
     state.items.push({
       kind: 'user', text: text,
       attachments: Array.isArray(attachments) ? attachments : [],
       local: true,
+      ...(clientInputId ? {client_input_id:clientInputId} : {}),
     });
     return state;
   }
@@ -311,6 +359,10 @@
         else if (it.result) log.appendChild(messageLine('assistant', it.result));
       } else if (it.kind === 'error') {
         log.appendChild(messageLine('error', it.text));
+      } else if (it.kind === 'thinking') {
+        const card = el('details', 'chat-thinking');
+        card.appendChild(el('summary', '', 'Thinking'));
+        card.appendChild(el('div', 'chat-text', it.text)); log.appendChild(card);
       }
     }
     container.appendChild(log);
@@ -379,7 +431,34 @@
     return m;
   }
 
+  // Fixed local allowlist: descriptors never determine script URLs. Lazy loading
+  // avoids introducing boot dependencies for CLI-only workspaces.
+  const localModules = {
+    'deeporca-chat-v1': {file:'integrations/deeporca/chat.js', global:'DeepOrcaChat', renderer:true},
+    'runtime-catalog': {file:'integrations/deeporca/agent-ui.js', global:'AgentBridgeRuntimeCatalog'},
+  };
+  function supportsRenderer(id) { return Object.hasOwn(localModules, id || '') && !!localModules[id].renderer; }
+  const loadingModules = new Map();
+  function loadLocalModule(id) {
+    const entry = Object.prototype.hasOwnProperty.call(localModules, id) ? localModules[id] : null;
+    if (!entry) return Promise.reject(new Error('Unsupported renderer'));
+    if (typeof module !== 'undefined' && module.exports) return Promise.resolve(require('./' + entry.file));
+    if (global[entry.global]) return Promise.resolve(global[entry.global]);
+    if (!loadingModules.has(id)) loadingModules.set(id, new Promise((resolve, reject) => {
+      const script = global.document.createElement('script');
+      script.src = '/static/' + entry.file + '?v=deeporca-2';
+      script.onload = () => global[entry.global] ? resolve(global[entry.global]) : reject(new Error('Local renderer unavailable'));
+      script.onerror = () => reject(new Error('Local renderer unavailable. Reload to retry.'));
+      global.document.head.appendChild(script);
+    }).catch(error => { loadingModules.delete(id); throw error; }));
+    return loadingModules.get(id);
+  }
+  function rendererId(agent, capability) {
+    const surface = capability?.surfaces?.find(item => item.id === 'structured');
+    return agent?.renderer || surface?.features?.renderer || capability?.features?.renderer || null;
+  }
   const api = {
+    loadLocalModule, rendererId, supportsRenderer, runtimeContract,
     parseEventPayload, initialChatState, applyEvent, foldEventPayload,
     appendUserTurn, renderChat,
     controlsFromCapability, reconcileControlValues, buildTurnOptions,

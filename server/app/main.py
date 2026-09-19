@@ -11,7 +11,7 @@ import re
 import secrets
 import asyncio
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import (
     FastAPI, Request, Response, HTTPException, Depends, WebSocket,
@@ -58,6 +58,7 @@ from .identity import (
     normalize_username_hint,
 )
 from agentbridge.product import DISPLAY_NAME, NAME, env
+from .integrations import InputRejected, runtime_policy
 
 from . import version as version_info
 
@@ -1099,6 +1100,8 @@ def _agent_json(a: Agent) -> dict:
     return {"id": a.id, "handle": a.handle, "display_name": a.display_name,
             "runtime": a.runtime, "local_project_id": a.local_project_id,
             "runtime_config": a.runtime_config or {},
+            "runtime_status": a.runtime_status,
+            "renderer": runtime_policy(a.runtime).renderer,
             # Legacy bridge only: the connector imports this path locally and a
             # successful project report clears it from the server.
             "cwd": a.cwd, "launch_cmd": a.launch_cmd,
@@ -1120,8 +1123,45 @@ def _connector_agent_dir(agents: list[Agent]) -> list[dict]:
     return [{"id": a.id, "handle": a.handle, "runtime": a.runtime,
              "local_project_id": a.local_project_id,
              "runtime_config": a.runtime_config or {},
+             "runtime_status": a.runtime_status,
+             "renderer": runtime_policy(a.runtime).renderer,
              "cwd": a.cwd, "launch_cmd": a.launch_cmd}
             for a in agents]
+
+
+async def _broadcast_runtime_status(s: OrmSession, agent: Agent) -> None:
+    """Use the existing bounded human channel, scoped to workspace membership."""
+    notification = runtime_policy(agent.runtime).status_notification(agent)
+    if notification is None:
+        return
+    d = s.get(Devbox, agent.devbox_id)
+    if d is None:
+        return
+    user_ids = set(s.scalars(select(Membership.user_id).join(
+        User, User.id == Membership.user_id).where(
+        Membership.workspace_id == d.workspace_id, User.disabled_at.is_(None))))
+    await hub.to_users(user_ids, notification)
+
+
+async def _accept_runtime_status(s: OrmSession, conn: DevboxConn, frame: dict) -> bool:
+    """Only a current owning Connector can report this desired binding's state."""
+    if not hub.is_current_devbox(conn):
+        return False
+    aid = frame.get("agent_id")
+    if not isinstance(aid, str) or len(aid) > 64 or aid not in conn.agent_ids:
+        return False
+    agent = s.get(Agent, aid)
+    if not agent or agent.devbox_id != conn.devbox_id:
+        return False
+    accepted = runtime_policy(agent.runtime).observed_status(agent, frame.get("runtime_status"))
+    if accepted is None:
+        return False
+    if agent.runtime_status == accepted:
+        return True
+    agent.runtime_status = accepted
+    s.commit()
+    await _broadcast_runtime_status(s, agent)
+    return True
 
 
 _agent_directory_locks: dict[str, asyncio.Lock] = {}
@@ -1370,12 +1410,19 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, d, WS_ROLE_ADMIN)
     body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected a JSON object")
+    policy = runtime_policy(body.get("runtime"))
+    policy.validate_create_fields(body)
     local_project_id = body.get("local_project_id") or None
+    if local_project_id is not None and (not isinstance(local_project_id, str) or len(local_project_id) > 64):
+        raise HTTPException(422, "invalid local project id")
+    policy.validate_local_project(local_project_id)
     if local_project_id:
         project = s.get(DevboxProject, local_project_id)
         if not project or project.devbox_id != d.id:
             raise HTTPException(422, "local project does not belong to this devbox")
-    runtime_config = body.get("runtime_config") or {}
+    runtime_config = policy.create_config(body)
     if not isinstance(runtime_config, dict):
         raise HTTPException(422, "runtime_config must be an object")
     if len(json.dumps(runtime_config)) > 16 * 1024:
@@ -1388,8 +1435,57 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
         cwd=body.get("cwd"), launch_cmd=body.get("launch_cmd"),
     )
     s.add(a)
+    policy.initialize_agent(a)
     s.commit()
     await _push_agent_directory(d.id)
+    await _broadcast_runtime_status(s, a)
+    return _agent_json(a)
+
+
+@app.get("/api/agents/{agent_id}")
+async def get_agent(agent_id: str, request: Request, s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    a = s.get(Agent, agent_id)
+    if not a:
+        raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, a.devbox)
+    return _agent_json(a)
+
+
+@app.patch("/api/agents/{agent_id}")
+async def rename_agent(agent_id: str, request: Request, s: OrmSession = Depends(db)):
+    """Display-only edits never repoint a native profile or reset its history."""
+    u = current_user(request, s)
+    a = s.get(Agent, agent_id)
+    if not a:
+        raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, a.devbox, WS_ROLE_ADMIN)
+    body = await _session_body(request)
+    runtime_policy(a.runtime).validate_agent_update(a, body)
+    if "display_name" in body:
+        name = body["display_name"]
+        if not isinstance(name, str) or not name.strip() or len(name) > 200:
+            raise HTTPException(422, "display_name must be a nonempty string of at most 200 characters")
+        a.display_name = name.strip()
+    s.commit()
+    await _push_agent_directory(a.devbox_id)
+    return _agent_json(a)
+
+
+@app.post("/api/agents/{agent_id}/runtime/retry")
+async def retry_agent_runtime(agent_id: str, request: Request, s: OrmSession = Depends(db)):
+    """Resend the exact desired binding; no credentials or config updates."""
+    u = current_user(request, s)
+    a = s.get(Agent, agent_id)
+    if not a:
+        raise HTTPException(404, "not found")
+    _devbox_role(s, u.id, a.devbox, WS_ROLE_ADMIN)
+    policy = runtime_policy(a.runtime)
+    policy.require_retry()
+    policy.retry_agent(a, await _session_body(request))
+    s.commit()
+    await _push_agent_directory(a.devbox_id)
+    await _broadcast_runtime_status(s, a)
     return _agent_json(a)
 
 
@@ -1431,13 +1527,16 @@ async def _session_body(request: Request) -> dict:
     return body
 
 
-def _session_json(sess: Session) -> dict:
+def _session_json(sess: Session, agent: Agent | None = None) -> dict:
     ls = live_registry.get(sess.id)
     state = ("live" if hub.is_session_active(sess.agent_id, sess.id)
              else "ended" if ls and ls.ended else "inactive")
-    return {"id": sess.id, "agent_id": sess.agent_id, "title": sess.title,
+    result = {"id": sess.id, "agent_id": sess.agent_id, "title": sess.title,
             "surface": sess.surface, "created_at": sess.created_at.isoformat(),
             "state": state}
+    if agent is not None:
+        result.update(runtime_policy(agent.runtime).session_fields(agent))
+    return result
 
 
 @app.get("/api/agents/{agent_id}/sessions")
@@ -1453,7 +1552,7 @@ async def list_agent_sessions(agent_id: str, request: Request,
     rows = s.scalars(select(Session).where(
         Session.agent_id == agent_id
     ).order_by(Session.created_at.desc())).all()
-    return [_session_json(sess) for sess in rows]
+    return [_session_json(sess, a) for sess in rows]
 
 
 @app.post("/api/agents/{agent_id}/sessions")
@@ -1464,12 +1563,13 @@ async def create_session(agent_id: str, request: Request, s: OrmSession = Depend
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, a.devbox, WS_ROLE_OPERATOR)
     surface = _surface_hint(await _session_body(request))
+    surface = runtime_policy(a.runtime).session_surface(surface)
     sess = Session(id=new_id(), user_id=u.id, agent_id=a.id,
                    workspace_id=a.devbox.workspace_id, title=f"{a.display_name} session",
                    surface=surface)
     s.add(sess)
     s.commit()
-    return _session_json(sess)
+    return _session_json(sess, a)
 
 
 @app.get("/api/sessions/{session_id}")
@@ -1479,7 +1579,7 @@ async def get_session(session_id: str, request: Request, s: OrmSession = Depends
     if not sess:
         raise HTTPException(404, "not found")
     _session_role(s, u.id, sess)
-    return _session_json(sess)
+    return _session_json(sess, s.get(Agent, sess.agent_id))
 
 
 def _require_terminal_keyboard(sess: Session) -> None:
@@ -1744,12 +1844,14 @@ async def report_projects(devbox_id: str, request: Request,
         agent = agents.get(agent_id)
         if agent is None:
             raise HTTPException(422, "migration agent does not belong to this devbox")
+        runtime_policy(agent.runtime).validate_project_migration(agent, project_id)
         agent.local_project_id = project_id
     # One release-cycle privacy bridge: after any successful authoritative report,
     # no absolute legacy cwd remains in the server database.
     for agent in agents.values():
         agent.cwd = None
         if agent.local_project_id not in projects:
+            runtime_policy(agent.runtime).validate_project_removal()
             agent.local_project_id = None
     for project_id, project in existing.items():
         if project_id not in projects:
@@ -1848,8 +1950,11 @@ def _connector_session(s: OrmSession, conn: DevboxConn, frame: dict) -> Session:
 
 def _resolved_session_ready(s: OrmSession, conn: DevboxConn,
                              sess: Session, frame: dict) -> dict:
-    """Apply authenticated generic surface facts; never infer from runtime names."""
+    """Apply authenticated surface facts within the runtime's session policy."""
     surface = _surface_hint(frame)
+    agent = s.get(Agent, sess.agent_id)
+    policy = runtime_policy(agent.runtime if agent else None)
+    surface = policy.session_surface(surface, error_status=400)
     if surface is not None:
         sess.surface = surface
     if sess.surface == "structured":
@@ -1861,7 +1966,8 @@ def _resolved_session_ready(s: OrmSession, conn: DevboxConn,
     if isinstance(instance, str) and instance:
         conn.session_instances[sess.id] = instance
     return {**frame, "type": "session.ready", "agent_id": sess.agent_id,
-            "session_id": sess.id, "surface": sess.surface}
+            "session_id": sess.id, "surface": sess.surface,
+            "renderer": policy.renderer}
 
 
 @app.websocket("/ws/devbox")
@@ -1922,6 +2028,9 @@ async def ws_devbox(ws: WebSocket):
                 await ws.close(code=4001)
                 break
             t = frame.get("type")
+            if t == "agent.runtime_status":
+                await _accept_runtime_status(s, conn, frame)
+                continue
             sid = frame.get("session_id")
             sess = None
             session_frame = t in ("output", "input_ack", "exit", "ready", "session.ready",
@@ -2058,10 +2167,15 @@ async def ws_devbox(ws: WebSocket):
                                           "message": "input acknowledgement requires string id and status"})
                     continue
                 try:
-                    client_input_id = str(UUID(str(client_input_id)))
+                    canonical_input_id = str(UUID(client_input_id))
                 except (TypeError, ValueError, AttributeError):
                     continue
                 if sess:
+                    agent = s.get(Agent, sess.agent_id)
+                    policy = runtime_policy(agent.runtime if agent else None)
+                    client_input_id = policy.acknowledged_input_id(client_input_id, canonical_input_id)
+                    if client_input_id is None:
+                        continue
                     ls = live_registry.get(sid)
                     if ls:
                         ls.acknowledge_input(client_input_id, frame["status"])
@@ -2153,15 +2267,22 @@ async def ws_devbox(ws: WebSocket):
     except (WebSocketDisconnect, RuntimeError, OSError):
         pass
     finally:
-        removed = await hub.remove_devbox(d.id, expected=conn)
-        if removed:
-            log_event(logger, "connector.offline", devbox_id=d.id)
-            dd = s.get(Devbox, d.id)
-            if dd:
-                for a in dd.agents:
-                    a.presence = "offline"
+        try:
+            removed = await hub.remove_devbox(conn.devbox_id, expected=conn)
+            if removed:
+                log_event(logger, "connector.offline", devbox_id=conn.devbox_id)
+                # HTTP reconciliation may have created/deleted agents while we
+                # awaited a frame. Never flush the connection's cached d.agents:
+                # deleted identities cause StaleDataError and new ones are missed.
+                # Discard any interrupted frame transaction, then update only
+                # currently persisted agents without touching runtime readiness.
+                s.rollback()
+                s.execute(update(Agent).where(Agent.devbox_id == conn.devbox_id)
+                          .values(presence="offline")
+                          .execution_options(synchronize_session=False))
                 s.commit()
-        s.close()
+        finally:
+            s.close()
 
 
 async def _receive_ws_object(ws: WebSocket, send) -> dict | None:
@@ -2223,10 +2344,28 @@ async def _forward_session_command(s: OrmSession, conn: HumanConn, frame: dict) 
     try:
         sess, _ = _attached_session(s, conn, frame)
     except HTTPException:
-        await ws.send_json({"type": "error", "code": "read_only",
-                            "message": "session control requires current operator access and attachment"})
+        message = "session control requires current operator access and attachment"
+        rejection = {"type": "error", "code": "read_only", "message": message}
+        if frame["type"] in ("stdin", "input"):
+            # An attached viewer may know the runtime, but removed members,
+            # unattached callers and mismatched agents must learn nothing new.
+            try:
+                sess, _ = _attached_session(s, conn, frame, WS_ROLE_VIEWER)
+            except HTTPException:
+                pass
+            else:
+                agent = s.get(Agent, sess.agent_id)
+                policy = runtime_policy(agent.runtime if agent else None)
+                rejection = policy.input_rejection(sess, frame, "read_only", message)
+        await ws.send_json(rejection)
         return
     sid, agent_id, kind = sess.id, sess.agent_id, frame["type"]
+    agent = s.get(Agent, agent_id)
+    policy = runtime_policy(agent.runtime if agent else None)
+    rejection = policy.command_rejection(kind)
+    if rejection is not None:
+        await ws.send_json(rejection)
+        return
     if sess.surface == "structured" and kind == "resize":
         await ws.send_json({"type": "error", "code": "surface_not_supported",
                             "message": "structured sessions do not use terminal resize"})
@@ -2242,13 +2381,9 @@ async def _forward_session_command(s: OrmSession, conn: HumanConn, frame: dict) 
     ls = live_registry.get(sid)
     if kind in ("stdin", "input"):
         try:
-            client_input_id = str(UUID(str(frame.get("client_input_id") or uuid4())))
-        except (TypeError, ValueError, AttributeError):
-            await ws.send_json({"type": "error", "message": "invalid client_input_id"})
-            return
-        data = frame.get("data", "")
-        if not isinstance(data, str):
-            await ws.send_json({"type": "error", "message": "invalid input data"})
+            client_input_id, data = policy.prepare_input(sess, frame)
+        except InputRejected as exc:
+            await ws.send_json(exc.frame)
             return
         if ls:
             ls.queue_input(client_input_id, data)
@@ -2339,6 +2474,9 @@ async def ws_term(ws: WebSocket):
                 if "agent_id" in frame and frame["agent_id"] != sess.agent_id:
                     await ws.send_json({"type": "error", "message": "session does not belong to agent"})
                     continue
+                agent = s.get(Agent, sess.agent_id)
+                policy = runtime_policy(agent.runtime if agent else None)
+                sess.surface = policy.stored_surface(sess.surface)
                 try:
                     requested_surface = _surface_hint(frame)
                 except HTTPException as exc:
@@ -2378,9 +2516,9 @@ async def ws_term(ws: WebSocket):
                 await _broadcast_collaboration(s, sess)
                 # 1) Restore terminal pixels or the structured event timeline.
                 event_data = live_registry.event_restore(sess.id)
-                if event_data:
+                if event_data or policy.restore_events:
                     await ws.send_json({"type": "restore", "session_id": sess.id,
-                                        "kind": "event", "data": event_data})
+                                        "kind": "event", "data": event_data or ""})
                 else:
                     await ws.send_json({"type": "restore", "session_id": sess.id,
                                         "data": ls.restore_bytes()})
@@ -2395,7 +2533,9 @@ async def ws_term(ws: WebSocket):
                     "surface": surface})
                 await ws.send_json({"type": "status", "session_id": sess.id,
                                     "state": "live" if ok else "offline",
-                                    "surface": sess.surface})
+                                    "surface": sess.surface,
+                                    "renderer": policy.renderer,
+                                    "runtime_status": agent.runtime_status if agent else None})
             elif t in ("keyboard_acquire", "keyboard_renew", "keyboard_release", "keyboard_handoff"):
                 sid = frame.get("session_id")
                 try:

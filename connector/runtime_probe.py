@@ -110,6 +110,9 @@ def probe_family(
     if not adapters:
         raise runtimes.UnknownRuntimeError(f"unknown runtime family {family!r}")
     representative = next((item for item in adapters if item.default_surface), adapters[0])
+    if representative.capability_probe is not None:
+        return _with_revision(representative.capability_probe(
+            representative, runner=runner, include_models=include_models))
 
     hinted = representative.probe_hint() if representative.probe_hint else None
     installed = bool(hinted) if hinted is not None else bool(shutil.which(representative.executable))

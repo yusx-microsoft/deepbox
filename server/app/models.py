@@ -132,6 +132,8 @@ class Agent(Base):
         ForeignKey("devbox_project.id", ondelete="SET NULL"), nullable=True)
     runtime_config: Mapped[dict] = mapped_column(JSON, default=dict)
     # One-cycle bridge for pre-project agents; cleared after connector import.
+    # Connector-observed provisioning state is independent of online presence.
+    runtime_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     cwd: Mapped[str | None] = mapped_column(String, nullable=True)
     launch_cmd: Mapped[str | None] = mapped_column(String, nullable=True)
     presence: Mapped[str] = mapped_column(String, default="offline")  # offline|online|busy|error
@@ -479,6 +481,8 @@ def _migrate(engine) -> None:
             stmts.append(
                 "ALTER TABLE agent ADD COLUMN runtime_config JSON "
                 "NOT NULL DEFAULT '{}'")
+        if "runtime_status" not in agent_cols:
+            stmts.append("ALTER TABLE agent ADD COLUMN runtime_status JSON")
     if "session" in inspector.get_table_names():
         session_cols = {c["name"] for c in inspector.get_columns("session")}
         if "workspace_id" not in session_cols:
@@ -492,6 +496,12 @@ def _migrate(engine) -> None:
     with engine.begin() as conn:
         for stmt in stmts:
             conn.execute(text(stmt))
+        # DeepOrca never has a terminal fallback. Preserve generic legacy NULLs.
+        if {"agent", "session"}.issubset(inspector.get_table_names()):
+            conn.execute(text(
+                "UPDATE session SET surface='structured' WHERE agent_id IN "
+                "(SELECT id FROM agent WHERE runtime='deeporca') "
+                "AND (surface IS NULL OR surface != 'structured')"))
         # SQLite cannot add a UNIQUE constraint with ALTER TABLE.  Keep this
         # unconditional so an interrupted prior migration repairs the index.
         conn.execute(text(

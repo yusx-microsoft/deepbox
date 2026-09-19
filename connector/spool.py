@@ -235,6 +235,10 @@ class SpoolBase:
     def status(self) -> dict:  # pragma: no cover - abstract
         raise NotImplementedError
 
+    def pending_usage(self) -> tuple[int, int]:
+        """Pending frame count and serialized UTF-8 bytes (no payload scan)."""
+        raise NotImplementedError
+
     def record_input_once(self, client_input_id: str) -> bool:  # pragma: no cover
         raise NotImplementedError
 
@@ -299,6 +303,7 @@ class InMemorySpool(SpoolBase):
         self._last_acked: dict[tuple[str, str], int] = {}
         self._ord = 0
         self._inputs: dict[str, float] = {}
+        self._pending_bytes = 0
 
     def _next_seq(self, key) -> int:
         base = self._last_acked.get(key, 0)
@@ -324,6 +329,7 @@ class InMemorySpool(SpoolBase):
             "created": time.time(), "ord": self._ord,
             "bytes": len(payload.encode("utf-8")),
         })
+        self._pending_bytes += len(payload.encode("utf-8"))
         return seq
 
     def pending_records(self):
@@ -348,6 +354,7 @@ class InMemorySpool(SpoolBase):
         if seq != smallest["seq"] or seq != last + 1:
             return False
         self._rows.remove(smallest)
+        self._pending_bytes -= smallest["bytes"]
         self._last_acked[key] = seq
         return True
 
@@ -364,6 +371,9 @@ class InMemorySpool(SpoolBase):
             "max_last_ack": max(self._last_acked.values(), default=0),
         }
 
+    def pending_usage(self) -> tuple[int, int]:
+        return len(self._rows), self._pending_bytes
+
     def record_input_once(self, client_input_id: str) -> bool:
         cid = _validate_input_id(client_input_id)
         if cid in self._inputs:
@@ -376,6 +386,7 @@ class InMemorySpool(SpoolBase):
         keep = [r for r in self._rows if (r["sid"], r["pid"]) != key]
         removed = len(self._rows) - len(keep)
         self._rows = keep
+        self._pending_bytes = sum(r["bytes"] for r in keep)
         self._last_acked.pop(key, None)
         return removed
 
@@ -505,6 +516,10 @@ class DiskSpool(SpoolBase):
                 f"spool is not a valid database: {self.path}: {e}"
             ) from e
         self._conn = conn
+        row = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(payload_bytes),0) FROM outbox"
+        ).fetchone()
+        self._pending_frames, self._pending_bytes = int(row[0]), int(row[1])
         _chmod_best_effort(self.path, 0o600)
 
     def close(self) -> None:
@@ -521,6 +536,10 @@ class DiskSpool(SpoolBase):
         return self._conn
 
     # -- v3 API -----------------------------------------------------------
+    def pending_usage(self) -> tuple[int, int]:
+        self._require()
+        return self._pending_frames, self._pending_bytes
+
     def enqueue_output(self, frame: dict) -> int:
         sid, pid = _identity(frame)
         if not sid or not pid:
@@ -556,6 +575,8 @@ class DiskSpool(SpoolBase):
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        self._pending_frames += 1
+        self._pending_bytes += pbytes
         return seq
 
     def _rows(self):
@@ -585,11 +606,12 @@ class DiskSpool(SpoolBase):
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
-                "SELECT MIN(seq) AS s FROM outbox "
-                "WHERE session_id=? AND pty_instance_id=?",
+                "SELECT seq AS s, payload_bytes FROM outbox "
+                "WHERE session_id=? AND pty_instance_id=? ORDER BY seq LIMIT 1",
                 (sid, pid),
             ).fetchone()
             smallest = row["s"] if row and row["s"] is not None else None
+            removed_bytes = row["payload_bytes"] if row else 0
             if smallest is None:
                 conn.execute("ROLLBACK")
                 return False
@@ -616,6 +638,8 @@ class DiskSpool(SpoolBase):
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        self._pending_frames -= 1
+        self._pending_bytes -= removed_bytes
         return True
 
     def last_acked(self, session_id: str, pty_instance_id: str) -> int:
@@ -669,6 +693,10 @@ class DiskSpool(SpoolBase):
         conn = self._require()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            removed_bytes = conn.execute(
+                "SELECT COALESCE(SUM(payload_bytes),0) FROM outbox "
+                "WHERE session_id=? AND pty_instance_id=?", (sid, pid)
+            ).fetchone()[0]
             cur = conn.execute(
                 "DELETE FROM outbox WHERE session_id=? AND pty_instance_id=?",
                 (sid, pid),
@@ -682,6 +710,8 @@ class DiskSpool(SpoolBase):
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        self._pending_frames -= removed
+        self._pending_bytes -= removed_bytes
         return removed
 
     def prune_input_receipts(self, max_age: float | None = None,

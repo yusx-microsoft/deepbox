@@ -19,6 +19,7 @@ explicit transport acknowledgement.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from uuid import UUID, uuid4
 
@@ -29,6 +30,9 @@ from .runtime_probe import availability, probe_family
 from .local_store import LocalProjectStore
 from . import runtimes
 from .spool import InMemorySpool, SpoolBase
+from .integrations.deeporca.supervisor import DeepOrcaSupervisorMixin
+
+log = logging.getLogger(__name__)
 
 # Pipelining bounds: how many durable output frames (and their bytes) may
 # be in flight to the transport before earlier ACKs return. The disk spool is
@@ -38,12 +42,13 @@ MAX_INFLIGHT_FRAMES = 64
 MAX_INFLIGHT_BYTES = 512 * 1024
 
 
-class SessionSupervisor:
+class SessionSupervisor(DeepOrcaSupervisorMixin):
     """Owns every local agent session, independent of any transport."""
 
     def __init__(self, agents: dict[str, dict] | None = None,
                  spool: SpoolBase | None = None,
-                 local_store: LocalProjectStore | None = None):
+                 local_store: LocalProjectStore | None = None,
+                 deeporca_store=None, deeporca_worker_factory=None):
         self.local_store = local_store
         self.agents: dict[str, dict] = {}
         self._project_migrations: dict[str, dict] = {}
@@ -80,6 +85,7 @@ class SessionSupervisor:
         self._inflight_bytes = 0
         # The currently attached transport channel, or None when detached.
         self._channel: Channel | None = None
+        self._init_runtime_extension(deeporca_store, deeporca_worker_factory)
         # Un-acked frames recovered from a prior run are immediately eligible.
         if self._spool.pending_records():
             self.pending_event.set()
@@ -168,6 +174,7 @@ class SessionSupervisor:
         self._inflight_bytes = 0
         if self.pending:
             self.pending_event.set()
+        self._schedule_runtime_reconciliation()
 
     def detach(self) -> None:
         """Unbind the transport. Sessions keep running and buffering output."""
@@ -325,6 +332,8 @@ class SessionSupervisor:
             removed_agent_ids = set(self.agents) - set(updated)
             self.agents = updated
             if removed_agent_ids:
+                for removed_agent_id in removed_agent_ids:
+                    await self._retire_runtime_agent(removed_agent_id)
                 for key in list(self._open_locks):
                     if key[0] in removed_agent_ids:
                         self._invalidate_open(key)
@@ -370,20 +379,24 @@ class SessionSupervisor:
                         except Exception:
                             log.exception(
                                 "Could not clear a local agent context marker")
+            self._schedule_runtime_reconciliation()
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
+        if t == "input":
+            try:
+                client_input_id = str(UUID(str(frame.get("client_input_id"))))
+            except (TypeError, ValueError, AttributeError):
+                return
+            frame = {**frame, "client_input_id": client_input_id}
+        if await self._handle_runtime_control(frame):
+            return
         if t == "open":
             await self.open_pty(
                 aid, sid, frame.get("cols", 120), frame.get("rows", 30),
                 surface=frame.get("surface"))
         elif t == "input":
             p = self.ptys.get((aid, sid))
-            client_input_id = frame.get("client_input_id")
-            try:
-                client_input_id = str(UUID(str(client_input_id)))
-            except (TypeError, ValueError, AttributeError):
-                return
             if p:
                 reason = None
                 if not p.is_alive():
@@ -417,6 +430,10 @@ class SessionSupervisor:
                     "client_input_id": client_input_id,
                     "status": "delivered",
                 })
+        elif t == "interrupt":
+            p = self.ptys.get((aid, sid))
+            if p is not None:
+                p.write("\x03")
         elif t == "resize":
             p = self.ptys.get((aid, sid))
             if p:
@@ -619,6 +636,9 @@ class SessionSupervisor:
                 "authentication": capability["authentication"]["status"],
             })
             return
+        if await self._open_runtime_session(
+                adapter, agent_id, session_id, confirmed_surface, pty_instance_id, current):
+            return
         runtime_config = (info.get("runtime_config")
                           if isinstance(info.get("runtime_config"), dict)
                           else {})
@@ -772,6 +792,12 @@ class SessionSupervisor:
             } for aid, sid in self.ptys.keys()],
             **spool_status,
         }
+
+    async def aclose(self) -> None:
+        """Settle extension sessions before closing the durable spool."""
+        await self._close_runtime_sessions()
+        self.shutdown()
+        self._close_runtime_storage()
 
     def shutdown(self) -> None:
         """Stop all sessions on supervisor exit. Never called on detach."""

@@ -115,6 +115,8 @@ class Connector:
         if server_protocol != PROTOCOL_VERSION:
             raise RuntimeError(
                 f"protocol mismatch: connector={PROTOCOL_VERSION}, server={server_protocol}")
+        if isinstance(data.get("devbox_id"), str):
+            self.supervisor.set_enrollment(self.server_url, data["devbox_id"])
         self.supervisor.replace_agents(data["agents"])
         print(f"[agentbridge] devbox={data['name']} agents={[a['handle'] for a in data['agents']]}")
         return data
@@ -288,7 +290,7 @@ class SupervisorService:
         finally:
             if self._server is not None:
                 await self._server.close()
-            self.supervisor.shutdown()
+            await self.supervisor.aclose()
 
     def stop(self) -> None:
         self._stop.set()
@@ -367,6 +369,7 @@ async def run_supervisor(server_url: str, token: str,
         service = SupervisorService(
             dict(bootstrap.supervisor.agents), endpoint=address,
             spool=open_spool(server_url, token), local_store=local_store)
+        service.supervisor.set_enrollment(server_url, me["devbox_id"])
         project_watcher = asyncio.create_task(
             _watch_project_inventory(bootstrap, me["devbox_id"]))
         try:
@@ -680,6 +683,7 @@ async def main(argv: list[str] | None = None):
                 print(f"[agentbridge] disconnected: {explain_connection_error(exc)}; retry in 3s")
                 await asyncio.sleep(3)
     finally:
+        await c.supervisor.aclose()
         local_store.close()
 
 

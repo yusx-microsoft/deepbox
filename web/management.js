@@ -2,10 +2,11 @@
 (function(root, factory){
   const common = typeof module === 'object' && module.exports;
   const api = factory(common ? require('./ui.js') : root.AgentBridgeUI,
-    common ? require('./dialogs.js') : root.AgentBridgeDialogs);
+    common ? require('./dialogs.js') : root.AgentBridgeDialogs,
+    common ? require('./chat.js') : root.AgentBridgeChat);
   if(common) module.exports = api;
   else root.AgentBridgeManagement = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function(UI, Dialogs){
+})(typeof globalThis !== 'undefined' ? globalThis : this, function(UI, Dialogs, Chat){
   'use strict';
   const esc = UI.escapeHtml;
   const enc = value=>encodeURIComponent(String(value));
@@ -499,14 +500,28 @@
       if(!target || !canManage(snapshot)){ if(live(snapshot, pending.element)) dialogs.close(); return; }
       const runtimes = UI.runtimeOptions(target.capabilities);
       if(!runtimes.length) return dialogs.alert('No runtimes reported', 'Start or reconnect this Machine so agentbridge can report its available runtime adapters.');
-      const projects = item=>[{value:'', label:'No project (runtime default)'}].concat(UI.localProjectOptions(item.projects).map(project=>({value:project.id, label:project.name})));
+      const contract = runtime=>Chat.runtimeContract({runtime});
+      const projects = (item, runtime)=>[{value:'', label:contract(runtime).requiresRegisteredProject ? 'Select a registered local project (required)' : 'No project (runtime default)'}].concat(UI.localProjectOptions(item.projects).map(project=>({value:project.id, label:project.name})));
+      const runtimeUis = new Map();
+      for(const runtime of runtimes){
+        const {agentUiModule, label} = contract(runtime);
+        if(!agentUiModule) continue;
+        try {
+          const ui = await Chat.loadLocalModule(agentUiModule);
+          runtimeUis.set(runtime, {ui, config:ui.agentConfiguration(UI.findRuntimeCapability(target.capabilities, runtime))});
+        } catch(error){ if(live(snapshot, pending.element)) return dialogs.alert(`${label || runtime} setup unavailable`, message(error)); return; }
+        if(!live(snapshot, pending.element)) return;
+      }
+      target = machine(snapshot, machineId);
+      if(!target || !canManage(snapshot)){ if(live(snapshot, pending.element)) dialogs.close(); return; }
       return mutationForm(snapshot, {
         title:'Add agent', desc:`Register an agent runtime on ${target.name}.`,
         fields:[
           {name:'handle', label:'Handle', type:'text', required:true},
           {name:'runtime', label:'Runtime adapter', type:'select', options:runtimes, value:runtimes[0], required:true},
-          {name:'local_project_id', label:'Local project', type:'select', options:projects(target), value:'',
-            helpHtml:'<small>Projects are connector-local. Add one below, then refresh.</small>'},
+          {name:'local_project_id', label:'Local project', type:'select', options:projects(target, runtimes[0]), value:'',
+            helpHtml:'<small data-project-help>Projects are connector-local. Add one below, then refresh.</small>'},
+          ...Array.from(runtimeUis.values()).flatMap(({ui, config})=>ui.creationFields(config)),
         ], submit:'Add agent',
         extraHtml:`<details class="local-action-guide"><summary>Add a local project</summary><p>Run this on <b>${esc(target.name)}</b>. The folder path stays on that Machine.</p>
           <div class="local-command-fields"><label>Folder path<input data-project-path type="text"/></label><label>Display name<input data-project-name type="text"/></label></div>
@@ -515,6 +530,23 @@
         onReady:root=>{
           const path = root.querySelector('[data-project-path]'), name = root.querySelector('[data-project-name]');
           const command = root.querySelector('[data-project-command]'), error = root.querySelector('[data-error]');
+          const runtime = root.querySelector('[data-field="runtime"]');
+          const project = root.querySelector('[data-field="local_project_id"]');
+          const updateProjects = ()=>{
+            const {requiresRegisteredProject, label} = contract(runtime.value);
+            const required = !!requiresRegisteredProject, selected = project.value;
+            const options = projects(target, runtime.value);
+            const value = options.some(item=>item.value === selected) ? selected : '';
+            project.innerHTML = optionsHtml(options, value); project.value = value;
+            project.required = required;
+            project.setAttribute('aria-required', String(required));
+            root.querySelector('[data-project-help]').textContent = required
+              ? (options.length > 1 ? `${label || runtime.value} requires a registered local project. Select one above.`
+                : `${label || runtime.value} requires a registered local project. Add one on this Machine using the command below, then refresh projects.`)
+              : 'Projects are connector-local. Optional for this runtime; add one below, then refresh.';
+          };
+          runtime.addEventListener('change', updateProjects); updateProjects();
+          for(const [id, {ui, config}] of runtimeUis) ui.bindCreation(root, runtime, config, id);
           const update = ()=>{ if(live(snapshot, root)) command.textContent = UI.projectAddCommand(path.value, name.value); };
           path.oninput = name.oninput = update; update();
           bindCopy(snapshot, root, root.querySelector('[data-project-copy]'), ()=>command.textContent, error);
@@ -526,10 +558,7 @@
               if(!await reload(snapshot, root)) return;
               target = machine(snapshot, machineId);
               if(!target) throw new Error('This Machine is no longer available.');
-              const select = root.querySelector('[data-field="local_project_id"]'), selected = select.value;
-              const options = projects(target);
-              select.innerHTML = optionsHtml(options, options.some(item=>item.value === selected) ? selected : '');
-              select.value = options.some(item=>item.value === selected) ? selected : '';
+              updateProjects();
             } catch(problem){ if(live(snapshot, root)) error.textContent = message(problem); }
             finally { if(live(snapshot, root)) button.disabled = submit.disabled = false; }
           };
@@ -539,12 +568,110 @@
         const current = machine(snapshot, machineId);
         if(!current) throw new Error('This Machine is no longer available.');
         if(!UI.runtimeOptions(current.capabilities).includes(values.runtime)) throw new Error('This runtime is no longer available. Reconnect the Machine and reopen this dialog.');
-        if(!projects(current).some(project=>project.value === values.local_project_id)) throw new Error('This project is no longer available. Refresh projects and choose again.');
-        await api(`/api/devboxes/${enc(machineId)}/agents`, {method:'POST', body:JSON.stringify({
+        const selectedContract = contract(values.runtime);
+        if(selectedContract.requiresRegisteredProject && !values.local_project_id) throw new Error(`${selectedContract.label || values.runtime} requires a registered local project. Add one on this Machine, refresh projects, then select it.`);
+        if(!projects(current, values.runtime).some(project=>project.value === values.local_project_id)) throw new Error('This project is no longer available. Refresh projects and choose again.');
+        const runtimeUi = runtimeUis.get(values.runtime)?.ui;
+        const runtimeConfig = runtimeUi ? runtimeUi.creationConfigFromValues(UI.findRuntimeCapability(current.capabilities, values.runtime), values) : {};
+        const created = await api(`/api/devboxes/${enc(machineId)}/agents`, {method:'POST', body:JSON.stringify({
           handle:values.handle, display_name:values.handle, runtime:values.runtime,
-          local_project_id:values.local_project_id || null, runtime_config:{},
+          local_project_id:values.local_project_id || null, runtime_config:runtimeConfig,
         })});
-        if(await reloadAfterMutation(snapshot, root)) dialogs.close();
+        if(await reloadAfterMutation(snapshot, root)){
+          dialogs.close();
+          if(runtimeUi && canManage(snapshot)) return agentSettings(created?.id);
+        }
+      });
+    }
+
+    async function agentSettings(id){
+      const snapshot = capture();
+      const find = ()=>{
+        if(!canManage(snapshot)) return null;
+        for(const box of list(context().devboxes)){
+          if(box.workspace_id !== snapshot.workspaceId) continue;
+          const agent = list(box.agents).find(item=>item.id === id && Chat.runtimeContract(item).agentUiModule);
+          if(agent) return {box, agent};
+        }
+        return null;
+      };
+      const initial = find();
+      if(!initial) return;
+      const runtime = initial.agent.runtime;
+      const pending = loading(snapshot, 'Agent settings', 'Refreshing Agent state…');
+      try { if(!await reload(snapshot, pending.element)) return; }
+      catch(error){
+        if(!live(snapshot, pending.element)) return;
+        if(!find()){ dialogs.close(); return; }
+        return dialogs.alert('Could not load Agent settings', message(error));
+      }
+      let found = find();
+      if(!found || found.agent.runtime !== runtime){ if(live(snapshot, pending.element)) dialogs.close(); return; }
+      let catalog;
+      try { catalog = await Chat.loadLocalModule(Chat.runtimeContract(found.agent).agentUiModule); }
+      catch(error){ if(live(snapshot, pending.element)) return dialogs.alert('Agent settings unavailable', message(error)); return; }
+      if(!live(snapshot, pending.element)) return;
+      found = find();
+      if(!found || found.agent.runtime !== runtime){ dialogs.close(); return; }
+      const retryable = catalog.retryable;
+      let render, refreshButton, retryButton;
+      const check = root=>{
+        if(!live(snapshot, root)) return null;
+        const current = find();
+        if(!current || current.agent.runtime !== runtime){ dialogs.close(); return null; }
+        return current;
+      };
+      return mutationForm(snapshot, {
+        title:'Agent settings', desc:catalog.settingsDescription,
+        fields:[{name:'display_name',label:'Agent name',type:'text',required:true,value:found.agent.display_name || found.agent.handle}],
+        submit:'Save name',
+        extraHtml:catalog.settingsHtml,
+        onReady:root=>{
+          const save = root.querySelector('[data-submit]'), input = root.querySelector('[data-field="display_name"]');
+          const error = root.querySelector('[data-error]');
+          refreshButton = root.querySelector('[data-refresh-status]');
+          retryButton = root.querySelector('[data-retry-runtime]');
+          render = ()=>{
+            const current = check(root); if(!current) return;
+            const {box, agent} = current;
+            catalog.renderSettings(root, box, agent, UI);
+            refreshButton.disabled = false;
+          };
+          const run = async retry=>{
+            const button = retry ? retryButton : refreshButton;
+            if(button.disabled || save.disabled || !root.contains(button)) return;
+            const current = check(root); if(!current || (retry && !retryable(current.agent))) return;
+            save.disabled = input.disabled = refreshButton.disabled = retryButton.disabled = true;
+            error.textContent = '';
+            try {
+              if(retry){
+                requireManager(snapshot);
+                // Reconcile this exact Agent, with no binding/configuration body or create request.
+                const result = await api(UI.agentApiPath(id) + '/runtime/retry', {method:'POST'});
+                const latest = check(root); if(!latest) return;
+                if(result?.id === id) latest.agent.runtime_status = result.runtime_status;
+              }
+              if(await reload(snapshot, root)) render();
+            } catch(problem){ if(check(root)) error.textContent = message(problem); }
+            finally { if(check(root)){ save.disabled = input.disabled = false; render(); } }
+          };
+          refreshButton.onclick = ()=>run(false);
+          retryButton.onclick = ()=>run(true);
+          render();
+        },
+      }, async(values, root)=>{
+        if(!check(root)) return;
+        requireManager(snapshot);
+        if(values.display_name.length > 200) throw new Error('Agent name must be at most 200 characters.');
+        refreshButton.disabled = retryButton.disabled = true;
+        try {
+          const result = await api(UI.agentApiPath(id), {method:'PATCH', body:JSON.stringify({display_name:values.display_name})});
+          const latest = check(root); if(!latest) return;
+          if(result?.id === id) latest.agent.display_name = result.display_name;
+          if(await reloadAfterMutation(snapshot, root) && check(root)){
+            render(); root.querySelector('[data-submit]').textContent = 'Saved';
+          }
+        } finally { if(check(root)) render(); }
       });
     }
 
@@ -632,7 +759,7 @@
     function showSkills(machineId){ return inventoryDialog(machineId, 'skills'); }
 
     return {createWorkspace, manageWorkspace, presentInvitation, admin, createMachine,
-      rotateMachineToken, deleteMachine, createAgent, deleteAgent, showRuntimes, showSkills};
+      rotateMachineToken, deleteMachine, createAgent, agentSettings, deleteAgent, showRuntimes, showSkills};
   }
 
   return {createManagement};

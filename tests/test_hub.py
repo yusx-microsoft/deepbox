@@ -18,14 +18,18 @@ class FanoutWebSocket:
         self.sent = []
         self.close_codes = []
         self._never = asyncio.Event()
+        self.received = asyncio.Queue()
+        self.closed = asyncio.Event()
 
     async def send_json(self, frame):
         if self.stalled:
             await self._never.wait()
         self.sent.append(frame)
+        self.received.put_nowait(frame)
 
     async def close(self, code=1000):
         self.close_codes.append(code)
+        self.closed.set()
 
 
 class HubUserDisconnectTests(unittest.IsolatedAsyncioTestCase):
@@ -99,10 +103,14 @@ class HubUserDisconnectTests(unittest.IsolatedAsyncioTestCase):
         ]
         for frame in frames:
             await asyncio.wait_for(hub.to_session_humans("s1", frame), timeout=0.2)
-        await asyncio.sleep(0.03)
+        # Observe actual delivery and eviction, not a fixed 30ms sleep that
+        # races Windows/loaded-runner scheduling. Policy timeouts stay intact.
+        for frame in frames:
+            self.assertEqual(await asyncio.wait_for(healthy_ws.received.get(), 0.2), frame)
 
         self.assertEqual(healthy_ws.sent, frames)
         self.assertIn(healthy, hub.humans)
+        await asyncio.wait_for(stalled_ws.closed.wait(), 1)
         self.assertNotIn(stalled, hub.humans)
         self.assertEqual(stalled_ws.close_codes, [1011])
         self.assertNotIn(stalled, hub.session_watchers.get("s1", set()))
