@@ -93,14 +93,16 @@ raises `SpoolInUseError`.
 
 The disk spool is only opened in real CLI mode via `open_spool(server_url,
 token)`. A plain `SessionSupervisor(...)` / `Connector(...)` constructed in tests
-or as a library defaults to an in-memory spool and never creates user files.
+or as a library defaults to an in-memory spool and creates no spool files.
+Native conversation launches independently acquire the on-disk guard in §3.3;
+tests must inject a disposable `native_lock_root` for those launches.
 
 ### 3.2 Local project and skill state (`connector/local_store.py`)
 
 `LocalProjectStore` uses a connector-state SQLite database (`state.db`). The
 state root is `%LOCALAPPDATA%/deepbox` on Windows and
 `${XDG_STATE_HOME:-~/.local/state}/deepbox` on macOS/Linux. The DB is opened
-with WAL, `synchronous=NORMAL`, and a 5-second `busy_timeout`; cross-process
+with WAL, `synchronous=FULL`, and a 5-second `busy_timeout`; cross-process
 mutations are serialized with a sibling `.lock` file, and on Unix the directory
 and DB are created `0700`/`0600` where possible.
 
@@ -112,13 +114,47 @@ and DB are created `0700`/`0600` where possible.
   only on the connector; the server keeps at most a sanitized inventory and
   never receives paths.
 - `native_context(agent_id, session_id, runtime_id, cwd, established_at,
-  updated_at)` — records that a runtime CLI already owns the conversation for a
-  session, so the next process resumes it instead of starting an empty one. It
-  stores no prompts, replies, or provider transcript identifiers; the history
-  itself stays inside the CLI. `cwd` is kept only to refuse resuming a
-  directory-scoped conversation from a different project, and it never leaves
-  the connector. Rows are written after the first successful turn and dropped
-  when the agent is deleted.
+  updated_at, state)` — an `attempted` reservation precedes first spawn;
+  `established_at` is empty until a successful turn promotes it to `established`.
+  Old rows migrate as established. Both states require resume on later launches,
+  never silent recreation. The table stores no prompts/replies/provider event
+  IDs. `cwd` is machine-private, including the effective inherited cwd, and is
+  checked for directory-scoped recovery. Original bindings are immutable and
+  retained when agents disappear from an inventory; omission is not deletion of
+  native history. `BEGIN IMMEDIATE` makes reservation conflicts atomic.
+
+### 3.3 Native conversation writer ownership (`connector/native_writer.py`)
+
+The shared user-state `native-writers/` directory contains one stable hashed lock
+file per runtime-family/session pair. It is independent of the connector DB,
+agent binding, project path, server URL, and transport. Files are never unlinked:
+replacing their inode could split ownership. Windows uses a non-blocking byte
+lock, POSIX `flock`; tests inject disposable roots. Creating an embedded supervisor
+alone does not write a guard, but starting a native conversation does.
+
+An active JSON journal (random owner, supervisor PID, start timestamp; no prompt,
+path, credential, or transcript) is flushed before spawn. A known-reaped child
+clears it; OS lock release alone does not. A crash during a turn can leave a child
+alive, so neither elapsed time nor a dead supervisor PID permits takeover. A
+malformed journal fails closed. Retention of output recordings does not erase
+these local guards or the provider's transcripts.
+
+After **personally confirming the previous CLI and any transcript writers have
+stopped**, inspect and release an abandoned guard on that same machine:
+
+```text
+agentbridge context status claude-code <session-id>
+agentbridge context release claude-code <session-id> --owner <owner-from-status> --confirm-writer-stopped
+```
+
+Use `copilot-cli` for that family. These commands make no network requests and do
+not start/resume/delete a conversation. The exact-owner check prevents a stale
+operator command from clearing a newer journal; release never breaks a live OS
+lock. The confirmation is a user assertion, not a process-tree safety proof. Do
+not delete lock files or clear a guard merely because its supervisor PID is gone.
+Malformed journals require investigation or a new session, not an automatic reset.
+Only cooperating updated connectors using this shared state root are covered;
+manual/older CLI launchers and separate OS users/machines are outside the lock.
 
 ## 4. Server-side persistence (`server/app/`)
 

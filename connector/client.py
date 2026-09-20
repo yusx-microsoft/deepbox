@@ -289,6 +289,7 @@ class SupervisorService:
             if self._server is not None:
                 await self._server.close()
             self.supervisor.shutdown()
+            await self.supervisor.wait_closed()
 
     def stop(self) -> None:
         self._stop.set()
@@ -680,6 +681,8 @@ async def main(argv: list[str] | None = None):
                 print(f"[agentbridge] disconnected: {explain_connection_error(exc)}; retry in 3s")
                 await asyncio.sleep(3)
     finally:
+        c.supervisor.shutdown()
+        await c.supervisor.wait_closed()
         local_store.close()
 
 

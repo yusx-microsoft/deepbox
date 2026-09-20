@@ -187,13 +187,23 @@ A conversation's history lives inside the agent's own CLI on the user's machine.
 AgentBridge keeps the transcript people read, but it never rebuilds the model's
 memory from those stored messages: doing so would resend other teammates' text
 and drift from what the CLI actually knows. Instead the connector hands the CLI
-the session identifier and asks it to continue its own conversation, which keeps
-one source of truth and one bill.
+the stable session identifier and asks it to continue its own conversation.
+AgentBridge does not inject a second copy of history; native resume can still
+consume context tokens and incur normal provider charges.
 
 This also means continuity has limits worth showing honestly. A conversation can
-belong to a specific project directory, so moving an agent to another project
-ends it. When continued memory is impossible, the product says so and offers a
-new session rather than answering as if the earlier turns never happened.
+belong to a specific project directory. Moving an agent elsewhere refuses resume
+rather than ending or deleting the old conversation; restore the binding or
+start a new session. Native-writer ownership prevents two cooperating connectors
+from writing that conversation concurrently. Uncertain crash recovery requires
+explicit local confirmation, not an automatic lease timeout.
+
+**Current status:** history selection and read-only replay exist. Renaming a
+historical session and explicitly resuming it from the browser are not implemented
+yet. The intended contract is an editable AgentBridge display title, with unchanged
+AgentBridge session ID/native resume ID. Replay and resume must be distinct
+operations with current Workspace authorization; selecting history must not spawn
+a CLI, and unsupported/missing native history must not become a new conversation.
 
 ### 5.3 Structured chat controls
 

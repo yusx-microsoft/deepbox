@@ -236,11 +236,36 @@ The connector's registry is the extension boundary. Each adapter describes:
 
 Conversation history belongs to the runtime CLI, not to AgentBridge. The
 connector never replays stored messages into a prompt: it passes its own session
-ID to the CLI, which creates the conversation on the first turn and restores it
-afterwards. The first completed turn records a local marker in the connector's
-SQLite store, so later turns resume even after the connector restarts. Provider
-transcript identifiers are deliberately ignored, because runtimes differ: Claude
-Code reports a fresh identifier on every resume and Copilot CLI reports none.
+ID to the CLI. Under exclusive native-writer ownership, the connector durably
+reserves that ID **before** the first launch, then marks it established after a
+successful translated turn. Any subsequent launch with a reservation uses explicit
+resume, including failed/interrupted first turns; if the CLI never created the
+transcript, resume can fail and the user must start a new session. It never retries
+with create or selects the CLI's latest conversation. Marker writes failing after
+a turn fence the session and stop its child instead of allowing further input.
+
+Provider event IDs are not compared as an identity proof. Tested Claude output
+can include both a fresh internal ID and the requested ID on resume; Copilot's
+translated structured stream does not reliably expose a native ID. This does not
+assert that every CLI version omits/changes IDs. The tested installed versions
+were Claude Code 2.1.119 and Copilot CLI 1.0.84-2, not verified latest releases.
+Installation-based capability reporting is not a version/flag compatibility gate.
+
+`connector/native_writer.py` holds a non-blocking OS file lock keyed by runtime
+family and session ID, independent of agent, working directory, or local DB path.
+It spans persistent-process life and per-turn idle gaps. A flushed active journal
+precedes spawn and is cleared only after the owned CLI child is reaped. Closing
+waits for late launches and drains pipes; repeated cancellation cannot discard a
+child handle. An orphaned/uncertain writer is **not** reclaimed by PID checks or
+TTL: later launches fail closed and require explicit local recovery. This protects
+cooperating, updated AgentBridge connectors under the same OS user/shared state
+root, not manually launched CLIs, older connectors, or other machines.
+
+Transport reattachment to a surviving sessiond is not native recovery. Isolated
+CLI tests verified recall through a fresh supervisor/local store, not a complete
+browser/server/sessiond restart. Historical-session selection currently opens
+read-only replay; explicit historical resume and display-title rename remain
+separate UI/API work, not completed by this connector implementation.
 
 Resuming fails closed. When the recorded runtime or, for a `cwd`-scoped runtime,
 the project directory no longer matches, the turn stops with an explicit error

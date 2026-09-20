@@ -19,6 +19,7 @@ explicit transport acknowledgement.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import deque
 from uuid import UUID, uuid4
 
@@ -26,7 +27,8 @@ from .ipc import Channel
 from .pty_session import PtySession, resolve_cmd
 from .agent_session import StructuredAgentSession
 from .runtime_probe import availability, probe_family
-from .local_store import LocalProjectStore
+from .local_store import LocalProjectStore, default_state_root
+from .native_writer import NativeWriterLease
 from . import runtimes
 from .spool import InMemorySpool, SpoolBase
 
@@ -43,8 +45,11 @@ class SessionSupervisor:
 
     def __init__(self, agents: dict[str, dict] | None = None,
                  spool: SpoolBase | None = None,
-                 local_store: LocalProjectStore | None = None):
+                 local_store: LocalProjectStore | None = None,
+                 native_lock_root: str | None = None):
         self.local_store = local_store
+        # User-scoped, never agent/DB/cwd-scoped. Tests inject disposable roots.
+        self._native_lock_root = native_lock_root or os.path.join(default_state_root(), "native-writers")
         self.agents: dict[str, dict] = {}
         self._project_migrations: dict[str, dict] = {}
         self.replace_agents(agents or {})
@@ -58,6 +63,7 @@ class SessionSupervisor:
         self._open_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._open_users: dict[tuple[str, str], int] = {}
         self._stopped = False
+        self._close_tasks: set[asyncio.Task] = set()
         # Durable, sequence-numbered store of unacknowledged session output. Tests
         # may inject an InMemorySpool; the CLI injects a DiskSpool.
         self._spool: SpoolBase = spool if spool is not None else InMemorySpool()
@@ -128,7 +134,8 @@ class SessionSupervisor:
         """Return ``(runtime_id, cwd)`` when this session already has context."""
         if self.local_store is not None:
             record = self.local_store.native_context(agent_id, session_id)
-            return (record.runtime_id, record.cwd) if record else None
+            return (record.runtime_id, os.path.normcase(record.cwd)
+                    if record.cwd else None) if record else None
         return self._memory_native_contexts.get((agent_id, session_id))
 
     def _record_context(self, agent_id: str, session_id: str,
@@ -139,19 +146,11 @@ class SessionSupervisor:
         else:
             self._memory_native_contexts[(agent_id, session_id)] = (runtime_id, cwd)
 
-    def _recorded_context_keys(
-            self, agent_ids: set[str]) -> list[tuple[str, str]]:
-        if self.local_store is None:
-            return []
-        keys: list[tuple[str, str]] = []
-        for agent_id in agent_ids:
-            try:
-                sessions = self.local_store.native_context_sessions(agent_id)
-            except Exception:
-                log.exception("Could not list local agent context markers")
-                continue
-            keys.extend((agent_id, session_id) for session_id in sessions)
-        return keys
+    def _reserve_context(self, agent_id, session_id, runtime_id, cwd) -> None:
+        if self.local_store is not None:
+            self.local_store.reserve_native_context(agent_id, session_id, runtime_id, cwd)
+        else:
+            self._record_context(agent_id, session_id, runtime_id, cwd)
 
     # -- transport attach/detach ------------------------------------------
 
@@ -350,26 +349,14 @@ class SessionSupervisor:
                 for key, pty in list(self.ptys.items()):
                     if key[0] in removed_agent_ids:
                         try:
-                            pty.kill()
+                            self._stop_session(pty)
                         except Exception:
                             pass
                         self.ptys.pop(key, None)
                         self.pty_instances.pop(key, None)
                         self.pty_surfaces.pop(key, None)
-                for key in list(self._memory_native_contexts):
-                    if key[0] in removed_agent_ids:
-                        self._memory_native_contexts.pop(key, None)
-                if self.local_store is not None:
-                    # Local resume markers for deleted agents are meaningless.
-                    # The provider transcript itself is never touched here.
-                    for agent_id, session_id in self._recorded_context_keys(
-                            removed_agent_ids):
-                        try:
-                            self.local_store.forget_native_context(
-                                agent_id, session_id)
-                        except Exception:
-                            log.exception(
-                                "Could not clear a local agent context marker")
+                # Inventory omission must not erase native history. Re-adding
+                # an agent must not turn an old ID into a create request.
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
@@ -433,7 +420,7 @@ class SessionSupervisor:
             self._invalidate_open(key)
             p = self.ptys.pop(key, None)
             if p:
-                p.kill()
+                self._stop_session(p)
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
         elif t == "list_sessions":
@@ -567,6 +554,7 @@ class SessionSupervisor:
                 "message": "Local project is unavailable. Restore or rebind the workspace, then retry.",
             })
             return
+        info = dict(info)  # snapshot across asynchronous availability probing
         configured_runtime = info.get("runtime", "mock")
         try:
             if surface:
@@ -604,6 +592,11 @@ class SessionSupervisor:
         capability = await asyncio.to_thread(
             probe_family, adapter.family_id, include_models=False)
         if not current():
+            return
+        if self.agents.get(agent_id) != info:
+            self.emit({"type": "runtime.unavailable", "agent_id": agent_id,
+                       "session_id": session_id, "code": "configuration_changed",
+                       "message": "Agent configuration changed during startup. Retry."})
             return
         can_spawn, reason = availability(capability, confirmed_surface)
         if not can_spawn:
@@ -660,32 +653,51 @@ class SessionSupervisor:
         if structured:
             attachment = runtimes.attachment_control(runtime_id)
             context_control = adapter.context_control
-            context_error = None
+            effective_cwd = os.path.normcase(os.path.realpath(os.path.abspath(
+                info.get("cwd") or os.getcwd())))
+            recorded = None
             resume_context = False
-            if context_control is not None:
-                # A recorded transcript means this session already exists inside
-                # the provider CLI, so the next process must resume instead of
-                # creating it. Mismatches fail closed: silently starting a fresh
-                # context under an existing conversation would mislead the user.
+            context_error = None
+
+            def refresh_context() -> None:
+                nonlocal recorded, resume_context, context_error
                 recorded = self._recorded_context(agent_id, session_id)
-                if recorded is not None:
-                    resume_context = True
-                    recorded_runtime, recorded_cwd = recorded
-                    if recorded_runtime != runtime_id:
-                        context_error = (
-                            "This session's agent runtime changed, so its earlier "
-                            "context cannot be resumed. Start a new session.")
-                    elif (context_control.resume_scope == "cwd"
-                          and recorded_cwd != info.get("cwd")):
-                        context_error = (
-                            "This session's local project changed, so its earlier "
-                            "context cannot be resumed. Restore the original "
-                            "project or start a new session.")
+                resume_context = recorded is not None
+                context_error = None
+                if recorded is not None and recorded[0] != runtime_id:
+                    context_error = (
+                        "This session's agent runtime changed, so its earlier context "
+                        "cannot be resumed. Start a new session.")
+                elif (recorded is not None and context_control.resume_scope == "cwd"
+                      and recorded[1] != effective_cwd):
+                    context_error = (
+                        "This session's local project changed, so its earlier context "
+                        "cannot be resumed. Restore the original project or start a new session.")
+
+            if context_control is not None:
+                refresh_context()
+
+            def prepare_context() -> None:
+                # Called only while holding native writer ownership. Open-time
+                # state alone cannot decide between create and resume.
+                refresh_context()
+                if context_error:
+                    raise ValueError(context_error)
+                if self._stopped or self.agents.get(agent_id) != info:
+                    raise ValueError("Agent configuration changed. Reopen the session before sending.")
+                if recorded is None:
+                    try:
+                        self._reserve_context(agent_id, session_id, runtime_id, effective_cwd)
+                    except Exception:
+                        raise ValueError(
+                            "Could not reserve native conversation state. No agent process was started.") from None
 
             async def context_started() -> None:
-                """The runtime accepted our session, so later turns must resume."""
                 nonlocal resume_context
-                self._record_context(agent_id, session_id, runtime_id, info.get("cwd"))
+                # Machine-scoped recovery preserves the original binding marker.
+                self._record_context(
+                    agent_id, session_id, runtime_id,
+                    recorded[1] if recorded is not None else effective_cwd)
                 resume_context = True
 
             def sanitize_options(value):
@@ -710,7 +722,8 @@ class SessionSupervisor:
 
             from .agent_session import TRANSLATORS
             p = StructuredAgentSession(
-                cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows,
+                cmd, effective_cwd if context_control else info.get("cwd"),
+                on_output, on_exit, cols=cols, rows=rows,
                 translate=TRANSLATORS.get(runtime_id),
                 per_turn=adapter.per_turn,
                 prompt_argv=list(adapter.prompt_argv),
@@ -731,8 +744,10 @@ class SessionSupervisor:
                     (lambda previous, current: runtimes.live_control_requests(
                         adapter.id, previous, current))
                     if adapter.live_controls else None),
-                context_started=(context_started
-                                 if context_control is not None else None))
+                context_started=(context_started if context_control else None),
+                context_preparing=(prepare_context if context_control else None),
+                writer_lease_factory=(lambda: NativeWriterLease(
+                    self._native_lock_root, adapter.family_id, session_id)) if context_control else None)
         else:
             p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
                            cols=cols, rows=rows)
@@ -749,7 +764,7 @@ class SessionSupervisor:
             if self.ptys.get(key) is not p:
                 # start() can raise or be cancelled after creating a child.
                 try:
-                    p.kill()
+                    self._stop_session(p)
                 except Exception:
                     pass
         self.emit({"type": "ready", "agent_id": agent_id,
@@ -773,6 +788,19 @@ class SessionSupervisor:
             **spool_status,
         }
 
+    def _stop_session(self, session) -> None:
+        session.kill()
+        waiter = getattr(session, "wait_closed", None)
+        if waiter is not None:
+            task = asyncio.create_task(waiter())
+            self._close_tasks.add(task)
+            task.add_done_callback(self._close_tasks.discard)
+
+    async def wait_closed(self) -> None:
+        """Drain reapers before closing the event loop or local SQLite store."""
+        while self._close_tasks:
+            await asyncio.gather(*tuple(self._close_tasks), return_exceptions=True)
+
     def shutdown(self) -> None:
         """Stop all sessions on supervisor exit. Never called on detach."""
         if self._stopped:
@@ -786,7 +814,7 @@ class SessionSupervisor:
         self.pty_surfaces.clear()
         for p in sessions:
             try:
-                p.kill()
+                self._stop_session(p)
             except Exception:
                 pass
         self._spool.close()

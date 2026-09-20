@@ -235,14 +235,28 @@ the connection. Valid legacy wire forms remain supported at this boundary.
   history.
 - Structured adapters may declare a `ContextControl` (`connector/runtimes.py`)
   naming the flags that create and resume a provider-owned conversation. The
-  supervisor passes AgentBridge's own session ID: the first turn uses the create
-  flag, later turns use the resume flag. A marker is written to the connector's
-  `native_context` table only after a turn completes without error, so a failed
-  first turn never claims a transcript exists. Persistent and per-turn runtimes
-  both spawn through the adapter's command builder, so continuity flags apply to
-  each process. Resume is refused when the recorded runtime changed, or when a
-  `cwd`-scoped runtime's project directory changed; the turn ends with a visible
-  error instead of an empty conversation.
+  supervisor passes AgentBridge's own session ID. Under a family/session writer
+  lock it re-reads the durable marker, reserves `state=attempted` before create,
+  and promotes it to `established` after a successful turn. Existing reservations
+  always resume, even if a failed first launch left no provider transcript; there
+  is no create fallback. `BEGIN IMMEDIATE` serializes marker read/check/write;
+  failure to promote fences input. Inventory omission does not delete markers.
+  Effective cwd is captured (including inherited cwd), and changed runtime or
+  cwd-scoped project bindings are refused. Configuration changed during probing
+  is rejected. Eager and lazy launches both use the command builder; the previous
+  lazy supervisor path already did so, so the earlier eager-path fix was not a
+  demonstrated production-Claude context-loss root cause.
+- `native_writer.py` provides a user-local, non-blocking OS lock and fsynced
+  active journal. Scope is runtime family + session ID, not agent/cwd/database.
+  The lock spans per-turn idle gaps and is released after confirmed child reap;
+  cancelled/late spawn and full-pipe cleanup are regression-tested. Uncertain
+  cleanup keeps the journal active for explicit recovery, never TTL/PID takeover.
+  `StructuredAgentSession.wait_closed()` and supervisor reaper tracking let CLI
+  shutdown finish cleanup before closing the local store/event loop.
+- `agentbridge context status|release` (`connector/cli.py`) inspects/recovers
+  guards locally without starting a connector or CLI. Release requires the exact
+  journal owner plus `--confirm-writer-stopped`, and cannot break a live OS lock.
+  That flag is human attestation, not automatic verification that an orphan died.
 - Adding a new runtime is one registry entry plus an adapter — no server or
   browser changes.
 

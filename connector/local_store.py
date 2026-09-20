@@ -129,6 +129,7 @@ class NativeContext:
     cwd: str | None
     established_at: str
     updated_at: str
+    state: str = "established"
 
 
 @dataclass(frozen=True)
@@ -187,7 +188,7 @@ class LocalProjectStore:
         self._conn = sqlite3.connect(self.path, timeout=5.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         with self._lock:
             self._conn.execute(
@@ -214,6 +215,12 @@ class LocalProjectStore:
                 )
                 """
             )
+            context_columns = {row[1] for row in self._conn.execute(
+                "PRAGMA table_info(native_context)")}
+            if "state" not in context_columns:
+                self._conn.execute(
+                    "ALTER TABLE native_context ADD COLUMN state TEXT NOT NULL "
+                    "DEFAULT 'established'")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS local_skill (
@@ -353,7 +360,7 @@ class LocalProjectStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT agent_id, session_id, runtime_id, cwd, "
-                "established_at, updated_at FROM native_context "
+                "established_at, updated_at, state FROM native_context "
                 "WHERE agent_id = ? AND session_id = ?",
                 (agent_id, session_id),
             ).fetchone()
@@ -377,34 +384,70 @@ class LocalProjectStore:
             ).fetchall()
         return [row["session_id"] for row in rows]
 
+    def reserve_native_context(self, agent_id: str, session_id: str,
+                               runtime_id: str, cwd: str | None) -> NativeContext:
+        """Reserve an ID before spawn; an uncertain attempt may only resume.
+
+        This does not assert that a provider transcript exists. A crash or
+        failed first turn must never make us reuse the ID as a new conversation.
+        """
+        return self._write_native_context(
+            agent_id, session_id, runtime_id, cwd, established=False)
+
     def establish_native_context(self, agent_id: str, session_id: str,
                                  runtime_id: str, cwd: str | None) -> NativeContext:
-        """Persist a provider transcript only after the CLI confirms it exists."""
+        """Record a successful native turn, not an identifier equality proof."""
+        return self._write_native_context(
+            agent_id, session_id, runtime_id, cwd, established=True)
+
+    def _write_native_context(self, agent_id, session_id, runtime_id, cwd,
+                              *, established: bool) -> NativeContext:
         for label, value in (("agent id", agent_id), ("session id", session_id),
                              ("runtime id", runtime_id)):
-            if (not isinstance(value, str) or not value
+            if (not isinstance(value, str) or not value.strip()
                     or any(ord(ch) < 0x20 for ch in value)):
                 raise ValueError(f"invalid {label}")
-        normalized_cwd = self._canonical_path(cwd) if cwd is not None else None
-        existing = self.native_context(agent_id, session_id)
-        if existing is not None and (
-                existing.runtime_id != runtime_id or existing.cwd != normalized_cwd):
-            raise ValueError(
-                "native context already belongs to another runtime or project")
+        normalized_cwd = self._normalized_path(cwd) if cwd is not None else None
         now = str(time.time())
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO native_context "
-                "(agent_id, session_id, runtime_id, cwd, established_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(agent_id, session_id) DO UPDATE "
-                "SET updated_at = excluded.updated_at",
-                (agent_id, session_id, runtime_id, normalized_cwd, now, now),
-            )
-            self._conn.commit()
-        value = self.native_context(agent_id, session_id)
-        assert value is not None
-        return value
+            # The read/check/write is atomic across independent connections.
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT agent_id, session_id, runtime_id, cwd, established_at, updated_at, state "
+                    "FROM native_context WHERE agent_id=? AND session_id=?", (agent_id, session_id),
+                ).fetchone()
+                previous = NativeContext(**dict(row)) if row else None
+                if previous is not None:
+                    previous_cwd = os.path.normcase(previous.cwd) if previous.cwd else None
+                    if previous.runtime_id != runtime_id or previous_cwd != (os.path.normcase(normalized_cwd) if normalized_cwd else None):
+                        raise ValueError("native context already belongs to another runtime or project")
+                    self._conn.execute(
+                        "UPDATE native_context SET updated_at=?, state=?, established_at=? "
+                        "WHERE agent_id=? AND session_id=?",
+                        (now, "established" if established else previous.state,
+                         (previous.established_at or now) if established else previous.established_at,
+                         agent_id, session_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "INSERT INTO native_context "
+                        "(agent_id, session_id, runtime_id, cwd, established_at, updated_at, state) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (agent_id, session_id, runtime_id, normalized_cwd,
+                         now if established else "", now,
+                         "established" if established else "attempted"),
+                    )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            row = self._conn.execute(
+                "SELECT agent_id, session_id, runtime_id, cwd, established_at, updated_at, state "
+                "FROM native_context WHERE agent_id=? AND session_id=?", (agent_id, session_id),
+            ).fetchone()
+            assert row is not None
+            return NativeContext(**dict(row))
 
     def resolve_agents(self, agents: Iterable[dict]) -> tuple[dict[str, dict], list[dict]]:
         """Resolve project ids locally and migrate legacy server-provided cwd values.
