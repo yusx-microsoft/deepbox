@@ -68,6 +68,7 @@ function harness({role='owner', localRole='owner', mockedDialogs}={}){
     throw new Error(`Unexpected API ${method} ${path}`);
   };
   h.dialogs = mockedDialogs || browser.loadModule('dialogs.js').createDialogs(browser.document);
+  h.chat = browser.loadModule('chat.js');
   h.management = browser.loadModule('management.js').createManagement({
     api:async(path, options={})=>{
       h.calls.push({path, method:options.method || 'GET', body:options.body ? JSON.parse(options.body) : undefined});
@@ -100,7 +101,8 @@ test('UMD and CommonJS export only the public management factory and methods', (
   assert.deepEqual(Object.keys(require('./management.js')), ['createManagement']);
   const h = harness();
   assert.deepEqual(Object.keys(h.management).sort(), ['createWorkspace','manageWorkspace','presentInvitation','admin',
-    'createMachine','rotateMachineToken','deleteMachine','createAgent','deleteAgent','showRuntimes','showSkills'].sort());
+    'createMachine','rotateMachineToken','deleteMachine','createAgent','agentSettings','hasAgentSettings',
+    'deleteAgent','showRuntimes','showSkills'].sort());
 });
 
 test('real workspace dialog preserves Viewer until an explicit role Save; invitations default Operator', async()=>{
@@ -538,4 +540,381 @@ test('workspace creation and owner metadata loads cannot cross an authentication
   h.ctx.user = {...h.ctx.user, id:'different-owner'};
   loaded.resolve([{id:'private-user', role:'member', username:'private-username'}]); await flush();
   assert.equal(h.root(), null); assert.doesNotMatch(h.document.body.textContent, /private-username/);
+});
+
+function deeporcaHarness(options){
+  const h=harness(options);
+  h.agent={id:'native',handle:'native-helper',display_name:'Local helper',runtime:'deeporca',local_project_id:'p1',
+    runtime_config:{integration_version:1,profile:{mode:'create',configuration_template_ref:'connector-default'}},
+    runtime_status:{state:'needs_configuration',code:'configuration_required'}};
+  h.box=h.ctx.devboxes[0];h.box.online=true;h.box.agents=[h.agent];
+  h.box.capabilities.runtimes.push({runtime:'deeporca',installed:true,
+    agent_config:{profile_modes:['create'],configuration_templates:[{id:'connector-default',label:'Connector default'}]}});
+  h.field=()=>h.root().querySelector('[data-field="display_name"]');
+  h.error=()=>h.root().querySelector('[data-error]').textContent;
+  h.open=async()=>{h.management.agentSettings('native');await flush();};
+  return h;
+}
+
+const modelValues={base_url:'http://localhost:11434/v1',model:'provider/test-model',context_window:'32768',reasoning_effort:'high'};
+const modelConfig={provider:'openai',...modelValues,context_window:32768};
+function fillModel(root){
+  for(const [name,value] of Object.entries(modelValues)) change(root.querySelector(`[data-field="${name}"]`),value);
+}
+
+test('runtime UI creation owns configuration fields while management requires registered project metadata', async()=>{
+  const h=deeporcaHarness(), loaded=[], load=h.chat.loadLocalModule;
+  h.chat.loadLocalModule=id=>{loaded.push(id);return load(id);};
+  h.management.createAgent('m1');await flush();
+  const root=h.root(), runtime=root.querySelector('[data-field="runtime"]');
+  const project=root.querySelector('[data-field="local_project_id"]');
+  const endpoint=root.querySelector('[data-field="base_url"]'), auth=root.querySelector('[data-field="auth_mode"]');
+  assert.deepEqual(loaded,['runtime-catalog']);
+  assert.equal(root.querySelector('[data-field="template"]'),null);
+  assert.equal(endpoint.closest('.field').hidden,true);assert.equal(endpoint.disabled,true);assert.equal(project.required,false);
+  change(runtime,'deeporca');
+  assert.equal(endpoint.closest('.field').hidden,false);assert.equal(endpoint.disabled,false);assert.equal(project.required,true);
+  assert.equal(project.getAttribute('aria-required'),'true');
+  assert.deepEqual(auth.querySelectorAll('option').map(option=>option.value),['api_key','none']);
+  assert.equal(auth.value,'api_key');assert.equal(root.querySelector('[data-field="api_key"]').getAttribute('type'),'password');
+  assert.match(root.textContent,/Model connection/);assert.match(root.textContent,/Model behavior/);
+  assert.match(root.textContent,/Automatic managed profile, created on the Connector from its default template/);
+  assert.doesNotMatch(root.textContent,/display name follows/);
+  root.querySelector('[data-field="handle"]').value='new-helper';
+  fillModel(root);change(auth,'none');
+  assert.equal(root.querySelector('[data-field="api_key"]').disabled,true);
+  submit(root);await flush();
+  assert.equal(h.calls.length,0);assert.match(root.querySelector('[data-error]').textContent,/DeepOrca requires a registered local project/);
+  change(project,'p1');
+  h.apiHook=(path, options)=>{
+    const body=JSON.parse(options.body);
+    const created={id:'created-native',...body,runtime_status:{state:'pending'}};
+    h.box.agents.push(created);return created;
+  };
+  submit(root);await flush();
+  assert.deepEqual(h.calls,[{path:'/api/devboxes/m1/agents',method:'POST',body:{
+    handle:'new-helper',display_name:'new-helper',runtime:'deeporca',local_project_id:'p1',
+    runtime_config:{integration_version:1,profile:{mode:'create',configuration_template_ref:'connector-default'},
+      llm:modelConfig,credential:{mode:'none'}}}}]);
+  assert.doesNotMatch(JSON.stringify(h.calls),/api_key/);
+  assert.notEqual(h.root(),root);assert.equal(h.field().value,'new-helper');
+  assert.equal(h.root().querySelector('[data-runtime-status] .pill').textContent,'Pending');
+  assert.deepEqual(loaded,['runtime-catalog','runtime-catalog']);
+  await h.close();
+});
+
+test('switching from DeepOrca to a CLI runtime keeps its draft private and sends only CLI metadata', async()=>{
+  const h=deeporcaHarness(), original=clone(h.agent);
+  h.management.createAgent('m1');await flush();
+  const root=h.root(), runtime=root.querySelector('[data-field="runtime"]');
+  change(runtime,'deeporca');fillModel(root);
+  root.querySelector('[data-field="api_key"]').value='private-unsent-draft-key';
+  change(runtime,'codex');
+  for(const name of ['base_url','model','auth_mode','api_key','context_window','reasoning_effort']){
+    const field=root.querySelector(`[data-field="${name}"]`);
+    assert.equal(field.disabled,true);assert.equal(field.closest('.field').hidden,true);
+  }
+  assert.equal(root.querySelector('[data-field="local_project_id"]').required,false);
+  change(runtime,'deeporca');
+  assert.equal(root.querySelector('[data-field="model"]').value,modelValues.model);
+  assert.equal(root.querySelector('[data-field="api_key"]').value,'private-unsent-draft-key');
+  change(runtime,'codex');root.querySelector('[data-field="handle"]').value='cli-helper';
+  submit(root);await flush();
+  assert.deepEqual(h.calls,[{path:'/api/devboxes/m1/agents',method:'POST',body:{
+    handle:'cli-helper',display_name:'cli-helper',runtime:'codex',local_project_id:null,runtime_config:{}}}]);
+  assert.doesNotMatch(JSON.stringify(h.calls),/private-unsent-draft-key|provider\/test-model|api_key/);
+  assert.deepEqual(h.agent,original);assert.equal(h.root(),null);
+  assert.deepEqual(h.detached,[]);assert.deepEqual(h.selections,[]);
+});
+
+test('CLI creation stays optional and does not load any runtime UI', async()=>{
+  const h=harness();
+  h.chat.loadLocalModule=()=>{throw new Error('CLI must not load runtime UI');};
+  await h.management.agentSettings('a1');assert.equal(h.root(),null);
+  h.management.createAgent('m1');await flush();
+  const root=h.root();
+  assert.equal(root.querySelector('[data-field="template"]'),null);
+  assert.equal(root.querySelector('[data-field="local_project_id"]').required,false);
+  root.querySelector('[data-field="handle"]').value='cli-helper';
+  submit(root);await flush();
+  assert.deepEqual(h.calls,[{path:'/api/devboxes/m1/agents',method:'POST',body:{
+    handle:'cli-helper',display_name:'cli-helper',runtime:'claude',local_project_id:null,runtime_config:{}}}]);
+  assert.equal(h.root(),null);
+});
+
+test('management discovers creation and settings through the runtime contract, not runtime IDs', async t=>{
+  const h=deeporcaHarness(), contract=h.chat.runtimeContract({runtime:'deeporca'});
+  const capability=h.box.capabilities.runtimes.find(item=>item.runtime==='deeporca');
+  capability.runtime=h.agent.runtime='managed-test';
+  h.chat.runtimeContract=agent=>agent?.runtime==='managed-test' ? {...contract,label:'Managed test'} : {};
+  await t.test('creation fields follow the delegated runtime',async()=>{
+    h.management.createAgent('m1');await flush();
+    const root=h.root();change(root.querySelector('[data-field="runtime"]'),'managed-test');
+    assert.equal(root.querySelector('[data-field="local_project_id"]').required,true);
+    assert.match(root.querySelector('[data-project-help]').textContent,/Managed test requires/);
+    assert.equal(root.querySelector('[data-field="template"]'),null);
+    assert.equal(root.querySelector('[data-field="base_url"]').closest('.field').hidden,false);
+    assert.equal(root.querySelector('[data-field="base_url"]').disabled,false);
+  });
+  await t.test('settings recheck the current runtime contract',async()=>{
+    await h.close();await h.open();assert.equal(h.field().value,'Local helper');
+    h.chat.runtimeContract=()=>({});
+    h.field().value='Not authorized';submit(h.root());await flush();assert.equal(h.calls.length,0);
+    assert.equal(h.agent.display_name,'Local helper');await h.close();
+  });
+});
+
+test('runtime UI modules still use the fixed local allowlist', async()=>{
+  const h=deeporcaHarness();
+  h.chat.runtimeContract=()=>({agentUiModule:'https://invalid.example/agent-ui.js',label:'Unsupported'});
+  h.management.createAgent('m1');await flush();
+  assert.match(h.root().textContent,/Unsupported setup unavailable/);
+  assert.equal(h.root().querySelector('[data-field="handle"]'),null);
+  assert.equal(h.calls.length,0);
+});
+
+test('runtime UI loading rechecks modal lifetime, context and management authorization', async t=>{
+  const changes={
+    role:h=>{h.ctx.workspace.role='viewer';},
+    epoch:h=>{h.ctx.epoch++;},
+    removed:h=>{h.ctx.devboxes=[];},
+    replacement:h=>{h.dialogs.modal({title:'Replacement',actions:[{label:'Done'}]});},
+    closed:h=>h.dialogs.close(),
+  };
+  for(const operation of ['create','settings']){
+    for(const [name,change] of Object.entries(changes)) await t.test(operation+' '+name,async()=>{
+      const h=deeporcaHarness(), gate=deferred(), ui=await h.chat.loadLocalModule('runtime-catalog');
+      let loads=0;h.chat.loadLocalModule=()=>{loads++;return gate.promise;};
+      if(operation==='create') h.management.createAgent('m1');else h.management.agentSettings('native');
+      await flush();assert.equal(loads,1);change(h);gate.resolve(ui);await flush();
+      assert.equal(h.root()?.querySelector('form') || null,null);assert.equal(h.calls.length,0);
+      if(name==='replacement') assert.match(h.root().textContent,/Replacement/);
+      else assert.equal(h.root(),null);
+    });
+  }
+});
+
+test('DeepOrca settings reopen with immutable metadata, safe readiness and only a display rename payload', async()=>{
+  const h=deeporcaHarness();
+  h.agent.runtime_config.credentials='PRIVATE_TOKEN';h.agent.runtime_status.message='C:/private/credentials';
+  const originalConfig=clone(h.agent.runtime_config);
+  await h.open();
+  for(const text of [/Agent settings/,/Project One/,/@native-helper/,/Needs configuration/,/configuration_required/]) assert.match(h.root().textContent,text);
+  assert.doesNotMatch(h.root().textContent,/PRIVATE_TOKEN|C:\/private/);
+  assert.equal(h.root().querySelector('[data-runtime-status] .pill').textContent,'Needs configuration');
+  assert.match(h.root().textContent,/Model connection/);assert.match(h.root().textContent,/Model behavior/);
+  for(const name of ['base_url','model','context_window','reasoning_effort']){
+    const field=h.root().querySelector(`[data-field="${name}"]`);
+    assert.equal(field.value,'');assert.equal(field.disabled,false);assert.equal(!!field.readOnly,false);
+  }
+  const auth=h.root().querySelector('[data-field="auth_mode"]');
+  assert.equal(auth.value,'keep');
+  assert.deepEqual(auth.querySelectorAll('option').map(option=>option.value),['keep','api_key','none']);
+  assert.equal(h.root().querySelector('[data-field="api_key"]').value,'');
+  assert.equal(h.root().querySelector('[data-field="api_key"]').disabled,true);
+  for(const name of ['handle','runtime','local_project_id','template','runtime_config'])
+    assert.equal(h.root().querySelector(`[data-field="${name}"]`),null);
+  h.field().value='Renamed helper';
+  h.apiHook=async()=>({...h.agent,display_name:'Renamed helper'});
+  submit(h.root());await flush();
+  assert.deepEqual(h.calls,[{path:'/api/agents/native',method:'PATCH',body:{display_name:'Renamed helper'}}]);
+  assert.equal(h.agent.handle,'native-helper');assert.equal(h.agent.display_name,'Renamed helper');
+  assert.equal(h.agent.local_project_id,'p1');assert.equal(h.box.agents.length,1);
+  assert.deepEqual(h.agent.runtime_config,originalConfig);
+  await h.close();await h.open();assert.equal(h.field().value,'Renamed helper');
+  assert.equal(h.root().querySelector('[data-field="auth_mode"]').value,'keep');await h.close();
+});
+
+test('DeepOrca settings preserve failed model drafts, keep credentials without replay and require explicit auth for endpoint changes', async()=>{
+  const h=deeporcaHarness();
+  h.agent.runtime_config={...h.agent.runtime_config,llm:clone(modelConfig),credential:{mode:'sealed',ciphertext:'PRIVATE_STORED_ENVELOPE'}};
+  const profile=clone(h.agent.runtime_config.profile);
+  await h.open();const root=h.root(), auth=root.querySelector('[data-field="auth_mode"]');
+  for(const [name,value] of Object.entries(modelValues)) assert.equal(root.querySelector(`[data-field="${name}"]`).value,value);
+  assert.equal(auth.value,'keep');assert.equal(root.querySelector('[data-field="api_key"]').value,'');
+  assert.doesNotMatch(root.textContent,/PRIVATE_STORED_ENVELOPE/);
+  h.field().value='Configured helper';
+  const edits={model:'provider/updated-model',context_window:'65536',reasoning_effort:'max'};
+  for(const [name,value] of Object.entries(edits)) change(root.querySelector(`[data-field="${name}"]`),value);
+  h.apiHook=()=>{throw new Error('Model update failed');};
+  submit(root);await flush();
+  const expected={display_name:'Configured helper',runtime_config:{integration_version:1,profile,
+    llm:{...modelConfig,...edits,context_window:65536}}};
+  assert.deepEqual(h.calls,[{path:'/api/agents/native',method:'PATCH',body:expected}]);
+  assert.equal(h.root(),root);assert.match(h.error(),/Model update failed/);
+  assert.equal(h.field().value,'Configured helper');assert.equal(h.agent.display_name,'Local helper');
+  for(const [name,value] of Object.entries(edits)){
+    const field=root.querySelector(`[data-field="${name}"]`);
+    assert.equal(field.value,value);assert.equal(field.disabled,false);
+  }
+  assert.deepEqual(h.agent.runtime_config.llm,modelConfig);assert.equal(auth.value,'keep');
+  h.apiHook=(path,options)=>{
+    const payload=JSON.parse(options.body);
+    return {...h.agent,...payload,runtime_config:{...h.agent.runtime_config,...payload.runtime_config}};
+  };
+  submit(root);await flush();
+  assert.equal(h.calls.length,2);assert.deepEqual(h.calls[1].body,expected);
+  assert.equal(h.agent.display_name,'Configured helper');assert.equal(root.querySelector('[data-submit]').textContent,'Saved');
+  assert.deepEqual(h.agent.runtime_config.credential,{mode:'sealed',ciphertext:'PRIVATE_STORED_ENVELOPE'});
+  const endpoint=root.querySelector('[data-field="base_url"]');
+  change(endpoint,'https://different-provider.invalid/v1');endpoint.dispatchEvent({type:'input'});
+  submit(root);await flush();
+  assert.equal(h.calls.length,2);assert.match(h.error(),/Endpoint changed/);
+  assert.equal(endpoint.value,'https://different-provider.invalid/v1');assert.equal(auth.value,'keep');
+  change(auth,'none');submit(root);await flush();
+  assert.equal(h.calls.length,3);
+  assert.deepEqual(h.calls[2].body,{...expected,runtime_config:{...expected.runtime_config,
+    llm:{...expected.runtime_config.llm,base_url:'https://different-provider.invalid/v1'},credential:{mode:'none'}}});
+  assert.doesNotMatch(JSON.stringify(h.calls),/PRIVATE_STORED_ENVELOPE|api_key/);
+  assert.deepEqual(h.agent.runtime_config.profile,profile);assert.equal(h.agent.handle,'native-helper');
+  assert.equal(h.agent.local_project_id,'p1');assert.equal(h.box.agents.length,1);
+  assert.equal(auth.value,'keep');assert.equal(root.querySelector('[data-field="api_key"]').value,'');
+  assert.deepEqual(h.detached,[]);assert.deepEqual(h.selections,[]);await h.close();
+  await h.open();assert.equal(h.field().value,'Configured helper');
+  assert.equal(h.root().querySelector('[data-field="base_url"]').value,'https://different-provider.invalid/v1');
+  assert.equal(h.root().querySelector('[data-field="model"]').value,edits.model);await h.close();
+});
+
+test('DeepOrca refresh is read-only; retry POST has no binding body and cannot duplicate an Agent', async()=>{
+  const h=deeporcaHarness();await h.open();
+  const binding=JSON.stringify(h.agent.runtime_config), refreshes=h.refreshes;
+  h.field().value='Unsaved draft';
+  h.root().querySelector('[data-refresh-status]').click();await flush();
+  assert.equal(h.refreshes,refreshes+1);assert.equal(h.calls.length,0);
+  assert.equal(h.field().value,'Unsaved draft');
+  const gate=deferred();h.apiHook=()=>gate.promise;
+  const retry=h.root().querySelector('[data-retry-runtime]');retry.click();retry.click();
+  submit(h.root());h.root().querySelector('[data-refresh-status]').click();
+  assert.equal(h.calls.length,1);assert.equal(retry.disabled,true);assert.equal(h.field().disabled,true);
+  assert.deepEqual(h.calls[0],{path:'/api/agents/native/runtime/retry',method:'POST',body:undefined});
+  gate.resolve({...h.agent,runtime_status:{state:'pending'}});await flush();
+  assert.equal(h.box.agents.length,1);assert.equal(JSON.stringify(h.agent.runtime_config),binding);
+  assert.equal(h.root().querySelector('[data-runtime-status] .pill').textContent,'Pending');assert.equal(retry.hidden,true);
+  assert.equal(h.field().value,'Unsaved draft');assert.equal(h.field().disabled,false);
+  h.agent.runtime_status={state:'ready'};
+  h.root().querySelector('[data-refresh-status]').click();await flush();
+  assert.match(h.root().textContent,/not been verified/);assert.equal(retry.hidden,true);assert.equal(h.calls.length,1);
+});
+
+test('DeepOrca retry is offered only for repairable states, with safe codes and offline guidance', async t=>{
+  for(const state of ['pending','provisioning','ready','needs_configuration','error','C:/private/state']){
+    await t.test(state,async()=>{
+      const h=deeporcaHarness();h.box.online=false;
+      h.agent.runtime_status={state,code:'C:/private/token',message:'PRIVATE_DIAGNOSTIC'};
+      await h.open();
+      assert.equal(h.root().querySelector('[data-retry-runtime]').hidden,!['needs_configuration','error'].includes(state));
+      assert.match(h.root().textContent,/Connector offline/);
+      assert.doesNotMatch(h.root().textContent,/C:\/private|PRIVATE_DIAGNOSTIC/);assert.equal(h.calls.length,0);
+    });
+  }
+});
+
+test('DeepOrca settings deny nonmanagers, other-workspace Agents and all CLI Agents', async t=>{
+  for(const variant of ['operator','viewer','wrong workspace','CLI','missing']){
+    await t.test(variant,async()=>{
+      const h=deeporcaHarness();
+      if(['operator','viewer'].includes(variant)) h.ctx.workspace.role=variant;
+      if(variant==='wrong workspace') h.box.workspace_id='other';
+      if(variant==='CLI') h.agent.runtime='cli';
+      if(variant==='missing') h.box.agents=[];
+      await h.open();assert.equal(h.root(),null);assert.equal(h.refreshes,0);assert.equal(h.calls.length,0);
+    });
+  }
+  const h=deeporcaHarness({role:'admin'});await h.open();assert.ok(h.field());
+});
+
+test('DeepOrca writes recheck workspace, identity, role, epoch and Agent ownership before HTTP', async t=>{
+  const changes = {
+    workspace:h=>{h.ctx.workspace={id:'other',role:'owner'};},
+    user:h=>{h.ctx.user={id:8};}, role:h=>{h.ctx.workspace.role='operator';},
+    epoch:h=>{h.ctx.epoch++;}, moved:h=>{h.box.workspace_id='other';},
+    removed:h=>{h.box.agents=[];}, runtime:h=>{h.agent.runtime='cli';},
+  };
+  for(const [name,change] of Object.entries(changes)){
+    for(const operation of ['rename','retry']) await t.test(name+' '+operation,async()=>{
+      const h=deeporcaHarness();await h.open();h.field().value='Stale draft';const root=h.root();change(h);
+      if(operation==='rename') submit(root);else root.querySelector('[data-retry-runtime]').click();
+      await flush();assert.equal(h.calls.length,0);assert.equal(h.agent.display_name,'Local helper');
+    });
+  }
+});
+
+test('DeepOrca async payload preparation rechecks permissions and dialog lifetime before HTTP', async t=>{
+  for(const operation of ['create','settings']){
+    for(const variant of ['role','workspace','replacement','closed']) await t.test(operation+' '+variant,async()=>{
+      const h=deeporcaHarness(), gate=deferred(), ui=await h.chat.loadLocalModule('runtime-catalog');
+      const method=operation==='create' ? 'creationConfigFromValues' : 'settingsPayload';
+      let preparations=0;
+      // Hold the real validated payload at the same async boundary as credential encryption.
+      h.chat.loadLocalModule=async()=>({...ui,[method]:async(...args)=>{
+        const payload=await ui[method](...args);preparations++;await gate.promise;return payload;
+      }});
+      if(operation==='create'){
+        h.management.createAgent('m1');await flush();
+        change(h.root().querySelector('[data-field="runtime"]'),'deeporca');
+        change(h.root().querySelector('[data-field="local_project_id"]'),'p1');
+        h.root().querySelector('[data-field="handle"]').value='pending-helper';
+      } else await h.open();
+      const root=h.root(), original=clone(h.agent), refreshes=h.refreshes;
+      fillModel(root);change(root.querySelector('[data-field="auth_mode"]'),'none');
+      submit(root);await flush();
+      assert.equal(preparations,1);assert.equal(h.calls.length,0);assert.equal(root.querySelector('[data-submit]').disabled,true);
+      if(variant==='role') h.ctx.workspace.role='viewer';
+      if(variant==='workspace') h.switchWorkspace('w2');
+      if(variant==='replacement') h.dialogs.modal({title:'Replacement',bodyHtml:'Keep this dialog',actions:[{label:'Done'}]});
+      if(variant==='closed') h.dialogs.close();
+      const replacement=variant==='replacement' ? h.root() : null;
+      gate.resolve();await flush();
+      assert.equal(h.calls.length,0,'No request may escape after authorization or dialog ownership changes during preparation');
+      assert.deepEqual(h.agent,original);assert.equal(h.box.agents.length,1);assert.equal(h.refreshes,refreshes);
+      assert.deepEqual(h.detached,[]);assert.deepEqual(h.selections,[]);
+      if(replacement){assert.equal(h.root(),replacement);assert.match(replacement.textContent,/Keep this dialog/);}
+      if(variant==='closed' || variant==='workspace') assert.equal(h.root(),null);
+      await h.close();
+    });
+  }
+});
+
+test('DeepOrca stale async responses cannot mutate rows, refresh or replace another dialog', async t=>{
+  for(const operation of ['rename','retry']){
+    for(const change of ['role','workspace','replacement','closed']) await t.test(operation+' '+change,async()=>{
+      const h=deeporcaHarness();await h.open();const gate=deferred();h.apiHook=()=>gate.promise;
+      if(operation==='rename'){h.field().value='Late rename';submit(h.root());}
+      else h.root().querySelector('[data-retry-runtime]').click();
+      await flush();assert.equal(h.calls.length,1); // The async payload is prepared before testing an in-flight response.
+      const count=h.refreshes;
+      if(change==='role') h.ctx.workspace.role='viewer';
+      if(change==='workspace') h.ctx.workspace={id:'other',role:'owner'};
+      if(change==='replacement') h.dialogs.modal({title:'Replacement',bodyHtml:'Do not replace',actions:[{label:'Done'}]});
+      if(change==='closed') h.dialogs.close();
+      gate.resolve({...h.agent,display_name:'Late rename',runtime_status:{state:'pending'}});await flush();
+      assert.equal(h.agent.display_name,'Local helper');assert.equal(h.agent.runtime_status.state,'needs_configuration');
+      assert.equal(h.refreshes,count);assert.equal(h.calls.length,1);
+      if(change==='replacement') assert.match(h.root().textContent,/Replacement/);
+      if(change==='closed') assert.equal(h.root(),null);
+    });
+  }
+  for(const change of ['role','workspace','replacement']) await t.test('initial refresh '+change,async()=>{
+    const gate=deferred(),h=deeporcaHarness();h.refreshHook=()=>gate.promise;h.management.agentSettings('native');
+    if(change==='role') h.ctx.workspace.role='viewer';
+    if(change==='workspace') h.ctx.epoch++;
+    if(change==='replacement') h.dialogs.modal({title:'Replacement',bodyHtml:'Keep this',actions:[{label:'Done'}]});
+    gate.resolve();await flush();
+    assert.equal(h.root()?.querySelector('[data-field="display_name"]') || null,null);
+    if(change==='replacement') assert.match(h.root().textContent,/Replacement/);
+    assert.equal(h.calls.length,0);
+  });
+});
+
+test('DeepOrca failed retry and rename preserve drafts and allow explicit retry only', async()=>{
+  const h=deeporcaHarness();await h.open();h.field().value='Keep draft';
+  h.apiHook=async()=>{throw new Error('Connector request failed');};
+  h.root().querySelector('[data-retry-runtime]').click();await flush();
+  assert.match(h.error(),/Connector request failed/);assert.equal(h.field().value,'Keep draft');
+  assert.equal(h.root().querySelector('[data-retry-runtime]').disabled,false);
+  assert.equal(h.calls.length,1);assert.equal(h.box.agents.length,1);
+  submit(h.root());await flush();assert.match(h.error(),/Connector request failed/);
+  assert.equal(h.field().value,'Keep draft');assert.equal(h.calls.length,2);
+  h.field().value='x'.repeat(201);submit(h.root());await flush();assert.equal(h.calls.length,2);assert.match(h.error(),/at most 200/);
+  h.field().value='';submit(h.root());await flush();assert.equal(h.calls.length,2);
 });

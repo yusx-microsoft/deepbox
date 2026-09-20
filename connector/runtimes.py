@@ -261,6 +261,10 @@ class RuntimeAdapter:
     auth_argv: tuple[str, ...] = ()
     version_argv: tuple[str, ...] = ("--version",)
     allow_custom_models: bool = True
+    # Execution backend is independent of the browser surface. Library runtimes
+    # deliberately have no executable/argv and must go through a session factory.
+    backend: str = "cli"
+    renderer: str | None = None
     # Optional safe model-discovery hook. It receives stdout from a declared
     # argv probe and returns model ids; credentials and raw output never leave
     # the connector. Current CLIs without a stable listing command report their
@@ -285,10 +289,13 @@ class RuntimeAdapter:
     model_scope: str = "session"
     controls: tuple[RuntimeControl, ...] = ()
     live_controls: tuple[RuntimeLiveControl, ...] = ()
+    # Optional integration probe: (adapter, *, runner, include_models) -> public
+    # capability. The platform adds the common stable revision afterwards.
+    capability_probe: Callable[..., dict] | None = None
 
     @property
     def executable(self) -> str:
-        return self.base_argv[0]
+        return self.base_argv[0] if self.base_argv else ""
 
     @property
     def family_id(self) -> str:
@@ -331,6 +338,9 @@ class RuntimeAdapter:
             # Deliberately omit the connector-local executable path. The
             # server/browser need capabilities, not workstation filesystem data.
             "features": {
+                **({"backend": self.backend} if self.backend != "cli" else {}),
+                **({"renderer": self.renderer, "interactive_approval": False}
+                   if self.renderer else {}),
                 "session_lifecycle": 1,
                 "models": list(self.models),
                 "permission_modes": sorted(self.permission_modes),
@@ -367,8 +377,16 @@ def register(adapter: RuntimeAdapter, *, replace: bool = False) -> RuntimeAdapte
         raise ValueError(f"duplicate runtime id: {adapter.id!r}")
     # Declared adapters must name a bare executable (strict); this blocks a
     # runtime from smuggling an absolute path or shell payload as argv[0].
-    validate_executable(adapter.base_argv[0])
-    validate_argv(list(adapter.base_argv))
+    if adapter.backend not in {"cli", "python-library"}:
+        raise InvalidCommandError("unsupported runtime backend")
+    if adapter.backend == "cli":
+        if not adapter.base_argv:
+            raise InvalidCommandError("CLI adapter requires an executable")
+        validate_executable(adapter.base_argv[0])
+        validate_argv(list(adapter.base_argv))
+    elif adapter.base_argv or not adapter.structured or adapter.permission_modes:
+        raise InvalidCommandError(
+            "library runtimes require structured output and no CLI/approval arguments")
     # Validate declared permission-mode flag tokens up front.
     if adapter.surface_id not in {"structured", "terminal"}:
         raise InvalidCommandError(
@@ -508,6 +526,8 @@ def build_command(runtime_id: str, *, model: str | None = None,
             the resulting argv fails validation.
     """
     adapter = get(runtime_id)
+    if adapter.backend != "cli":
+        raise InvalidCommandError("library runtimes cannot be launched as CLI commands")
     argv: list[str] = list(adapter.base_argv)
 
     # -- model selection ---------------------------------------------------
@@ -614,6 +634,10 @@ _REGISTRY["mock"] = RuntimeAdapter(
     family="mock", surface="terminal", default_surface=True,
     version_argv=(), allow_custom_models=False,
 )
+
+from .integrations.deeporca.adapter import create_adapter as _deeporca_adapter
+
+register(_deeporca_adapter())
 
 _CLAUDE_PERSONAL_SKILL_ROOTS = ("~/.claude/skills", "~/.agents/skills")
 _CLAUDE_PROJECT_SKILL_ROOTS = (".claude/skills", ".agents/skills")

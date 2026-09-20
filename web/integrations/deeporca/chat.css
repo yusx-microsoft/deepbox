@@ -1,0 +1,70 @@
+/* Native WebUI patterns, pane scoped: neutral compact tool groups, faint
+ * thinking rail, distinct user bubble, readable Markdown. No app-wide resets.
+ * Crucially the reading column is anchored to the PANE, not centered in the
+ * viewport. Explicit min/width also works when every ancestor is nested flex. */
+.chat-scroll.deeporca-host{min-width:0;width:100%;box-sizing:border-box;padding:22px 28px 18px}
+.deeporca-surface>.chat-composer{padding:10px 28px 16px}
+.deeporca-surface .chat-form,.deeporca-surface .chat-controls,.deeporca-surface .chat-file-tray{max-width:880px;margin-left:0;margin-right:0}
+.deeporca-chat{--do-ink:var(--text,#e8e9ed);--do-muted:var(--text-2,#969ca8);--do-line:rgba(160,170,188,.17);--do-panel:rgba(155,165,185,.045);--do-accent:#a5bbdf;box-sizing:border-box;min-width:0;width:100%;max-width:880px;margin:0;padding:0;color:var(--do-ink);font:14px/1.65 var(--sans,system-ui,sans-serif);overflow-wrap:anywhere}
+.deeporca-chat *{box-sizing:border-box;min-width:0}
+.deeporca-chat .do-content{width:100%;max-width:100%;margin:0}
+.deeporca-chat .do-status{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 24px;padding:0 0 10px;border-bottom:1px solid var(--do-line);font-size:11px;line-height:1.5;color:var(--do-muted)}
+.deeporca-chat .do-brand{color:var(--do-ink);font-weight:650;letter-spacing:.015em}
+.deeporca-chat .do-model{overflow-wrap:anywhere}
+.deeporca-chat .do-access{margin-left:auto;font-size:10px}
+.deeporca-chat .do-message{margin:22px 0 18px}
+.deeporca-chat .do-role{font-size:11px;font-weight:650;color:var(--do-muted);margin-bottom:7px}
+.deeporca-chat .do-user{margin:0 0 22px;padding:12px 16px;background:rgba(155,165,185,.075);border:1px solid var(--do-line);border-radius:12px}
+.deeporca-chat .do-user .do-role{margin-bottom:4px;color:var(--do-ink)}
+.deeporca-chat .do-user-text{white-space:pre-wrap}
+.deeporca-chat .do-markdown{max-width:100%;line-height:1.72}
+.deeporca-chat .do-markdown>:first-child{margin-top:0}
+.deeporca-chat .do-markdown>:last-child{margin-bottom:0}
+.deeporca-chat .do-markdown p{margin:10px 0;white-space:normal}
+.deeporca-chat .do-markdown h1{font-size:1.5em}.deeporca-chat .do-markdown h2{font-size:1.3em}.deeporca-chat .do-markdown h3{font-size:1.14em}
+.deeporca-chat .do-markdown h1,.deeporca-chat .do-markdown h2,.deeporca-chat .do-markdown h3,.deeporca-chat .do-markdown h4{font-weight:650;line-height:1.4;margin:24px 0 10px;letter-spacing:-.012em}
+.deeporca-chat .do-markdown ul,.deeporca-chat .do-markdown ol{padding-left:24px;margin:10px 0;list-style-position:outside}
+.deeporca-chat .do-markdown ol{list-style-type:decimal}.deeporca-chat .do-markdown ul{list-style-type:disc}.deeporca-chat .do-markdown ul ul{list-style-type:circle}
+.deeporca-chat .do-markdown li{display:list-item;margin:5px 0;padding-left:3px}
+.deeporca-chat .do-markdown li>p{margin:4px 0}.deeporca-chat .do-markdown li>ul,.deeporca-chat .do-markdown li>ol{margin:5px 0 9px}
+.deeporca-chat .do-markdown blockquote{margin:14px 0;padding:2px 16px;border-left:2px solid var(--do-line);color:var(--do-muted)}
+.deeporca-chat .do-markdown hr{border:0;border-top:1px solid var(--do-line);margin:20px 0}
+.deeporca-chat a{color:var(--do-accent);text-decoration:underline;text-underline-offset:3px}
+.deeporca-chat code,.deeporca-chat pre{font-family:var(--mono,ui-monospace,monospace);font-size:12px}
+.deeporca-chat :not(pre)>code{padding:2px 5px;background:rgba(155,165,185,.1);border-radius:4px}
+.deeporca-chat .do-code{max-width:100%;margin:14px 0;border:1px solid var(--do-line);border-radius:8px;overflow:hidden;background:rgba(0,0,0,.12)}
+.deeporca-chat .do-code-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--do-line);padding:5px 12px;font:10px/1.5 var(--mono,monospace);color:var(--do-muted);background:var(--do-panel)}
+.deeporca-chat .do-copy{border:0;background:transparent;color:var(--do-muted);font:inherit;cursor:pointer;padding:2px 5px}
+.deeporca-chat .do-copy:hover{color:var(--do-ink)}
+.deeporca-chat pre{line-height:1.6;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
+.deeporca-chat .do-code pre{padding:13px 16px;white-space:pre;overflow:auto;max-width:100%;tab-size:4}
+.deeporca-chat .do-table-scroll{overflow:auto;max-width:100%;margin:14px 0;border:1px solid var(--do-line);border-radius:6px}
+.deeporca-chat table{border-collapse:collapse;min-width:100%;font-size:12px}.deeporca-chat th,.deeporca-chat td{padding:8px 12px;border-bottom:1px solid var(--do-line);text-align:left;vertical-align:top;overflow-wrap:normal;word-break:normal}.deeporca-chat th{font-weight:600;background:var(--do-panel)}.deeporca-chat tbody tr:last-child td{border-bottom:0}
+.deeporca-chat summary{list-style:none;display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+.deeporca-chat summary::-webkit-details-marker{display:none}
+.deeporca-chat .do-chevron{display:inline-block;flex:0 0 10px;color:var(--do-muted);font:17px/1 var(--sans,system-ui);transition:transform .12s}
+.deeporca-chat details[open]>summary>.do-chevron{transform:rotate(90deg)}
+.deeporca-chat .do-thinking{margin:10px 0 16px;color:var(--do-muted);border-left:2px solid var(--do-line)}
+.deeporca-chat .do-thinking>summary{padding:5px 10px;font-size:12px}
+.deeporca-chat .do-thinking-text{padding:8px 16px 12px;white-space:pre-wrap;font-size:12px;line-height:1.75;max-height:340px;overflow:auto}
+.deeporca-chat .do-tool-group{margin:12px 0 20px;border:1px solid var(--do-line);border-radius:8px;background:var(--do-panel);overflow:hidden}
+.deeporca-chat .do-tool+.do-tool{border-top:1px solid var(--do-line)}
+.deeporca-chat .do-tool>summary{padding:9px 12px;font-size:12px;line-height:1.5}
+.deeporca-chat .do-tool>summary:hover{background:rgba(155,165,185,.06)}
+.deeporca-chat .do-tool .do-summary-label{font-weight:600;flex-shrink:0;max-width:38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deeporca-chat .do-tool-detail{font:11px/1.5 var(--mono,monospace);color:var(--do-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.deeporca-chat .do-tool-state{font-size:10px;color:var(--do-muted);margin-left:auto;flex-shrink:0;max-width:45%;text-align:right}
+.deeporca-chat .do-tool-body{border-top:1px solid var(--do-line);padding:12px 16px;background:rgba(0,0,0,.1);max-height:420px;overflow:auto}
+.deeporca-chat .do-section-label{font-size:10px;font-weight:600;color:var(--do-muted);margin:0 0 6px;text-transform:uppercase;letter-spacing:.06em}
+.deeporca-chat .do-tool-body pre+.do-section-label{margin-top:16px}
+.deeporca-chat .do-turn{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 14px;margin:14px 0 26px;padding-top:9px;border-top:1px solid var(--do-line);color:var(--do-muted);font-size:10px}
+.deeporca-chat .do-usage>summary{gap:4px}.deeporca-chat .do-usage pre{padding:8px;font-size:11px}
+.deeporca-chat .do-runtime-meta{margin:14px 0;font-size:11px;color:var(--do-muted)}.deeporca-chat .do-runtime-meta pre{font-size:11px;padding:10px 16px}
+.deeporca-chat .do-note,.deeporca-chat .do-empty{font-size:12px;color:var(--do-muted)}
+.deeporca-chat .do-empty{padding:26px 0}
+.deeporca-chat .do-warning,.deeporca-chat .do-tool-error .do-tool-state{color:#c5a77e}
+.deeporca-chat .do-error,.deeporca-chat .do-error-banner{color:var(--danger,#e6a09a)}
+.deeporca-chat .do-error-banner{margin:14px 0;padding:10px 14px;border:1px solid rgba(230,160,154,.3);border-radius:8px;font-size:12px}
+.deeporca-chat .do-run-note{color:var(--do-muted);font-size:12px;padding:10px 0}
+.deeporca-chat button:focus-visible,.deeporca-chat summary:focus-visible,.deeporca-chat a:focus-visible,.deeporca-chat .do-table-scroll:focus-visible{outline:2px solid var(--do-accent);outline-offset:-2px}
+@media(max-width:600px){.chat-scroll.deeporca-host{padding:16px 14px}.deeporca-surface>.chat-composer{padding:8px 14px 12px}.deeporca-chat{font-size:13px}.deeporca-chat .do-status{gap:5px 10px;margin-bottom:18px}.deeporca-chat .do-access{width:100%;margin:0}.deeporca-chat .do-user{padding:10px 12px}.deeporca-chat .do-tool>summary{padding:8px;gap:6px;flex-wrap:wrap}.deeporca-chat .do-tool-detail{min-width:70px}.deeporca-chat .do-tool-state{font-size:9px}.deeporca-chat .do-markdown ul,.deeporca-chat .do-markdown ol{padding-left:21px}}

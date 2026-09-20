@@ -58,6 +58,9 @@
     let chat = null, controls = [], controlValues = {}, attachments = {}, readingFiles = false;
     let turnPending = false; // Presentation only; never persisted or folded into canonical events.
     let announcedCapability = null;
+    let persistedRenderer = null, rendererView = null, rendererLoading = false, rendererFailed = false;
+    let inputSequence = 0;
+    let nativeSubmission = null;
     let recording = null, replayTimer = null, replayPlaying = false, replaySpeed = 1, replayCursor = 0, replayGeneration = 0;
     let nodes = {}, listeners = [];
     let sessionCards = [], sessionActionPending = false;
@@ -233,7 +236,10 @@
       sessionCards = []; sessionActionPending = false;
       chat = null; controls = []; controlValues = {}; attachments = {}; readingFiles = false;
       turnPending = false;
+      nativeSubmission = null;
       announcedCapability = null;
+      rendererView?.destroy(); rendererView = null;
+      persistedRenderer = null; rendererLoading = false; rendererFailed = false;
       recording = null; replaySpeed = 1; replayCursor = 0;
       reconnectDelay = 500; endPending = false;
       root.textContent = '';
@@ -246,6 +252,21 @@
       if (announcedCapability) return announcedCapability;
       const found = services.findAgent ? services.findAgent(target?.agentId) : null;
       return UI.findRuntimeCapability(found?.box?.capabilities, found?.agent?.runtime);
+    }
+    function selectedRenderer() {
+      const found = services.findAgent?.(target?.agentId);
+      return chat?.renderer || persistedRenderer || Chat.rendererId(found?.agent, capability());
+    }
+    function runtimeContract() {
+      return Chat.runtimeContract(services.findAgent?.(target?.agentId)?.agent, capability(), selectedRenderer());
+    }
+    function sessionRuntimeContract(session) {
+      return Chat.runtimeContract(services.findAgent?.(target?.agentId)?.agent, capability(), session?.renderer || selectedRenderer());
+    }
+    function canContinueNative(session) {
+      return sessionRuntimeContract(session).explicitContinuation
+        && canOperate() && session?.state === 'inactive'
+        && session.surface === 'structured' && session.available !== false;
     }
     function unavailable(message, allowReplay = true) {
       liveActive = false; wantOpen = false; turnPending = false;
@@ -283,7 +304,7 @@
       setStatus(status, statusText);
       try {
         if (activation && !restoreRequested) await openActivated(view, activation);
-        else if (target.kind === 'live') await openLive(view, next.forceNew === true, !!validSurface(next.surface));
+        else if (target.kind === 'live') await openLive(view, next.forceNew === true, !!validSurface(next.surface), next.continueNative === true && !restoreRequested);
         else if (target.kind === 'history') await loadHistory(view);
         else await loadReplay(view);
       } catch (error) {
@@ -294,7 +315,7 @@
       }
       return getState();
     }
-    async function openLive(view, forceNew, explicitSurface) {
+    async function openLive(view, forceNew, explicitSurface, continueNative = false) {
       // Restoration is navigation, not consent to spawn a new model, even if forceNew was persisted elsewhere.
       if (restoreRequested && !target.sessionId) {
         unavailable('No saved session ID. Choose New session to start explicitly.', false);
@@ -309,7 +330,7 @@
           : UI.resumableSession(sessions.filter(item => item.available !== false), target.surface);
         if (target.sessionId) {
           if (!session) { unavailable('The saved session is missing. It will not be recreated automatically.'); return; }
-          if (session.state !== 'live') {
+          if (session.state !== 'live' && !(continueNative && canContinueNative(session))) {
             await open({ ...snapshot(), kind: 'replay', surface: validSurface(session.surface) || target.surface });
             return;
           }
@@ -322,6 +343,7 @@
         }
       }
       if (!current(view)) return;
+      if (session) applySessionMetadata(session);
       // Preflight the renderer BEFORE any create request. Chat never touches xterm.
       if (target.surface === 'terminal' && services.ensureTerminal) {
         setStatus('opening', 'Loading terminal renderer…');
@@ -345,12 +367,12 @@
         return;
       }
       // A new persisted row is inactive until this browser sends its attach.
-      if (!created && session.state && session.state !== 'live') {
+      if (!created && session.state && session.state !== 'live' && !(continueNative && canContinueNative(session))) {
         await open({ ...snapshot(), kind: 'replay' });
         return;
       }
       wantOpen = true; liveActive = false;
-      connectSocket();
+      connectSocket(null, continueNative);
     }
     function mountSurface() {
       if (target.surface === 'structured') { mountChat(); return true; }
@@ -428,8 +450,11 @@
       const active = services.isActive ? services.isActive() : root.contains(document.activeElement);
       return !!(active && sendFrame('input', { data: '\u0002' }));
     }
-    function connectSocket(resume = null) {
+    function connectSocket(resume = null, continueNative = false) {
       if (!current(epoch) || !wantOpen || !target?.sessionId || target.kind !== 'live') return;
+      // SDK continuation uses the same explicit, generation-checked wire intent;
+      // the Server routes it to the library, not a generic CLI resume operation.
+      if (continueNative) resume = { launch_id: target.launchId ?? null };
       stopReconnect(); detachSocket();
       liveActive = false;
       setStatus('connecting', resume ? 'Preparing resume…' : 'Connecting…');
@@ -448,7 +473,10 @@
       const isCurrent = () => current(view) && socket === ownSocket && target.sessionId === sessionId;
       inputSender = UI.createTerminalInputSender((data, options) => {
         if (!isCurrent() || !(target.surface === 'structured' ? canWriteChat() : canWriteTerminal())) return false;
-        return sendFrame('input', { data, options });
+        const clientInputId = runtimeContract().inputReceipts && options?.client_input_id;
+        if (clientInputId) { options = {...options}; delete options.client_input_id; }
+        return sendFrame('input', { data, options,
+          ...(clientInputId ? {client_input_id:clientInputId} : {}) });
       });
       // Owned by this socket callback only, never by target/snapshot/reconnect.
       let opened = false, resumeOnce = resume;
@@ -457,9 +485,9 @@
         if (!isCurrent() || !wantOpen || opened) return;
         opened = true;
         const intent = resumeOnce; resumeOnce = null;
-        if (intent && !canOperate()) {
+        if ((intent || continueNative) && !canOperate()) {
           wantOpen = false; setStatus('unavailable', 'Read-only');
-          reportError('Read-only: permission to resume was revoked.'); return;
+          reportError(continueNative ? 'Read-only: permission to continue was revoked.' : 'Read-only: permission to resume was revoked.'); return;
         }
         if (!sendFrame(intent ? 'resume' : 'attach', { cols: terminal?.cols || 120, rows: terminal?.rows || 30,
           surface: target.surface, ...(intent ? { agent_id: target.agentId, launch_id: intent.launch_id ?? null } : {}) })) return;
@@ -558,6 +586,26 @@
             }
             break;
           case 'exit': finishSession(frame); break;
+          case 'input_ack':
+            if (runtimeContract().inputReceipts && nativeSubmission && nativeSubmission.id === frame.client_input_id) {
+              if (frame.status === 'rejected') {
+                const submitted = nativeSubmission;
+                nativeSubmission = null; turnPending = false;
+                chat.items = chat.items.filter(item => !(item.kind === 'user' && item.local && item.client_input_id === submitted.id));
+                chat._openAssistant = null;
+                if (!nodes.input.value) { nodes.input.value = submitted.text; resizeChatInput(); }
+                renderChat();
+                const uncertain = ['execution_uncertain', 'input_delivery_failed'].includes(frame.reason);
+                composerError(uncertain
+                  ? 'Execution outcome is uncertain. It was not resent; check possible tool side effects before submitting again.'
+                  : 'Input rejected: ' + String(frame.reason || frame.code || 'not accepted').replace(/_/g, ' ') + '. Your draft has been kept.');
+              } else if (frame.status === 'delivered' && frame.duplicate) {
+                nativeSubmission = null; turnPending = false; renderChat();
+              } else if (frame.status === 'delivered') {
+                nativeSubmission.delivered = true;
+              }
+            }
+            break;
           case 'error':
             if (awaitingReady || awaitingStart || ['resume_required', 'session_changed', 'start_failed', 'session_failed',
               'configuration_changed', 'context.not_found', 'context.changed', 'context.in_use',
@@ -588,6 +636,10 @@
       ownSocket.onerror = () => { if (isCurrent()) reportError('Session connection failed. Check your connection or use Reconnect.'); };
       ownSocket.onclose = () => {
         if (!isCurrent()) return;
+        if (runtimeContract().inputReceipts && nativeSubmission && !nativeSubmission.delivered) {
+          if (!nodes.input.value) { nodes.input.value = nativeSubmission.text; resizeChatInput(); }
+          composerError('Delivery is unconfirmed. Nothing was automatically resent; check restored history and possible tool effects before submitting again.');
+        }
         stopHeartbeat();
         if (inputSender) inputSender.close();
         inputSender = null; collaboration = null; keyboardRequester = null; liveActive = false;
@@ -655,6 +707,9 @@
     function mountChat() {
       chat = Chat.initialChatState();
       const surface = element('div', 'chat', 'chat-surface');
+      nodes.rendererNote = element('div', 'chat-renderer-notice', 'chat-renderer-notice');
+      nodes.rendererNote.setAttribute('role', 'status');
+      nodes.rendererNote.hidden = true;
       nodes.scroll = element('div', 'chat-scroll', 'chat-scroll');
       nodes.scroll.setAttribute('aria-label', 'Session transcript');
       nodes.composer = element('div', 'chat-composer', 'chat-composer');
@@ -677,7 +732,7 @@
       nodes.composerError = element('div', 'chat-composer-error', 'chat-composer-error');
       nodes.composerError.setAttribute('role', 'status');
       nodes.composer.append(nodes.controls, nodes.tray, form, nodes.composerError);
-      surface.append(nodes.scroll, nodes.composer);
+      surface.append(nodes.rendererNote, nodes.scroll, nodes.composer);
       nodes.body.appendChild(surface);
       let composing = false;
       listen(form, 'submit', event => { event.preventDefault(); if (!composing) sendChatMessage(); });
@@ -711,7 +766,8 @@
     function setupChatControls() {
       const selected = UI.capabilityForSurface(capability(), 'structured');
       // Project the selected surface; the renderer also supports legacy single-surface schemas.
-      const nextControls = Chat.controlsFromCapability(selected ? { features: selected.features, models: selected.models } : null);
+      const nextControls = Chat.controlsFromCapability(selected ? { features: selected.features, models: selected.models } : null)
+        .filter(control => runtimeContract().interactiveApproval || !/permission|approval/i.test(control.key));
       if (nodes.controls.childElementCount && JSON.stringify(controls) === JSON.stringify(nextControls)) return;
       const savedAttachments = attachments;
       controls = nextControls;
@@ -770,11 +826,12 @@
     function syncChatControls() {
       if (!chat || !nodes.input) return;
       const writable = canWriteChat();
+      rendererView?.setAccess({live:target.kind === 'live' && liveActive, readOnly:!writable, canSend:writable, canInterrupt:writable});
       nodes.input.disabled = !writable;
       nodes.input.placeholder = writable ? 'Message…' : 'Read-only';
       for (const node of root.querySelectorAll('[data-ui="chat-composer"] button, [data-ui="chat-file"], .chat-perm button'))
         node.disabled = !writable;
-      nodes.send.disabled = !writable || readingFiles;
+      nodes.send.disabled = !writable || readingFiles || (runtimeContract().serialTurns && turnPending);
       nodes.interrupt.hidden = target.kind !== 'live' || !turnPending;
       for (const node of root.querySelectorAll('[data-ui="chat-attach"], [data-ui="chat-file"]')) node.disabled = !writable || readingFiles;
       const locked = chat.configured || chat.items.length > 0;
@@ -790,7 +847,33 @@
     function renderChat() {
       if (!chat || !nodes.scroll) return;
       const view = epoch;
-      Chat.renderChat(nodes.scroll, chat, { onPermission: (requestId, allow) => {
+      const rendererId = selectedRenderer();
+      const native = Chat.supportsRenderer(rendererId);
+      nodes.rendererNote.hidden = !rendererId || native;
+      nodes.rendererNote.textContent = rendererId && !native
+        ? 'Unsupported conversation renderer. Using standard chat; some presentation features may be unavailable.' : '';
+      if (!runtimeContract().interactiveApproval) chat.pendingPermission = null;
+      if (!native && rendererView) { rendererView.destroy(); rendererView = null; }
+      if (native && !rendererView && !rendererLoading && !rendererFailed) {
+        const host = nodes.scroll;
+        rendererLoading = true;
+        Chat.loadLocalModule(rendererId).then(module => {
+          if (!current(view) || nodes.scroll !== host) return;
+          rendererLoading = false;
+          if (selectedRenderer() !== rendererId) return;
+          rendererView = module.createView(host, {interrupt,
+            sendInput:text => { if (!nodes.input || !canWriteChat()) return false; nodes.input.value = text; return sendChatMessage(); }});
+          renderChat();
+        }).catch(() => {
+          if (!current(view)) return;
+          rendererLoading = false; rendererFailed = true;
+          reportError('Conversation presentation unavailable. Using standard chat; reload to retry.');
+        });
+      }
+      if (rendererView && native) {
+        rendererView.setAccess({live:target.kind === 'live' && liveActive, readOnly:!canWriteChat(), canSend:canWriteChat(), canInterrupt:canWriteChat()});
+        rendererView.renderState(chat, {live:target.kind === 'live' && liveActive, readOnly:!canWriteChat(), pending:turnPending});
+      } else Chat.renderChat(nodes.scroll, chat, !runtimeContract().interactiveApproval ? {} : { onPermission: (requestId, allow) => {
         if (current(view)) sendPermission(requestId, allow);
       } });
       syncAccess(); notify();
@@ -802,27 +885,50 @@
       chat = folded.state;
       if (frame.type === 'restore') turnPending = false;
       for (const event of folded.events) {
-        if (event.ev === 'turn.end') turnPending = false;
-        else if (['user.echo', 'message', 'message.delta', 'tool.call', 'tool.result', 'permission.ask'].includes(event.ev))
+        if (nativeSubmission && event.ev === 'user.echo' && event.client_input_id === nativeSubmission.id) nativeSubmission.delivered = true;
+        if (event.ev === 'turn.end') { turnPending = false; nativeSubmission = null; }
+        else if (['turn.start', 'thinking.delta', 'user.echo', 'message', 'message.delta', 'tool.call', 'tool.result', 'permission.ask'].includes(event.ev))
           turnPending = true;
       }
       if (frame.type === 'restore' || folded.events.some(event => event.ev === 'session.config'))
         controlValues = Chat.reconcileControlValues(controls, controlValues, chat.config);
       renderChat();
     }
+    function newNativeInputId() {
+      if (typeof window.crypto?.randomUUID === 'function') return window.crypto.randomUUID();
+      // randomUUID requires a secure context; getRandomValues also works on
+      // ordinary LAN HTTP. IDs correlate receipts, never authorize access.
+      const bytes = new Uint8Array(16);
+      if (typeof window.crypto?.getRandomValues === 'function') window.crypto.getRandomValues(bytes);
+      else {
+        let seed = Date.now() + (++inputSequence);
+        for (let i = 0; i < bytes.length; i++) {
+          bytes[i] = (seed + Math.floor(Math.random() * 256)) & 255;
+          seed = Math.floor(seed / 256);
+        }
+      }
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      const h = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+      return h.slice(0,8) + '-' + h.slice(8,12) + '-' + h.slice(12,16) + '-' + h.slice(16,20) + '-' + h.slice(20);
+    }
     function sendChatMessage() {
       if (!chat || !nodes.input || target.kind !== 'live' || target.surface !== 'structured') return false;
       const text = nodes.input.value;
       if (!text.trim()) return false;
       if (!canWriteChat()) { composerError('Read-only or reconnecting. Your draft has been kept.'); return false; }
+      if (runtimeContract().serialTurns && turnPending) { composerError('Wait for the current turn to settle. Your draft has been kept.'); return false; }
       if (readingFiles) { composerError('Wait for attachments to finish loading. Your draft has been kept.'); return false; }
       try {
         const options = Chat.buildTurnOptions(controls, controlValues, attachments);
+        const clientInputId = runtimeContract().inputReceipts ? newNativeInputId() : null;
+        if (clientInputId) options.client_input_id = clientInputId;
         if (!inputSender || !inputSender.push(text, options)) {
           composerError('The session is reconnecting. Your draft has been kept; try again.'); return false;
         }
         const metadata = Object.values(attachments).flat().map(file => ({ name: file.name, type: file.type, size: file.size }));
-        Chat.appendUserTurn(chat, text, metadata);
+        Chat.appendUserTurn(chat, text, metadata, clientInputId);
+        if (clientInputId) nativeSubmission = {id:clientInputId, text};
         turnPending = true;
         for (const key of Object.keys(attachments)) attachments[key] = [];
         nodes.input.value = '';
@@ -835,6 +941,7 @@
       }
     }
     function sendPermission(requestId, allow) {
+      if (!runtimeContract().interactiveApproval) return false;
       if (!canWriteChat() || chat?.pendingPermission?.request_id !== requestId) return false;
       if (!sendFrame('permission', { request_id: requestId, allow: !!allow })) return false;
       chat.pendingPermission = null; renderChat(); return true;
@@ -928,6 +1035,7 @@
       if (target.sessionId === String(sessionId)) { target.title = title; notify(); }
     }
     function applySessionMetadata(session) {
+      if (session.renderer) persistedRenderer = session.renderer;
       if (typeof session.title === 'string') target.title = session.title;
       target.launchId = session.launch_id;
     }
@@ -945,6 +1053,10 @@
     }
     function resumeBlocked(session) {
       if (!canOperate()) return 'Read-only: an Operator, Admin or Owner is required to resume.';
+      // DeepOrca's explicit continuation has its own native binding checks.
+      // Generic resume metadata must not authorize adopting an unknown context.
+      if (sessionRuntimeContract(session).explicitContinuation)
+        return 'Use Continue native conversation for an inactive DeepOrca session; generic native resume is unavailable.';
       if (session.surface !== 'structured') return 'Native resume is supported only for compatible Chat sessions, not Terminal sessions.';
       if (!session.resume_supported) return session.resume_reason || 'This runtime does not support native resume.';
       if (session.state === 'starting') return 'This session is already starting. View history or attach once it is live.';
@@ -1025,10 +1137,17 @@
           } catch (failure) { if (current(view)) error.textContent = failure.message || 'Could not prepare resume.'; }
           finally { if (current(view)) { sessionActionPending = false; syncAccess(); } }
         });
+      const continuation = navigation && sessionRuntimeContract(session).explicitContinuation && session.state === 'inactive'
+        ? button('history-continue-native', 'Continue native conversation', () => {
+          if (saving || editing || sessionActionPending || !canContinueNative(session)) return;
+          return open({ kind: 'live', agentId, sessionId, title: sessionTitle(session),
+            surface: session.surface, continueNative: true });
+        }) : null;
       if (history) actions.appendChild(button('history-replay', 'View history', () => open({
         kind: 'replay', agentId, sessionId, title: sessionTitle(session), surface: validSurface(session.surface),
       })));
       actions.appendChild(rename);
+      if (continuation) actions.appendChild(continuation);
       if (navigation) actions.appendChild(action);
       row.append(title, detail, actions, edit, reason, error);
       const card = { session, sync() {
@@ -1044,6 +1163,7 @@
             : !validSurface(session.surface) ? 'This session has no supported live surface.' : ''
           : resumeBlocked(session);
         action.disabled = saving || editing || sessionActionPending || !!blocked;
+        if (continuation) continuation.disabled = saving || editing || sessionActionPending || !canContinueNative(session);
         const renameReason = allowedRename() ? '' : !canOperate() ? 'Read-only: renaming requires an Operator, Admin or Owner.' : 'Renaming is not available for this session.';
         reason.textContent = [renameReason, navigation ? blocked : ''].filter(Boolean).join(' ');
         reason.hidden = !reason.textContent; error.hidden = !error.textContent;
@@ -1120,6 +1240,7 @@
       }
       if (!current(view)) return;
       recording = Replay.normalizeReplay(data);
+      persistedRenderer = data.renderer || data.session?.renderer || persistedRenderer;
       if (!recording.events.length && !recording.checkpoints.length && !nodes.recordingNote)
         recordingNote('No recorded transcript is available for this session.');
       target.surface = validSurface(data.surface) || target.surface ||

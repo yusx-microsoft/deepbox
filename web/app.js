@@ -483,6 +483,7 @@
       scopedMenu(anchor,[
         ...surfaces.filter(surface=>['terminal','structured'].includes(surface)).map(surface=>({label:surface==='structured'?'Open chat':'Open terminal',disabled:!found.box.online,action:()=>openAgent(id,surface)})),
         {label:'Session history',action:()=>bench?.open({kind:'history',agentId:id,title:found.agent.display_name||found.agent.handle})},
+        ...(management.hasAgentSettings(found.agent) && canManage() ? [{label:'Agent settings',action:()=>management.agentSettings(id)}] : []),
         {separator:true}, {label:'Delete agent…',danger:true,disabled:!canManage(),action:()=>management.deleteAgent(id,found.agent.handle)},
       ]);
     }

@@ -39,6 +39,37 @@ test('permission.ask sets pendingPermission', () => {
   assert.strictEqual(s.pendingPermission.request_id, 'r1');
 });
 
+test('DeepOrca tool identities are scoped to turns, including an unfinished previous call', () => {
+  const s = C.initialChatState();
+  C.applyEvent(s, {ev:'session.config', renderer:'deeporca-chat-v1'});
+  C.applyEvent(s, {ev:'tool.call', turn_id:'first', tool_id:'reused/id+=', tool:'read', input:'one'});
+  C.applyEvent(s, {ev:'turn.end', turn_id:'first', status:'uncertain', native:{runtime:'deeporca'}});
+  C.applyEvent(s, {ev:'tool.call', turn_id:'second', tool_id:'reused/id+=', tool:'read', input:'two'});
+  C.applyEvent(s, {ev:'tool.result', turn_id:'second', tool_id:'reused/id+=', content:'preview', truncated:true, original_bytes:250000});
+  const cards = s.items.filter(i => i.kind === 'tool');
+  assert.strictEqual(cards.length, 2);
+  assert.strictEqual(cards[0].result, null);
+  assert.strictEqual(cards[0].status, 'uncertain');
+  assert.strictEqual(cards[0].input, 'one');
+  assert.strictEqual(cards[1].result, 'preview');
+  assert.strictEqual(cards[1].truncated, true);
+  assert.strictEqual(cards[1].original_bytes, 250000);
+});
+
+test('DeepOrca settled tools do not imply success or rollback, and legacy permissions remain intact', () => {
+  for (const status of ['cancelled', 'error', 'completed']) {
+    const s = C.initialChatState();
+    C.applyEvent(s, {ev:'tool.call', turn_id:'turn', tool_id:'call', tool:'write'});
+    C.applyEvent(s, {ev:'turn.end', turn_id:'turn', status, native:{runtime:'deeporca'}});
+    assert.strictEqual(s.items[0].status, status === 'completed' ? 'incomplete' : status);
+    assert.strictEqual(s.items[0].result, null);
+  }
+  let s = C.initialChatState();
+  C.applyEvent(s, { ev: 'permission.ask', request_id: 'r1', tool: 'Write', input: {} });
+  assert.ok(s.pendingPermission);
+  assert.strictEqual(s.pendingPermission.request_id, 'r1');
+});
+
 test('turn.end appends a turn item and closes assistant', () => {
   let s = C.initialChatState();
   C.applyEvent(s, { ev: 'message.delta', text: 'x' });

@@ -103,6 +103,7 @@ def probe_family(
     *,
     runner: Callable[[list[str], float], ProbeResult] = run_probe,
     include_models: bool = True,
+    local_state_path=None,
 ) -> dict:
     """Probe one runtime family and return the normalized capability-v2 blob."""
     adapters = [adapter for adapter in runtimes.all_adapters()
@@ -110,6 +111,11 @@ def probe_family(
     if not adapters:
         raise runtimes.UnknownRuntimeError(f"unknown runtime family {family!r}")
     representative = next((item for item in adapters if item.default_surface), adapters[0])
+    if representative.capability_probe is not None:
+        local_options = ({"local_state_path": local_state_path}
+                         if local_state_path is not None else {})
+        return _with_revision(representative.capability_probe(
+            representative, runner=runner, include_models=include_models, **local_options))
 
     hinted = representative.probe_hint() if representative.probe_hint else None
     installed = bool(hinted) if hinted is not None else bool(shutil.which(representative.executable))
@@ -245,8 +251,9 @@ class RuntimeProbeCache:
     """TTL cache scoped by server devbox identity and runtime family."""
 
     def __init__(self, ttl_seconds: float = DEFAULT_PROBE_TTL_SECONDS,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, *, local_state_path=None):
         self.ttl_seconds = ttl_seconds
+        self.local_state_path = local_state_path
         self.clock = clock
         self._entries: dict[tuple[str, str], tuple[float, dict]] = {}
 
@@ -257,7 +264,8 @@ class RuntimeProbeCache:
             key = (devbox_id, family)
             cached = self._entries.get(key)
             if force or cached is None or cached[0] <= now:
-                value = probe_family(family)
+                value = (probe_family(family, local_state_path=self.local_state_path)
+                         if self.local_state_path is not None else probe_family(family))
                 self._entries[key] = (now + self.ttl_seconds, value)
             else:
                 value = cached[1]

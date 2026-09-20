@@ -31,6 +31,7 @@ from .local_store import LocalProjectStore, default_state_root
 from .native_writer import NativeWriterError, NativeWriterLease
 from . import runtimes
 from .spool import InMemorySpool, SpoolBase
+from .integrations.deeporca.supervisor import DeepOrcaSupervisorMixin
 
 # Pipelining bounds: how many durable output frames (and their bytes) may
 # be in flight to the transport before earlier ACKs return. The disk spool is
@@ -50,12 +51,13 @@ class _ContextUnavailable(ValueError):
             "Restore the original local context or start a new session.")
 
 
-class SessionSupervisor:
+class SessionSupervisor(DeepOrcaSupervisorMixin):
     """Owns every local agent session, independent of any transport."""
 
     def __init__(self, agents: dict[str, dict] | None = None,
                  spool: SpoolBase | None = None,
                  local_store: LocalProjectStore | None = None,
+                 deeporca_store=None, deeporca_worker_factory=None,
                  native_lock_root: str | None = None):
         self.local_store = local_store
         # User-scoped, never agent/DB/cwd-scoped. Tests inject disposable roots.
@@ -99,6 +101,7 @@ class SessionSupervisor:
         self._inflight_bytes = 0
         # The currently attached transport channel, or None when detached.
         self._channel: Channel | None = None
+        self._init_runtime_extension(deeporca_store, deeporca_worker_factory)
         # Un-acked frames recovered from a prior run are immediately eligible.
         if self._spool.pending_records():
             self.pending_event.set()
@@ -130,6 +133,7 @@ class SessionSupervisor:
 
     def replace_agents(self, agents) -> None:
         self.agents = self._resolve_agents(agents)
+        self._schedule_runtime_reconciliation()
 
     def pending_project_migrations(self) -> list[dict]:
         return list(self._project_migrations.values())
@@ -180,6 +184,7 @@ class SessionSupervisor:
         self._inflight_bytes = 0
         if self.pending:
             self.pending_event.set()
+        self._schedule_runtime_reconciliation()
 
     def detach(self) -> None:
         """Unbind the transport. Sessions keep running and buffering output."""
@@ -334,9 +339,11 @@ class SessionSupervisor:
                    for agent in agents):
                 return
             updated = self._resolve_agents(agents)
-            removed_agent_ids = set(self.agents) - set(updated)
+            removed_agent_ids = (set(self.agents) | self._runtime_bound_agent_ids()) - set(updated)
             self.agents = updated
             if removed_agent_ids:
+                for removed_agent_id in removed_agent_ids:
+                    await self._retire_runtime_agent(removed_agent_id)
                 for key in list(self._open_locks):
                     if key[0] in removed_agent_ids:
                         self._invalidate_open(key)
@@ -371,11 +378,12 @@ class SessionSupervisor:
                         self.pty_launch_ids.pop(key, None)
                 # Inventory omission must not erase native history. Re-adding
                 # an agent must not turn an old ID into a create request.
+            self._schedule_runtime_reconciliation()
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
         key = (aid, sid)
-        if t in {"input", "resize", "permission", "close", "terminate"}:
+        if t in {"input", "interrupt", "resize", "permission", "close", "terminate"}:
             pending = self._open_generations.get(key)
             active = self.pty_launch_ids.get(key)
             target = pending[0] if pending is not None else active
@@ -383,8 +391,16 @@ class SessionSupervisor:
             # sessions. Never let a delayed control cross a Resume generation.
             if frame.get("launch_id") != target:
                 return
-            if t in {"input", "resize", "permission"} and target != active:
+            if t in {"input", "interrupt", "resize", "permission"} and target != active:
                 return  # The pending generation does not own the live child yet.
+        if t == "input":
+            try:
+                client_input_id = str(UUID(str(frame.get("client_input_id"))))
+            except (TypeError, ValueError, AttributeError):
+                return
+            frame = {**frame, "client_input_id": client_input_id}
+        if await self._handle_runtime_control(frame):
+            return
         if t in {"open", "resume"}:
             await self.open_pty(
                 aid, sid, frame.get("cols", 120), frame.get("rows", 30),
@@ -392,11 +408,6 @@ class SessionSupervisor:
                 resume=t == "resume")
         elif t == "input":
             p = self.ptys.get((aid, sid))
-            client_input_id = frame.get("client_input_id")
-            try:
-                client_input_id = str(UUID(str(client_input_id)))
-            except (TypeError, ValueError, AttributeError):
-                return
             if p:
                 reason = None
                 if not p.is_alive():
@@ -414,6 +425,7 @@ class SessionSupervisor:
                         "type": "input_ack", "agent_id": aid,
                         "session_id": sid, "client_input_id": client_input_id,
                         "status": "rejected", "reason": reason,
+                        "launch_id": frame.get("launch_id"),
                     })
                     return
                 first_delivery = self._spool.record_input_once(client_input_id)
@@ -429,7 +441,12 @@ class SessionSupervisor:
                     "session_id": sid,
                     "client_input_id": client_input_id,
                     "status": "delivered",
+                    "launch_id": frame.get("launch_id"),
                 })
+        elif t == "interrupt":
+            p = self.ptys.get((aid, sid))
+            if p is not None:
+                p.write("\x03")
         elif t == "resize":
             p = self.ptys.get((aid, sid))
             if p:
@@ -683,6 +700,10 @@ class SessionSupervisor:
                 "authentication": capability["authentication"]["status"],
             })
             return
+        if await self._open_runtime_session(
+                adapter, agent_id, session_id, confirmed_surface, pty_instance_id,
+                current, launch_id=launch_id):
+            return
         runtime_config = (info.get("runtime_config")
                           if isinstance(info.get("runtime_config"), dict)
                           else {})
@@ -895,6 +916,13 @@ class SessionSupervisor:
             } for aid, sid in self.ptys.keys()],
             **spool_status,
         }
+
+    async def aclose(self) -> None:
+        """Settle extension sessions before closing the durable spool."""
+        await self._close_runtime_sessions()
+        self.shutdown()
+        await self.wait_closed()
+        self._close_runtime_storage()
 
     def _stop_session(self, session) -> None:
         session.kill()

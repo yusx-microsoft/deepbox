@@ -80,6 +80,25 @@ def test_revision_ignores_probe_timestamps_but_tracks_capability_changes():
     assert first["revision"] != changed["revision"]
 
 
+def test_adapter_owned_probe_preserves_injected_runner_and_common_revision(monkeypatch):
+    calls = []
+    runner = lambda argv, timeout: ProbeResult(0, "unused")
+
+    def custom_probe(adapter, *, runner, include_models):
+        calls.append((adapter, runner, include_models))
+        return {"runtime": adapter.family_id, "models": {"probed_at": len(calls)}}
+
+    adapter = _adapter(capability_probe=custom_probe)
+    monkeypatch.setattr(runtimes, "all_adapters", lambda: [adapter])
+    first = probe_family("test-cli", runner=runner, include_models=False)
+    second = probe_family("test-cli", runner=runner, include_models=True)
+
+    assert calls == [(adapter, runner, False), (adapter, runner, True)]
+    assert first["runtime"] == "test-cli"
+    assert first["revision"] == second["revision"]
+    assert len(first["revision"]) == 16
+
+
 def test_probe_missing_runtime_is_reported_without_host_paths(monkeypatch):
     adapter = _adapter()
     monkeypatch.setattr(runtimes, "all_adapters", lambda: [adapter])

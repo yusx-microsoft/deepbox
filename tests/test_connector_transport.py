@@ -177,6 +177,46 @@ class TransportDeliveryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(supervisor.recv(), timeout=0.02)
         await self._stop(tasks)
 
+    async def test_stale_lifecycle_rejections_preserve_connection_and_output(self):
+        supervisor, transport, ws, tasks = await self._start()
+        try:
+            await self._deliver(supervisor, OUTPUT)
+            for code in ("stale_launch", "stale_instance"):
+                await transport._server_events.put({"type": "error", "code": code})
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(supervisor.recv(), timeout=0.02)
+                self.assertFalse(any(task.done() for task in tasks))
+                self.assertEqual(ws.sent, [OUTPUT])
+                self.assertEqual(len(transport._outstanding), 1)
+            await transport._server_events.put({
+                "type": "ack", "session_id": "s1", "pty_instance_id": "p1", "seq": 1,
+            })
+            self.assertEqual(await asyncio.wait_for(supervisor.recv(), 0.2), {
+                "type": "ipc_delivery_ack", "delivery_id": 7,
+            })
+        finally:
+            await self._stop(tasks)
+
+    async def test_output_and_unknown_errors_still_fail_without_releasing_rows(self):
+        for error in (
+            {"type": "error", "code": "output_invalid"},
+            {"type": "error", "code": "invalid_session"},
+            {"type": "error", "code": "stale_launch", "seq": 1},
+            {"type": "error", "code": "stale_instance", "pty_instance_id": "p1"},
+        ):
+            with self.subTest(error=error):
+                supervisor, transport, _, tasks = await self._start()
+                try:
+                    await self._deliver(supervisor, OUTPUT)
+                    await transport._server_events.put(error)
+                    with self.assertRaises(ProtocolError):
+                        await asyncio.wait_for(tasks[1], 0.2)
+                    self.assertEqual(len(transport._outstanding), 1)
+                    with self.assertRaises(asyncio.TimeoutError):
+                        await asyncio.wait_for(supervisor.recv(), 0.02)
+                finally:
+                    await self._stop(tasks)
+
     async def test_resume_mismatch_fails_closed_without_local_ack(self):
         supervisor, transport, _, tasks = await self._start()
         await self._deliver(supervisor, OUTPUT)

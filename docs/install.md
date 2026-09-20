@@ -4,6 +4,8 @@ Install agentbridge once as a local command. Daily connections use `agentbridge 
 they do **not** download code, rebuild the virtualenv, or replace
 `<install-root>/app`. The old `deepbox` command remains supported.
 
+For the optional local DeepOrca library runtime, see [DeepOrca integration](deeporca.md).
+
 **Local-review phase:** these are instructions for a later, explicitly authorized
 installation, not actions performed by the rename review. No machine needs to be
 re-enrolled and no credential or state migration is required. Publishing scripts,
