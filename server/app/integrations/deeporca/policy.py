@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 class DeepOrcaPolicy(RuntimePolicy):
     renderer = RENDERER_ID
     restore_events = True
+    library_continuation = True
 
     def validate_create_fields(self, body: dict) -> None:
         desired.validate_create_fields(body)
@@ -99,9 +100,12 @@ class DeepOrcaPolicy(RuntimePolicy):
         # Correlate the original browser ID, not a canonicalized UUID. Do not
         # stringify malformed objects or echo input/options on validation errors.
         input_id = frame.get("client_input_id")
+        launch_id = frame.get("launch_id")
         return {"type": "input_ack", "status": "rejected",
                 "client_input_id": input_id[:128] if isinstance(input_id, str) else None,
                 "session_id": sess.id, "agent_id": sess.agent_id,
+                **({"launch_id": launch_id[:128] if isinstance(launch_id, str) else None}
+                   if "launch_id" in frame else {}),
                 "reason": code, "code": code, "message": message}
 
     def client_input_id(self, frame: dict) -> str:
@@ -116,7 +120,9 @@ class DeepOrcaPolicy(RuntimePolicy):
 
     def validate_input_options(self, sess: Session, frame: dict) -> None:
         options = frame.get("options", {})
-        if (frame.keys() - {"type", "session_id", "agent_id", "client_input_id", "data", "options"}
+        # The platform validates launch_id against the authorized Session before
+        # consulting input policy. It is lifecycle metadata, not a model option.
+        if (frame.keys() - {"type", "session_id", "agent_id", "client_input_id", "data", "options", "launch_id"}
                 or not isinstance(options, dict) or options.keys() - {"model"}):
             raise InputRejected(self.input_rejection(
                 sess, frame, "invalid_options", "DeepOrca only supports text input and model options"))

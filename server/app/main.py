@@ -11,7 +11,7 @@ import re
 import secrets
 import asyncio
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import (
     FastAPI, Request, Response, HTTPException, Depends, WebSocket,
@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session as OrmSession
+from sqlalchemy.orm import Session as OrmSession, object_session
 
 from . import models
 from .models import (
@@ -1559,13 +1559,57 @@ async def _session_body(request: Request) -> dict:
     return body
 
 
-def _session_json(sess: Session, agent: Agent | None = None) -> dict:
+def _session_features(sess: Session) -> dict:
+    """Read only generic reported feature keys, never runtime-name semantics."""
+    store = object_session(sess)
+    agent = store.get(Agent, sess.agent_id) if store is not None else None
+    devbox = store.get(Devbox, agent.devbox_id) if agent is not None else None
+    capabilities = devbox.capabilities if devbox is not None else []
+    for capability in capabilities if isinstance(capabilities, list) else []:
+        if not isinstance(capability, dict):
+            continue
+        aliases = capability.get("legacy_runtime_ids", [])
+        if (capability.get("runtime") != agent.runtime
+                and not (isinstance(aliases, list) and agent.runtime in aliases)):
+            continue
+        surfaces = capability.get("surfaces", [])
+        for surface in surfaces if isinstance(surfaces, list) else []:
+            if isinstance(surface, dict) and surface.get("id") == sess.surface:
+                features = surface.get("features")
+                return features if isinstance(features, dict) else {}
+    return {}
+
+
+def _native_resume_supported(sess: Session) -> bool:
+    features = _session_features(sess)
+    context = features.get("context", {})
+    if (sess.surface == "structured" and features.get("session_lifecycle") == 1
+            and isinstance(context, dict) and context.get("continuity") == "native"
+            and context.get("available") is True):
+        store = object_session(sess)
+        agent = store.get(Agent, sess.agent_id) if store is not None else None
+        return bool(agent and runtime_policy(agent.runtime).library_continuation)
+    return (sess.surface == "structured" and features.get("session_lifecycle") == 1
+            and isinstance(context, dict) and context.get("continuity") == "native_resume"
+            and context.get("available") is True and context.get("explicit_resume") is True)
+
+
+def _session_json(sess: Session, agent: Agent | None = None, *, role: str | None = None) -> dict:
     ls = live_registry.get(sess.id)
     state = ("live" if hub.is_session_active(sess.agent_id, sess.id)
              else "ended" if ls and ls.ended else "inactive")
+    supported = _native_resume_supported(sess)
+    operator = can_control(role) if role else False
+    online = hub.is_agent_online(sess.agent_id)
+    reason = ("Operator access is required to resume." if not operator else
+              "This machine is offline." if not online else
+              "This session does not report explicit native resume support. "
+              "Update the connector or start a new session." if not supported else "")
     result = {"id": sess.id, "agent_id": sess.agent_id, "title": sess.title,
-            "surface": sess.surface, "created_at": sess.created_at.isoformat(),
-            "state": state}
+              "surface": sess.surface, "created_at": sess.created_at.isoformat(),
+              "state": state, "launch_id": sess.launch_id,
+              "can_rename": operator, "resume_supported": supported,
+              "can_resume": operator and online and supported, "resume_reason": reason}
     if agent is not None:
         result.update(runtime_policy(agent.runtime).session_fields(agent))
     return result
@@ -1584,7 +1628,7 @@ async def list_agent_sessions(agent_id: str, request: Request,
     rows = s.scalars(select(Session).where(
         Session.agent_id == agent_id
     ).order_by(Session.created_at.desc())).all()
-    return [_session_json(sess, a) for sess in rows]
+    return [_session_json(sess, a, role=_session_role(s, u.id, sess)) for sess in rows]
 
 
 @app.post("/api/agents/{agent_id}/sessions")
@@ -1593,15 +1637,16 @@ async def create_session(agent_id: str, request: Request, s: OrmSession = Depend
     a = s.get(Agent, agent_id)
     if not a:
         raise HTTPException(404, "not found")
-    _devbox_role(s, u.id, a.devbox, WS_ROLE_OPERATOR)
+    role = _devbox_role(s, u.id, a.devbox, WS_ROLE_OPERATOR)
     surface = _surface_hint(await _session_body(request))
     surface = runtime_policy(a.runtime).session_surface(surface)
-    sess = Session(id=new_id(), user_id=u.id, agent_id=a.id,
+    # Canonical UUID text for new native CLI handles. Existing IDs never change.
+    sess = Session(id=str(uuid4()), user_id=u.id, agent_id=a.id,
                    workspace_id=a.devbox.workspace_id, title=f"{a.display_name} session",
                    surface=surface)
     s.add(sess)
     s.commit()
-    return _session_json(sess, a)
+    return _session_json(sess, a, role=role)
 
 
 @app.get("/api/sessions/{session_id}")
@@ -1610,8 +1655,37 @@ async def get_session(session_id: str, request: Request, s: OrmSession = Depends
     sess = s.get(Session, session_id)
     if not sess:
         raise HTTPException(404, "not found")
-    _session_role(s, u.id, sess)
-    return _session_json(sess, s.get(Agent, sess.agent_id))
+    role = _session_role(s, u.id, sess)
+    return _session_json(sess, s.get(Agent, sess.agent_id), role=role)
+
+
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request, s: OrmSession = Depends(db)):
+    u = current_user(request, s)
+    sess = s.get(Session, session_id)
+    if not sess:
+        raise HTTPException(404, "not found")
+    role = _session_role(s, u.id, sess, WS_ROLE_OPERATOR)
+    body = await _session_body(request)
+    title, expected = body.get("title"), body.get("expected_title")
+    if (set(body) != {"title", "expected_title"} or not isinstance(title, str)
+            or not isinstance(expected, str) or len(expected) > 512):
+        raise HTTPException(400, "title and expected_title are required; only the display title can change")
+    title = title.strip()
+    if (not title or len(title) > 120
+            or any(ord(ch) < 32 or 127 <= ord(ch) <= 159 or ch in "\u2028\u2029" for ch in title)):
+        raise HTTPException(400, "title must be a single line of 1 to 120 characters")
+    changed = s.execute(update(Session).where(
+        Session.id == session_id, Session.title == expected).values(title=title))
+    if changed.rowcount != 1:
+        s.rollback()
+        raise HTTPException(409, "The title changed. Refresh it before saving your edit.")
+    s.commit()
+    s.refresh(sess)
+    audit_event("session.renamed", actor_user_id=u.id, resource_type="session", resource_id=sess.id)
+    await hub.to_session_humans(sess.id, {
+        "type": "session.updated", "session_id": sess.id, "title": sess.title})
+    return _session_json(sess, s.get(Agent, sess.agent_id), role=role)
 
 
 def _require_terminal_keyboard(sess: Session) -> None:
@@ -1981,8 +2055,13 @@ def _connector_session(s: OrmSession, conn: DevboxConn, frame: dict) -> Session:
 
 
 def _resolved_session_ready(s: OrmSession, conn: DevboxConn,
-                             sess: Session, frame: dict) -> dict:
-    """Apply authenticated surface facts within the runtime's session policy."""
+                             sess: Session, frame: dict) -> dict | None:
+    """Accept the requested launch and enforce the authorized runtime's surface policy."""
+    if not _matches_session_launch(sess, frame, adopt_legacy=True):
+        return None
+    if (sess.launch_id != "legacy" and
+            (not isinstance(frame.get("pty_instance_id"), str) or not frame["pty_instance_id"])):
+        return None
     surface = _surface_hint(frame)
     agent = s.get(Agent, sess.agent_id)
     policy = runtime_policy(agent.runtime if agent else None)
@@ -1994,12 +2073,41 @@ def _resolved_session_ready(s: OrmSession, conn: DevboxConn,
         if lease:
             s.delete(lease)
     conn.active_session_ids.add(sess.id)
+    live_registry.get_or_create(sess.id).mark_resumed()
     instance = frame.get("pty_instance_id")
     if isinstance(instance, str) and instance:
         conn.session_instances[sess.id] = instance
     return {**frame, "type": "session.ready", "agent_id": sess.agent_id,
             "session_id": sess.id, "surface": sess.surface,
-            "renderer": policy.renderer}
+            "renderer": policy.renderer, "launch_id": sess.launch_id}
+
+
+def _matches_session_launch(sess: Session, frame: dict, *, adopt_legacy=False) -> bool:
+    token = frame.get("launch_id")
+    if sess.launch_id is None and adopt_legacy and token is None:
+        # Old connectors can report pre-existing live processes. New connectors
+        # must echo the generation, and new history never auto-spawns either way.
+        if _session_features(sess).get("session_lifecycle") != 1:
+            sess.launch_id = "legacy"
+    if sess.launch_id == "legacy":
+        return token in (None, "legacy")
+    return bool(sess.launch_id and isinstance(token, str) and token == sess.launch_id)
+
+
+def _session_failure_message(code: object) -> str:
+    """Public recovery guidance, never raw connector stderr or local paths."""
+    return {
+        "context.not_found": "No local native-context record was found. Restore the original connector state or start a new session explicitly.",
+        "context.changed": "The original runtime or local project no longer matches. Restore the original configuration or start a new session explicitly.",
+        "context.runtime_mismatch": "The original runtime no longer matches. Restore the original runtime or start a new session explicitly.",
+        "context.cwd_mismatch": "The original local project no longer matches. Restore the original project or start a new session explicitly.",
+        "context.in_use": "This native conversation already has a writer. End that writer before resuming.",
+        "context.recovery_required": "The previous writer stopped without confirmed cleanup. Check local context status and complete explicit local recovery before retrying.",
+        "context.writer_unavailable": "The local native writer could not be acquired. Check the connector before retrying.",
+        "configuration_changed": "The agent configuration changed while starting. Review it before retrying.",
+        "start_failed": "The CLI could not be started. Check the local connector and retry explicitly; no replacement session was created.",
+        "spawn_failed": "The CLI could not be started. Check its installation, authentication and local project before retrying explicitly; no replacement session was created.",
+    }.get(code if isinstance(code, str) else "", "This session could not be continued. Check the local connector; no replacement session was created.")
 
 
 @app.websocket("/ws/devbox")
@@ -2051,6 +2159,7 @@ async def ws_devbox(ws: WebSocket):
             if frame is None:
                 continue
             s.rollback()
+            s.expire_all()  # commit keeps objects; rollback may have no transaction to expire
             # Recheck revocation and disabled owners on long-lived connections.
             tok = s.get(Token, token_id)
             devbox = s.get(Devbox, conn.devbox_id)
@@ -2067,6 +2176,7 @@ async def ws_devbox(ws: WebSocket):
             sess = None
             session_frame = t in ("output", "input_ack", "exit", "ready", "session.ready",
                                   "runtime.unavailable", "runtime_unavailable")
+            session_frame = session_frame or (t == "error" and "session_id" in frame)
             session_frame = session_frame or (t == "presence" and "session_id" in frame)
             session_frame = session_frame or (t == "process_snapshot" and "sessions" not in frame)
             if session_frame:
@@ -2075,6 +2185,11 @@ async def ws_devbox(ws: WebSocket):
                 except HTTPException:
                     await send_connector({"type": "error", "code": "invalid_session",
                                           "message": "session is not owned by this connector"})
+                    continue
+                if (t in ("exit", "error", "runtime.unavailable", "runtime_unavailable")
+                        and not _matches_session_launch(sess, frame)):
+                    await send_connector({"type": "error", "code": "stale_launch",
+                                          "message": "session launch is no longer current"})
                     continue
                 instance = frame.get("pty_instance_id")
                 if (t not in ("output", "ready", "session.ready", "process_snapshot")
@@ -2114,7 +2229,15 @@ async def ws_devbox(ws: WebSocket):
                             # them into the pyte screen. The browser demuxes on
                             # `kind` and renders a chat surface instead.
                             ls.feed_live_output(frame.get("data", ""))
-                        await hub.to_session_humans(sid, frame)
+                        current_output = (
+                            sess.surface != "structured" or sess.launch_id == "legacy"
+                            or (sid in conn.active_session_ids and
+                                conn.session_instances.get(sid) == frame.get("pty_instance_id")))
+                        # Old output is still committed/ACKed below; only live
+                        # fan-out is fenced so an old turn.end cannot affect a
+                        # newly resumed chat's pending input state.
+                        if current_output:
+                            await hub.to_session_humans(sid, frame)
                         # Now make it durable OFF the event loop: a synchronous
                         # SQLite commit (network disk) would otherwise stall the
                         # loop and delay the very fan-out we just enqueued. The
@@ -2228,6 +2351,10 @@ async def ws_devbox(ws: WebSocket):
                     await send_connector({"type": "error", "code": "invalid_surface",
                                           "message": exc.detail})
                     continue
+                if ready is None:
+                    await send_connector({"type": "error", "code": "stale_launch",
+                                          "message": "session launch is no longer current"})
+                    continue
                 s.commit()
                 await hub.to_session_humans(sess.id, ready)
                 await _broadcast_collaboration(s, sess)
@@ -2247,6 +2374,15 @@ async def ws_devbox(ws: WebSocket):
                 s.commit()
                 if sess:
                     await hub.to_session_humans(sess.id, frame)
+            elif t == "error" and sess:
+                code = frame.get("code")
+                if code not in ("start_failed", "spawn_failed", "configuration_changed", "context.not_found",
+                                "context.changed", "context.in_use", "context.recovery_required",
+                                "context.writer_unavailable", "context.runtime_mismatch", "context.cwd_mismatch"):
+                    code = "session_failed"
+                await hub.to_session_humans(sid, {
+                    "type": "error", "session_id": sid, "launch_id": sess.launch_id,
+                    "code": code, "message": _session_failure_message(code)})
             elif t in ("runtime.unavailable", "runtime_unavailable"):
                 sid = frame.get("session_id")
                 if sid:
@@ -2254,6 +2390,8 @@ async def ws_devbox(ws: WebSocket):
                         "type": "runtime.unavailable",
                         "session_id": sid,
                         "code": frame.get("code", "runtime_unavailable"),
+                        "message": _session_failure_message(frame.get("code", "runtime_unavailable")),
+                        "launch_id": sess.launch_id,
                         "runtime": frame.get("runtime"),
                         "surface": frame.get("surface"),
                         "installation": frame.get("installation"),
@@ -2269,9 +2407,13 @@ async def ws_devbox(ws: WebSocket):
                     continue
                 # Validate the entire snapshot before changing any live/DB state.
                 resolved = []
+                seen_sessions = set()
                 try:
                     for item in items:
                         sess = _connector_session(s, conn, item)
+                        if sess.id in seen_sessions:
+                            raise HTTPException(403, "duplicate session in snapshot")
+                        seen_sessions.add(sess.id)
                         if "agent_id" in frame and frame["agent_id"] != sess.agent_id:
                             raise HTTPException(403, "session is not owned by this connector")
                         _surface_hint(item)
@@ -2281,12 +2423,22 @@ async def ws_devbox(ws: WebSocket):
                                           "code": "invalid_surface" if exc.status_code == 400 else "invalid_session",
                                           "message": exc.detail})
                     continue
+                previous_active = set(conn.active_session_ids)
+                previous_instances = dict(conn.session_instances)
                 conn.active_session_ids.clear()
                 conn.session_instances.clear()
                 ready_frames = [(sess, _resolved_session_ready(s, conn, sess, item))
                                 for sess, item in resolved]
                 s.commit()
                 for sess, ready in ready_frames:
+                    if ready is None:
+                        # An explicitly stale entry is not evidence that a newer
+                        # accepted instance disappeared. Do not let replayed
+                        # snapshots downgrade a current live generation.
+                        if sess.id in previous_active:
+                            conn.active_session_ids.add(sess.id)
+                            conn.session_instances[sess.id] = previous_instances.get(sess.id)
+                        continue
                     await hub.to_session_humans(sess.id, ready)
                     await _broadcast_collaboration(s, sess)
             elif t == "runtimes":
@@ -2371,7 +2523,7 @@ def _change_keyboard(s: OrmSession, sess: Session, user_id: str, role: str,
 
 
 async def _forward_session_command(s: OrmSession, conn: HumanConn, frame: dict) -> None:
-    """One authorization boundary for input/control, with surface-specific leases."""
+    """Current permissions, surface lease and launch generation precede every effect."""
     ws = conn.ws
     try:
         sess, _ = _attached_session(s, conn, frame)
@@ -2397,6 +2549,15 @@ async def _forward_session_command(s: OrmSession, conn: HumanConn, frame: dict) 
     rejection = policy.command_rejection(kind)
     if rejection is not None:
         await ws.send_json(rejection)
+        return
+    if (sess.launch_id not in (None, "legacy") and frame.get("launch_id") != sess.launch_id):
+        await ws.send_json({"type": "error", "session_id": sid, "code": "session_changed",
+                            "message": "This session changed. Reattach before sending commands."})
+        return
+    if (sess.launch_id not in (None, "legacy") and kind != "terminate"
+            and not hub.is_session_active(agent_id, sid)):
+        await ws.send_json({"type": "error", "session_id": sid, "code": "resume_required",
+                            "message": "The session is not ready. Use explicit Resume."})
         return
     if sess.surface == "structured" and kind == "resize":
         await ws.send_json({"type": "error", "code": "surface_not_supported",
@@ -2429,11 +2590,37 @@ async def _forward_session_command(s: OrmSession, conn: HumanConn, frame: dict) 
             ls.resize(cols, rows)
         outbound.update(cols=cols, rows=rows)
     elif kind == "terminate":
-        outbound = {"type": "terminate", "agent_id": agent_id, "session_id": sid}
-    await hub.to_devbox(agent_id, outbound)
-    if kind == "terminate":
+        previous = sess.launch_id
+        ended_launch = new_id()
+        changed = s.execute(update(Session).where(
+            Session.id == sid, Session.launch_id == previous).values(launch_id=ended_launch))
+        if changed.rowcount != 1:
+            s.rollback()
+            await ws.send_json({"type": "error", "session_id": sid, "code": "session_changed",
+                                "message": "The session changed. Reattach before ending it."})
+            return
+        s.commit()
+        # Target the old run. A delayed terminate must not kill a later resume.
+        outbound = {"type": "terminate", "agent_id": agent_id, "session_id": sid,
+                    "launch_id": None if previous == "legacy" else previous}
+    ok = await hub.to_devbox(agent_id, outbound)
+    if not ok:
+        if kind == "terminate":
+            s.execute(update(Session).where(
+                Session.id == sid, Session.launch_id == ended_launch).values(launch_id=previous))
+            s.commit()
+        await ws.send_json({"type": "error", "session_id": sid, "code": "agent_offline",
+                            "message": "The machine could not accept this command."})
+    elif kind == "terminate":
+        owner = hub.devboxes.get(hub.agent_to_devbox.get(agent_id, ""))
+        if owner:
+            owner.active_session_ids.discard(sid)
+        if ls:
+            ls.mark_ended(None)
         audit_event("session.terminated", actor_user_id=conn.user_id,
                     resource_type="session", resource_id=sid)
+        await hub.to_session_humans(sid, {"type": "status", "session_id": sid,
+                                        "state": "ended", "launch_id": ended_launch})
 
 
 async def _broadcast_collaboration(s: OrmSession, sess: Session) -> None:
@@ -2486,6 +2673,7 @@ async def ws_term(ws: WebSocket):
             # A long-lived socket must re-read current user, membership and
             # session rows rather than authorize from its identity-map cache.
             s.rollback()
+            s.expire_all()
             user = s.get(User, uid, populate_existing=True)
             if not user or user.disabled_at is not None:
                 await ws.send_json({"type": "error", "code": "read_only",
@@ -2493,7 +2681,7 @@ async def ws_term(ws: WebSocket):
                 await ws.close(code=4001)
                 break
             t = frame.get("type")
-            if t in ("attach", "open"):  # 'open' kept for back-compat
+            if t in ("attach", "open", "resume"):  # 'open' is legacy attach, not a resume bypass
                 sid = frame.get("session_id")
                 sess = s.get(Session, sid) if isinstance(sid, str) else None
                 try:
@@ -2525,6 +2713,22 @@ async def ws_term(ws: WebSocket):
                 if any(type(value) is not int or not 1 <= value <= 1000 for value in (cols, rows)):
                     await ws.send_json({"type": "error", "message": "invalid terminal dimensions"})
                     continue
+                if t == "resume":
+                    if not can_control(role):
+                        await ws.send_json({"type": "error", "session_id": sid,
+                                            "code": "read_only", "message": "Operator access is required to resume."})
+                        continue
+                    if not _native_resume_supported(sess):
+                        await ws.send_json({"type": "runtime.unavailable", "session_id": sid,
+                                            "code": "resume_unsupported", "message":
+                                            "This session does not report explicit native resume support. "
+                                            "Update the connector; no new session was created."})
+                        continue
+                    if "launch_id" not in frame or frame["launch_id"] != sess.launch_id:
+                        await ws.send_json({"type": "error", "session_id": sid,
+                                            "code": "session_changed", "message":
+                                            "This session changed. Refresh its history before resuming."})
+                        continue
                 participant = s.scalar(select(SessionParticipant).where(
                     SessionParticipant.session_id == sess.id,
                     SessionParticipant.user_id == uid))
@@ -2554,20 +2758,94 @@ async def ws_term(ws: WebSocket):
                 else:
                     await ws.send_json({"type": "restore", "session_id": sess.id,
                                         "data": ls.restore_bytes()})
-                if ls.ended:
+                # Attach/reload never resurrects a historical session. A live
+                # process is reattached without even queuing an open command.
+                if hub.is_session_active(sess.agent_id, sess.id):
                     await ws.send_json({"type": "status", "session_id": sess.id,
-                                        "state": "ended", "code": ls.exit_code})
+                                        "state": "live", "surface": sess.surface,
+                                        "renderer": policy.renderer,
+                                        "runtime_status": agent.runtime_status if agent else None,
+                                        "launch_id": sess.launch_id, "reattached": t == "resume"})
                     continue
-                # 2) ask the connector to ensure the PTY is alive (idempotent)
-                ok = await hub.to_devbox(sess.agent_id, {
-                    "type": "open", "agent_id": sess.agent_id,
-                    "session_id": sess.id, "cols": cols, "rows": rows,
-                    "surface": surface})
+                initial = sess.launch_id is None and not ls.ended
+                if t != "resume" and not (initial and can_control(role)):
+                    await ws.send_json({"type": "status", "session_id": sess.id,
+                                        "state": "ended" if ls.ended else "inactive",
+                                        "surface": sess.surface, "launch_id": sess.launch_id,
+                                        "renderer": policy.renderer,
+                                        "runtime_status": agent.runtime_status if agent else None,
+                                        "code": "resume_required", "message":
+                                        "History is read-only. Use Resume to continue the original conversation."})
+                    continue
+                if not hub.is_agent_online(sess.agent_id):
+                    await ws.send_json({"type": "status", "session_id": sess.id,
+                                        "state": "offline", "surface": sess.surface,
+                                        "renderer": policy.renderer,
+                                        "runtime_status": agent.runtime_status if agent else None,
+                                        "launch_id": sess.launch_id})
+                    continue
+                previous = sess.launch_id
+                launch = new_id() if _session_features(sess).get("session_lifecycle") == 1 else "legacy"
+                changed = s.execute(update(Session).where(
+                    Session.id == sess.id, Session.launch_id == previous).values(launch_id=launch))
+                if changed.rowcount != 1:
+                    s.rollback()
+                    await ws.send_json({"type": "error", "session_id": sid,
+                                        "code": "session_changed", "message":
+                                        "This session changed. Refresh its history before resuming."})
+                    continue
+                s.commit()
+                # Set preparing BEFORE enqueuing so an immediate ready cannot
+                # be overwritten by a late 'starting' status.
+                # Pending resume is not idle history: preserve the Agent policy's
+                # configuration-update guard while awaiting Connector readiness.
+                was_ended, previous_exit_code = ls.ended, ls.exit_code
+                ls.mark_resumed()
                 await ws.send_json({"type": "status", "session_id": sess.id,
-                                    "state": "live" if ok else "offline",
-                                    "surface": sess.surface,
+                                    "state": "starting", "surface": sess.surface,
+                                    "launch_id": launch,
                                     "renderer": policy.renderer,
                                     "runtime_status": agent.runtime_status if agent else None})
+                # Sending status yielded to other sockets (End/role changes).
+                # Recheck the same durable token before the non-yielding enqueue.
+                s.rollback()
+                sess = s.get(Session, sid, populate_existing=True)
+                if not sess or sess.launch_id != launch:
+                    await ws.send_json({"type": "error", "session_id": sid,
+                                        "code": "session_changed", "message": "The session changed before startup."})
+                    continue
+                try:
+                    fresh_user = s.get(User, uid, populate_existing=True)
+                    if not fresh_user or fresh_user.disabled_at is not None:
+                        raise HTTPException(403, "access changed")
+                    _session_role(s, uid, sess, WS_ROLE_OPERATOR)
+                except HTTPException:
+                    s.execute(update(Session).where(
+                        Session.id == sid, Session.launch_id == launch).values(launch_id=previous))
+                    s.commit()
+                    if was_ended:
+                        ls.mark_ended(previous_exit_code)
+                    await ws.send_json({"type": "error", "session_id": sid,
+                                        "code": "read_only", "message": "Operator access is required to start or resume."})
+                    continue
+                ok = await hub.to_devbox(sess.agent_id, {
+                    # Never forward browser profile/config/credential overrides.
+                    # Desired settings enter only via the authorized Agent policy.
+                    "type": "resume" if t == "resume" and not policy.library_continuation else "open",
+                    "agent_id": sess.agent_id, "session_id": sess.id,
+                    "launch_id": launch, "cols": cols, "rows": rows, "surface": surface})
+                if not ok:
+                    s.execute(update(Session).where(
+                        Session.id == sess.id, Session.launch_id == launch).values(launch_id=previous))
+                    s.commit()
+                    if was_ended:
+                        ls.mark_ended(previous_exit_code)
+                    await ws.send_json({"type": "status", "session_id": sess.id,
+                                        "state": "offline", "surface": sess.surface,
+                                        "renderer": policy.renderer,
+                                        "runtime_status": agent.runtime_status if agent else None,
+                                        "launch_id": sess.launch_id,
+                                        "message": "The machine could not accept the request. No process was started."})
             elif t in ("keyboard_acquire", "keyboard_renew", "keyboard_release", "keyboard_handoff"):
                 sid = frame.get("session_id")
                 try:

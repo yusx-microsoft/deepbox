@@ -92,6 +92,10 @@ class TransportSession:
             if frame_type in {"ack", "resend", "error", "fence"}:
                 await self._server_events.put(frame)
                 continue
+            # Lifecycle controls (open/resume/terminate) use the reliable,
+            # awaited IPC path, preserving the opaque launch_id verbatim.
+            # In particular, never translate resume to open: an older sessiond
+            # must ignore the unknown control rather than create a new context.
             await self.channel.send(frame)
 
     @staticmethod
@@ -154,6 +158,13 @@ class TransportSession:
             elif event_type == "resend":
                 await self._handle_resend(ws, event)
             elif event_type == "error":
+                if (event.get("code") in ("stale_launch", "stale_instance")
+                        and "pty_instance_id" not in event and "seq" not in event):
+                    # A terminated/replaced child can still emit an exit or
+                    # input ACK. Its control-generation rejection is not a
+                    # durable-output rejection and must not stop the Connector.
+                    # Keep every outstanding row until its exact output ACK.
+                    continue
                 raise ProtocolError(
                     str(event.get("detail") or "server rejected output"))
             elif event_type == "fence":

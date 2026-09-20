@@ -325,7 +325,8 @@ class TestNativeContextContinuity:
         context = runtimes.get(runtime_id).capabilities(
             installed=True, version="1.2.3")["features"]["context"]
         assert context == {
-            "continuity": "native_resume", "available": True, "resume_scope": scope}
+            "continuity": "native_resume", "available": True,
+            "resume_scope": scope, "explicit_resume": True}
 
     def test_capabilities_report_no_resume_when_the_runtime_is_missing(self):
         context = runtimes.get("claude-code-structured").capabilities(

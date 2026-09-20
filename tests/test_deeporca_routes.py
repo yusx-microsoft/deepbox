@@ -530,9 +530,19 @@ def test_deeporca_text_input_options_rejected_before_queue_or_forward(app_client
             for kind in ("interrupt", "terminate"):
                 ws.send_json({"type": kind, "session_id": sid})
                 ws.send_json({"type": "input", "session_id": sid, "client_input_id": "invalid"})
-                assert ws.receive_json()["message"] == "invalid client_input_id"
-                send.assert_awaited_once_with(agent["id"], {
-                    "type": kind, "session_id": sid, "agent_id": agent["id"]})
+                response = ws.receive_json()
+                if kind == "terminate":
+                    assert response["type"] == "status" and response["state"] == "ended"
+                    response = ws.receive_json()
+                    # Termination replaces the generation immediately; even
+                    # this invalid-input barrier belongs to the old launch.
+                    assert response["code"] == "session_changed"
+                else:
+                    assert response["message"] == "invalid client_input_id"
+                expected = {"type": kind, "session_id": sid, "agent_id": agent["id"]}
+                if kind == "terminate":
+                    expected["launch_id"] = None
+                send.assert_awaited_once_with(agent["id"], expected)
                 send.reset_mock()
 
 

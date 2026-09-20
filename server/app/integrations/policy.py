@@ -27,6 +27,7 @@ class InputRejected(Exception):
 class RuntimePolicy:
     renderer: str | None = None
     restore_events = False
+    library_continuation = False
     identity_fields = {"runtime", "local_project_id", "runtime_config"}
 
     def validate_create_fields(self, body: dict) -> None:

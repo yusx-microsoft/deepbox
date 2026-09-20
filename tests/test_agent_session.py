@@ -575,10 +575,10 @@ def test_confirmed_native_context_is_recorded_once_for_the_session():
 
 
 def test_context_is_recorded_even_when_the_runtime_reports_no_identifier():
-    """Copilot completes turns without ever emitting a transcript id.
+    """Successful establishment must not require a provider ID in the event.
 
-    Continuity must therefore key off a completed turn, not a provider id,
-    otherwise the next turn would silently start a new conversation.
+    The translated stream may omit identifiers; reservation before spawn is
+    separate from this successful-turn promotion callback.
     """
     async def run():
         got = []
@@ -609,10 +609,10 @@ def test_context_is_recorded_even_when_the_runtime_reports_no_identifier():
 
 
 def test_a_persistent_session_spawns_through_the_command_builder():
-    """Regression: persistent runtimes once spawned with the base command.
+    """Eager-start callers, too, must use the adapter command builder.
 
-    That bypassed session-continuity flags entirely, so Claude silently began a
-    brand new conversation while the UI still showed the old transcript.
+    The supervisor's lazy-start path already did; this is not evidence of a
+    production Claude context-loss bug in that path.
     """
     async def run():
         spawned = []

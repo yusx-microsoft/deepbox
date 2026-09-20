@@ -223,6 +223,7 @@ async def test_real_connector_sdk_browser_roundtrip(hermetic_sdk, tmp_path, monk
                 assert any(f.get("type") == "restore" and f.get("kind") == "event" for f in initial)
                 input_id = str(uuid4())
                 user_input = {"type": "input", "session_id": sid,
+                              "launch_id": ready["launch_id"],
                               "client_input_id": input_id, "data": FIRST}
                 await ws.send(json.dumps(user_input))
                 def completed(frame):
@@ -295,10 +296,8 @@ async def test_real_connector_sdk_browser_roundtrip(hermetic_sdk, tmp_path, monk
             assert connector.supervisor._library_store().worker_binding(aid) == private_binding
 
             # Discover the existing public reference through the authenticated
-            # API, then explicitly attach THAT conversation. UI restoration
-            # currently sends inactive sessions to replay; this tests the real
-            # browser wire API, not a nonexistent UI Continue button. Ended
-            # sessions intentionally cannot be revived by ordinary attach.
+            # API, then explicitly continue THAT conversation with its expected
+            # launch generation. Ordinary attach remains passive for history.
             response = await browser.get(f"/api/agents/{aid}/sessions")
             assert response.status_code == 200, response.text
             sessions = response.json()
@@ -306,8 +305,10 @@ async def test_real_connector_sdk_browser_roundtrip(hermetic_sdk, tmp_path, monk
             assert sessions[0]["state"] == "inactive", sessions
             assert len(provider.requests) == 1  # restart never replays model input
             async with websockets.connect(ws_url, **connect_options) as ws:
-                await ws.send(json.dumps({"type": "attach", "session_id": sid, "surface": "structured"}))
+                await ws.send(json.dumps({"type": "resume", "session_id": sid, "surface": "structured",
+                                          "launch_id": sessions[0]["launch_id"]}))
                 ready, resumed_frames = await _receive_until(ws, lambda f: f.get("type") == "session.ready")
+                assert ready["launch_id"] != sessions[0]["launch_id"]
                 assert ready["session_id"] == sid
                 assert ready["pty_instance_id"] != first_pty
                 assert ready["surface"] == "structured"
@@ -321,6 +322,7 @@ async def test_real_connector_sdk_browser_roundtrip(hermetic_sdk, tmp_path, monk
 
                 second_input_id = str(uuid4())
                 await ws.send(json.dumps({"type": "input", "session_id": sid,
+                    "launch_id": ready["launch_id"],
                     "client_input_id": second_input_id, "data": SECOND}))
                 _, second_frames = await _receive_until(ws, completed)
                 assert any(f.get("type") == "input_ack" and f.get("client_input_id") == second_input_id

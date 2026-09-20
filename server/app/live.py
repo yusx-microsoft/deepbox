@@ -221,6 +221,15 @@ class LiveSession:
     def restore_bytes(self) -> str:
         return serialize_screen(self.screen)
 
+    def mark_resumed(self):
+        """Confirmed same-session resume reopens append-only recording, not history."""
+        if self.ended:
+            if self._cast.closed:
+                self._open_cast()
+            self.pending_inputs.clear()  # never replay queued user input after End
+            self.ended = False
+            self.exit_code = None
+
     def mark_ended(self, code: int | None):
         self.ended = True
         self.exit_code = code

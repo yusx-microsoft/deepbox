@@ -259,7 +259,8 @@ session-scoped controls remain editable until the session is configured
 or contains its first chat item. They then lock with a prompt to start **New chat**.
 That action creates a blank persisted session and re-enables those controls without
 stopping another collaborator's session or deleting saved history. **End session**
-is a separate confirmed action for the keyboard holder or a workspace Admin/Owner.
+is a separate confirmed action: current Operator/Admin/Owner access for structured
+Chat, or the current keyboard holder for Terminal (including an Admin/Owner).
 
 ### Terminal and shared-chat checks
 

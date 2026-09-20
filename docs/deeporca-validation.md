@@ -272,6 +272,49 @@ From the native repository:
 python -m pytest tests/test_embedded.py tests/test_turn_error_settlement.py tests/test_tools_cancel_cleanup.py tests/test_turn_characterization.py tests/test_turns.py tests/test_turns_phase3.py tests/test_turns_phase4.py tests/test_turns_phase5.py tests/test_turns_phase6.py tests/test_turns_phase7.py tests/test_turns_phase8.py tests/test_turns_phase9.py tests/test_tools.py tests/test_file_tools.py tests/test_security.py -q
 ```
 
+## Merge with native writers and session-history actions
+
+PR #1 was reconciled with `main` at `0aa3e09`, retaining native writer ownership,
+history rename and explicit lifecycle generations alongside the DeepOrca library
+runtime, managed configuration and existing-profile binding. New regressions cover
+library continuation without CLI adoption, authorization and generation fencing,
+originating-generation input acknowledgments, and passive browser restoration.
+
+The merged-tree validation results were:
+
+- Full Python suite: **1321 passed, 14 skipped, 24 subtests passed**. The skips
+  are seven real-SDK opt-ins and seven host/platform permission cases; the SDK
+  cases were exercised separately below.
+- All 17 recursively discovered Node test files: **354 passed**.
+- Chromium/browser, web integration and web assets: **23 passed** (overlaps the
+  full Python suite).
+- Connector transport plus real SDK/E2E group: **24 passed** with isolated SDK
+  source archived from `b222de5`. This includes managed model reconfiguration
+  after termination, restart/continuation, and existing-profile operation.
+- CRLF-aware whitespace, residual conflict markers and documentation checks
+  passed. Counts above overlap and must not be added together.
+
+The first full run had five failures from old lifecycle/UI test expectations;
+these were retained and corrected for immediate `status: ended`, generation
+tokens, authoritative session metadata and the **View history** action. Real
+E2E then exposed a transport defect: a late exit after termination receives
+`stale_launch`, which had incorrectly stopped the entire Connector as an output
+protocol error. Only identity-free stale lifecycle rejections are now ignored;
+pending durable rows still require their exact output ACK, and output/unknown
+errors still fail closed. Regression tests cover both sides of this boundary.
+
+An earlier SDK run against concurrent native history-log work failed a history
+filename assertion. Stable-SDK verification used an archive rather than changing
+that live checkout. No live services/profiles or external model providers were
+used or modified in this merge validation.
+
+Local temporary evidence is under
+`C:/Users/chec/.deeporca/agents/deepbox/tmp/pr1-merge-evidence/`:
+`full.xml` retains the first failure run; `full-resolved.xml`/`.log` and
+`sdk-e2e-transport-fixed.xml`/`.log` contain the final Python results;
+`ui-regressions-b739728384/` contains browser and recursive Node logs. These
+artifacts are not committed fixtures or deployment evidence.
+
 ## Important assertions
 
 - Browser inputs/configuration never choose an executable, package, environment or arbitrary workspace/template/profile path. Configuration uses registered projects, the Connector's `connector-default` template or advertised opaque existing-profile references. Web-entered API keys are sealed before Server submission.

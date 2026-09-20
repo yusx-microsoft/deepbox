@@ -19,7 +19,7 @@ explicit transport acknowledgement.
 from __future__ import annotations
 
 import asyncio
-import logging
+import os
 from collections import deque
 from uuid import UUID, uuid4
 
@@ -27,12 +27,11 @@ from .ipc import Channel
 from .pty_session import PtySession, resolve_cmd
 from .agent_session import StructuredAgentSession
 from .runtime_probe import availability, probe_family
-from .local_store import LocalProjectStore
+from .local_store import LocalProjectStore, default_state_root
+from .native_writer import NativeWriterError, NativeWriterLease
 from . import runtimes
 from .spool import InMemorySpool, SpoolBase
 from .integrations.deeporca.supervisor import DeepOrcaSupervisorMixin
-
-log = logging.getLogger(__name__)
 
 # Pipelining bounds: how many durable output frames (and their bytes) may
 # be in flight to the transport before earlier ACKs return. The disk spool is
@@ -42,14 +41,27 @@ MAX_INFLIGHT_FRAMES = 64
 MAX_INFLIGHT_BYTES = 512 * 1024
 
 
+class _ContextUnavailable(ValueError):
+    """Only fixed, non-secret lifecycle failures may cross the wire."""
+
+    def __init__(self, code="context.not_found"):
+        self.code = code
+        super().__init__(
+            "Native context is unavailable for this session and configuration. "
+            "Restore the original local context or start a new session.")
+
+
 class SessionSupervisor(DeepOrcaSupervisorMixin):
     """Owns every local agent session, independent of any transport."""
 
     def __init__(self, agents: dict[str, dict] | None = None,
                  spool: SpoolBase | None = None,
                  local_store: LocalProjectStore | None = None,
-                 deeporca_store=None, deeporca_worker_factory=None):
+                 deeporca_store=None, deeporca_worker_factory=None,
+                 native_lock_root: str | None = None):
         self.local_store = local_store
+        # User-scoped, never agent/DB/cwd-scoped. Tests inject disposable roots.
+        self._native_lock_root = native_lock_root or os.path.join(default_state_root(), "native-writers")
         self.agents: dict[str, dict] = {}
         self._project_migrations: dict[str, dict] = {}
         self.replace_agents(agents or {})
@@ -57,12 +69,16 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
         self.ptys: dict[tuple[str, str], PtySession | StructuredAgentSession] = {}
         self.pty_instances: dict[tuple[str, str], str] = {}
         self.pty_surfaces: dict[tuple[str, str], str] = {}
+        self.pty_launch_ids: dict[tuple[str, str], object] = {}
         # Test/embedded callers may omit the local store. Production persists
         # these records in LocalProjectStore so a sessiond restart can resume.
         self._memory_native_contexts: dict[tuple[str, str], tuple[str, str | None]] = {}
         self._open_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._open_users: dict[tuple[str, str], int] = {}
+        self._open_requests: dict[tuple[str, str], object] = {}
+        self._open_generations: dict[tuple[str, str], tuple] = {}
         self._stopped = False
+        self._close_tasks: set[asyncio.Task] = set()
         # Durable, sequence-numbered store of unacknowledged session output. Tests
         # may inject an InMemorySpool; the CLI injects a DiskSpool.
         self._spool: SpoolBase = spool if spool is not None else InMemorySpool()
@@ -135,7 +151,8 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
         """Return ``(runtime_id, cwd)`` when this session already has context."""
         if self.local_store is not None:
             record = self.local_store.native_context(agent_id, session_id)
-            return (record.runtime_id, record.cwd) if record else None
+            return (record.runtime_id, os.path.normcase(record.cwd)
+                    if record.cwd else None) if record else None
         return self._memory_native_contexts.get((agent_id, session_id))
 
     def _record_context(self, agent_id: str, session_id: str,
@@ -146,19 +163,11 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
         else:
             self._memory_native_contexts[(agent_id, session_id)] = (runtime_id, cwd)
 
-    def _recorded_context_keys(
-            self, agent_ids: set[str]) -> list[tuple[str, str]]:
-        if self.local_store is None:
-            return []
-        keys: list[tuple[str, str]] = []
-        for agent_id in agent_ids:
-            try:
-                sessions = self.local_store.native_context_sessions(agent_id)
-            except Exception:
-                log.exception("Could not list local agent context markers")
-                continue
-            keys.extend((agent_id, session_id) for session_id in sessions)
-        return keys
+    def _reserve_context(self, agent_id, session_id, runtime_id, cwd) -> None:
+        if self.local_store is not None:
+            self.local_store.reserve_native_context(agent_id, session_id, runtime_id, cwd)
+        else:
+            self._record_context(agent_id, session_id, runtime_id, cwd)
 
     # -- transport attach/detach ------------------------------------------
 
@@ -360,30 +369,30 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                 for key, pty in list(self.ptys.items()):
                     if key[0] in removed_agent_ids:
                         try:
-                            pty.kill()
+                            self._stop_session(pty)
                         except Exception:
                             pass
                         self.ptys.pop(key, None)
                         self.pty_instances.pop(key, None)
                         self.pty_surfaces.pop(key, None)
-                for key in list(self._memory_native_contexts):
-                    if key[0] in removed_agent_ids:
-                        self._memory_native_contexts.pop(key, None)
-                if self.local_store is not None:
-                    # Local resume markers for deleted agents are meaningless.
-                    # The provider transcript itself is never touched here.
-                    for agent_id, session_id in self._recorded_context_keys(
-                            removed_agent_ids):
-                        try:
-                            self.local_store.forget_native_context(
-                                agent_id, session_id)
-                        except Exception:
-                            log.exception(
-                                "Could not clear a local agent context marker")
+                        self.pty_launch_ids.pop(key, None)
+                # Inventory omission must not erase native history. Re-adding
+                # an agent must not turn an old ID into a create request.
             self._schedule_runtime_reconciliation()
             return
         aid = frame.get("agent_id")
         sid = frame.get("session_id")
+        key = (aid, sid)
+        if t in {"input", "interrupt", "resize", "permission", "close", "terminate"}:
+            pending = self._open_generations.get(key)
+            active = self.pty_launch_ids.get(key)
+            target = pending[0] if pending is not None else active
+            # Missing/None tokens are compatible only with tokenless legacy
+            # sessions. Never let a delayed control cross a Resume generation.
+            if frame.get("launch_id") != target:
+                return
+            if t in {"input", "interrupt", "resize", "permission"} and target != active:
+                return  # The pending generation does not own the live child yet.
         if t == "input":
             try:
                 client_input_id = str(UUID(str(frame.get("client_input_id"))))
@@ -392,10 +401,11 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             frame = {**frame, "client_input_id": client_input_id}
         if await self._handle_runtime_control(frame):
             return
-        if t == "open":
+        if t in {"open", "resume"}:
             await self.open_pty(
                 aid, sid, frame.get("cols", 120), frame.get("rows", 30),
-                surface=frame.get("surface"))
+                surface=frame.get("surface"), launch_id=frame.get("launch_id"),
+                resume=t == "resume")
         elif t == "input":
             p = self.ptys.get((aid, sid))
             if p:
@@ -415,6 +425,7 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                         "type": "input_ack", "agent_id": aid,
                         "session_id": sid, "client_input_id": client_input_id,
                         "status": "rejected", "reason": reason,
+                        "launch_id": frame.get("launch_id"),
                     })
                     return
                 first_delivery = self._spool.record_input_once(client_input_id)
@@ -430,6 +441,7 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                     "session_id": sid,
                     "client_input_id": client_input_id,
                     "status": "delivered",
+                    "launch_id": frame.get("launch_id"),
                 })
         elif t == "interrupt":
             p = self.ptys.get((aid, sid))
@@ -447,13 +459,13 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                 p.respond_permission(str(frame.get("request_id", "")),
                                      bool(frame.get("allow")))
         elif t in ("close", "terminate"):
-            key = (aid, sid)
             self._invalidate_open(key)
             p = self.ptys.pop(key, None)
             if p:
-                p.kill()
+                self._stop_session(p)
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
+            self.pty_launch_ids.pop(key, None)
         elif t == "list_sessions":
             self.emit(self.sessions_frame())
 
@@ -489,21 +501,39 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                 "session_id": sid,
                 "pty_instance_id": self.pty_instances[(aid, sid)],
                 "surface": self.pty_surfaces.get((aid, sid), "terminal"),
+                "launch_id": self.pty_launch_ids.get((aid, sid)),
             } for aid, sid in self.ptys.keys()],
         }
 
     async def open_pty(self, agent_id: str, session_id: str,
                        cols: int = 120, rows: int = 30,
-                       surface: str | None = None) -> None:
+                       surface: str | None = None, launch_id=None,
+                       *, resume: bool = False) -> None:
         if self._stopped or agent_id not in self.agents:
             return
         key = (agent_id, session_id)
+        pending = self._open_generations.get(key)
+        if launch_id is None and (self.pty_launch_ids.get(key) is not None
+                                  or (pending is not None and pending[0] is not None)):
+            # An old tokenless reconnect must not downgrade an already modern
+            # live/pending session and enable legacy controls against it.
+            return
         lock = self._open_locks.setdefault(key, asyncio.Lock())
         self._open_users[key] = self._open_users.get(key, 0) + 1
+        generation = (launch_id, resume)
+        if self._open_generations.get(key) != generation:
+            self._open_generations[key] = generation
+            self._open_requests[key] = object()
+        request = self._open_requests[key]
 
         def current():
             return (not self._stopped and agent_id in self.agents
-                    and self._open_locks.get(key) is lock)
+                    and self._open_locks.get(key) is lock
+                    and self._open_requests.get(key) is request)
+
+        def emit(frame):
+            if current():
+                self.emit({**frame, "launch_id": launch_id})
 
         try:
             async with lock:
@@ -511,12 +541,17 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                     return
                 try:
                     await self._open_pty(
-                        agent_id, session_id, cols, rows, surface, current)
+                        agent_id, session_id, cols, rows, surface, current,
+                        emit, launch_id, resume)
+                except (_ContextUnavailable, NativeWriterError) as exc:
+                    emit({"type": "runtime.unavailable", "agent_id": agent_id,
+                          "session_id": session_id, "surface": surface,
+                          "code": exc.code, "message": str(exc)})
                 except Exception:
                     # Exceptions can contain executable paths, argv, environment
                     # values or provider credentials. Never forward their text.
                     if current():
-                        self.emit({
+                        emit({
                             "type": "runtime.unavailable",
                             "agent_id": agent_id,
                             "session_id": session_id,
@@ -538,15 +573,17 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
         # register a child after close, retirement or shutdown (even on re-add).
         self._open_locks.pop(key, None)
         self._open_users.pop(key, None)
+        self._open_requests.pop(key, None)
+        self._open_generations.pop(key, None)
 
     async def _open_pty(self, agent_id, session_id, cols, rows, surface,
-                        current) -> None:
+                        current, emit, launch_id, resume) -> None:
         key = (agent_id, session_id)
         existing = self.ptys.get(key)
         if existing and existing.is_alive():
             confirmed = self.pty_surfaces.get(key, "terminal")
             if surface and surface != confirmed:
-                self.emit({
+                emit({
                     "type": "runtime.unavailable",
                     "agent_id": agent_id,
                     "session_id": session_id,
@@ -555,11 +592,21 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                     "available_surfaces": [confirmed],
                 })
                 return
-            self.emit({"type": "ready", "agent_id": agent_id,
+            if resume:
+                if (confirmed != "structured"
+                        or not isinstance(existing, StructuredAgentSession)
+                        or existing._context_preparing is None
+                        or existing._writer_lease_factory is None):
+                    raise _ContextUnavailable()
+                existing.require_existing_context = True
+                existing.prepare_context()
+            self.pty_launch_ids[key] = launch_id
+            emit({"type": "ready", "agent_id": agent_id,
                        "session_id": session_id,
                        "pty_instance_id": self.pty_instances[key],
                        "surface": confirmed,
-                       "structured": confirmed == "structured"})
+                       "structured": confirmed == "structured",
+                       **({"context_resume": "pending"} if resume else {})})
             return
         if existing:
             # A child can stop outside the supervisor while its reader is blocked.
@@ -567,16 +614,22 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             self.ptys.pop(key, None)
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
+            self.pty_launch_ids.pop(key, None)
             try:
-                existing.kill()
+                self._stop_session(existing)
+                waiter = getattr(existing, "wait_closed", None)
+                if waiter is not None:
+                    await waiter()
             except Exception:
                 pass
+            if not current():
+                return
         pty_instance_id = str(uuid4())
         info = self.agents.get(agent_id)
         if not info:
             return
         if info.get("project_error"):
-            self.emit({
+            emit({
                 "type": "runtime.unavailable",
                 "agent_id": agent_id,
                 "session_id": session_id,
@@ -585,6 +638,7 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                 "message": "Local project is unavailable. Restore or rebind the workspace, then retry.",
             })
             return
+        info = dict(info)  # snapshot across asynchronous availability probing
         configured_runtime = info.get("runtime", "mock")
         try:
             if surface:
@@ -603,7 +657,9 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                 adapter = next((item for item in candidates
                                 if item.default_surface), candidates[0])
         except (runtimes.UnknownRuntimeError, IndexError):
-            self.emit({
+            if resume:
+                raise _ContextUnavailable() from None
+            emit({
                 "type": "runtime.unavailable",
                 "agent_id": agent_id,
                 "session_id": session_id,
@@ -615,6 +671,8 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             return
         runtime_id = adapter.id
         confirmed_surface = adapter.surface_id
+        if resume and (not adapter.structured or adapter.context_control is None):
+            raise _ContextUnavailable()
 
         # The server-side capability blob is a cached self-report, not an auth
         # gate. Re-probe installation/auth/compatibility immediately before every
@@ -623,9 +681,14 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             probe_family, adapter.family_id, include_models=False)
         if not current():
             return
+        if self.agents.get(agent_id) != info:
+            emit({"type": "runtime.unavailable", "agent_id": agent_id,
+                       "session_id": session_id, "code": "configuration_changed",
+                       "message": "Agent configuration changed during startup. Retry."})
+            return
         can_spawn, reason = availability(capability, confirmed_surface)
         if not can_spawn:
-            self.emit({
+            emit({
                 "type": "runtime.unavailable",
                 "agent_id": agent_id,
                 "session_id": session_id,
@@ -638,7 +701,8 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             })
             return
         if await self._open_runtime_session(
-                adapter, agent_id, session_id, confirmed_surface, pty_instance_id, current):
+                adapter, agent_id, session_id, confirmed_surface, pty_instance_id,
+                current, launch_id=launch_id):
             return
         runtime_config = (info.get("runtime_config")
                           if isinstance(info.get("runtime_config"), dict)
@@ -671,42 +735,89 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             if self.ptys.get(key) is not p:
                 return
             self.ptys.pop(key, None)
+            exit_launch_id = self.pty_launch_ids.pop(key, None)
             self.emit({"type": "exit", "agent_id": agent_id,
                        "session_id": session_id,
                        "pty_instance_id": pty_instance_id,
-                       "code": code})
+                       "code": code, "launch_id": exit_launch_id})
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
 
         if structured:
             attachment = runtimes.attachment_control(runtime_id)
             context_control = adapter.context_control
-            context_error = None
+            effective_cwd = os.path.normcase(os.path.realpath(os.path.abspath(
+                info.get("cwd") or os.getcwd())))
+            recorded = None
             resume_context = False
-            if context_control is not None:
-                # A recorded transcript means this session already exists inside
-                # the provider CLI, so the next process must resume instead of
-                # creating it. Mismatches fail closed: silently starting a fresh
-                # context under an existing conversation would mislead the user.
-                recorded = self._recorded_context(agent_id, session_id)
-                if recorded is not None:
-                    resume_context = True
-                    recorded_runtime, recorded_cwd = recorded
-                    if recorded_runtime != runtime_id:
-                        context_error = (
-                            "This session's agent runtime changed, so its earlier "
-                            "context cannot be resumed. Start a new session.")
-                    elif (context_control.resume_scope == "cwd"
-                          and recorded_cwd != info.get("cwd")):
-                        context_error = (
-                            "This session's local project changed, so its earlier "
-                            "context cannot be resumed. Restore the original "
-                            "project or start a new session.")
+            context_error = None
+
+            def refresh_context(*, strict=False) -> None:
+                nonlocal recorded, resume_context, context_error
+                if strict:
+                    if self.local_store is None:
+                        raise _ContextUnavailable()
+                    try:
+                        marker = self.local_store.native_context(agent_id, session_id)
+                    except Exception:
+                        raise _ContextUnavailable() from None
+                    if (marker is None or marker.state not in {"attempted", "established"}
+                            or marker.cwd is None):
+                        raise _ContextUnavailable()
+                    try:
+                        recorded_adapter = runtimes.get(marker.runtime_id)
+                    except runtimes.UnknownRuntimeError:
+                        raise _ContextUnavailable() from None
+                    if not recorded_adapter.structured or recorded_adapter.context_control is None:
+                        raise _ContextUnavailable()
+                    recorded = (marker.runtime_id, os.path.normcase(os.path.realpath(os.path.abspath(marker.cwd))))
+                else:
+                    recorded = self._recorded_context(agent_id, session_id)
+                resume_context = recorded is not None
+                context_error = None
+                if recorded is not None and recorded[0] != runtime_id:
+                    if strict:
+                        raise _ContextUnavailable("context.runtime_mismatch")
+                    context_error = (
+                        "This session's agent runtime changed, so its earlier context "
+                        "cannot be resumed. Start a new session.")
+                elif (recorded is not None and context_control.resume_scope == "cwd"
+                      and recorded[1] != effective_cwd):
+                    if strict:
+                        raise _ContextUnavailable("context.cwd_mismatch")
+                    context_error = (
+                        "This session's local project changed, so its earlier context "
+                        "cannot be resumed. Restore the original project or start a new session.")
+
+            if context_control is not None and not resume:
+                refresh_context()
+
+            def prepare_context() -> None:
+                # Called only while holding native writer ownership. Open-time
+                # state alone cannot decide between create and resume.
+                refresh_context(strict=getattr(p, "require_existing_context", resume))
+                if context_error:
+                    raise ValueError(context_error)
+                if self._stopped or self.agents.get(agent_id) != info:
+                    if getattr(p, "require_existing_context", resume):
+                        raise _ContextUnavailable("configuration_changed")
+                    raise ValueError("Agent configuration changed. Reopen the session before sending.")
+                if recorded is None:
+                    try:
+                        self._reserve_context(agent_id, session_id, runtime_id, effective_cwd)
+                    except Exception:
+                        raise ValueError(
+                            "Could not reserve native conversation state. No agent process was started.") from None
 
             async def context_started() -> None:
-                """The runtime accepted our session, so later turns must resume."""
                 nonlocal resume_context
-                self._record_context(agent_id, session_id, runtime_id, info.get("cwd"))
+                # Strict resumes may update an existing marker, never create one.
+                if getattr(p, "require_existing_context", resume):
+                    refresh_context(strict=True)
+                # Machine-scoped recovery preserves the original binding marker.
+                self._record_context(
+                    agent_id, session_id, runtime_id,
+                    recorded[1] if recorded is not None else effective_cwd)
                 resume_context = True
 
             def sanitize_options(value):
@@ -731,7 +842,8 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
 
             from .agent_session import TRANSLATORS
             p = StructuredAgentSession(
-                cmd, info.get("cwd"), on_output, on_exit, cols=cols, rows=rows,
+                cmd, effective_cwd if context_control else info.get("cwd"),
+                on_output, on_exit, cols=cols, rows=rows,
                 translate=TRANSLATORS.get(runtime_id),
                 per_turn=adapter.per_turn,
                 prompt_argv=list(adapter.prompt_argv),
@@ -752,12 +864,17 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                     (lambda previous, current: runtimes.live_control_requests(
                         adapter.id, previous, current))
                     if adapter.live_controls else None),
-                context_started=(context_started
-                                 if context_control is not None else None))
+                context_started=(context_started if context_control else None),
+                context_preparing=(prepare_context if context_control else None),
+                writer_lease_factory=(lambda: NativeWriterLease(
+                    self._native_lock_root, adapter.family_id, session_id)) if context_control else None,
+                require_existing_context=resume)
         else:
             p = PtySession(cmd, info.get("cwd"), on_output, on_exit,
                            cols=cols, rows=rows)
         try:
+            if resume:
+                p.prepare_context()
             await p.start()
             if not current():
                 return
@@ -766,18 +883,23 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
             self.ptys[key] = p
             self.pty_instances[key] = pty_instance_id
             self.pty_surfaces[key] = confirmed_surface
+            self.pty_launch_ids[key] = launch_id
         finally:
             if self.ptys.get(key) is not p:
                 # start() can raise or be cancelled after creating a child.
                 try:
-                    p.kill()
+                    self._stop_session(p)
+                    waiter = getattr(p, "wait_closed", None)
+                    if waiter is not None:
+                        await waiter()
                 except Exception:
                     pass
-        self.emit({"type": "ready", "agent_id": agent_id,
+        emit({"type": "ready", "agent_id": agent_id,
                    "session_id": session_id,
                    "pty_instance_id": pty_instance_id,
                    "surface": confirmed_surface,
-                   "structured": structured})
+                   "structured": structured,
+                   **({"context_resume": "pending"} if resume else {})})
         self.emit({"type": "presence", "agent_id": agent_id, "state": "online"})
 
     def status(self) -> dict:
@@ -790,6 +912,7 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                 "session_id": sid,
                 "pty_instance_id": self.pty_instances[(aid, sid)],
                 "surface": self.pty_surfaces.get((aid, sid), "terminal"),
+                "launch_id": self.pty_launch_ids.get((aid, sid)),
             } for aid, sid in self.ptys.keys()],
             **spool_status,
         }
@@ -798,7 +921,21 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
         """Settle extension sessions before closing the durable spool."""
         await self._close_runtime_sessions()
         self.shutdown()
+        await self.wait_closed()
         self._close_runtime_storage()
+
+    def _stop_session(self, session) -> None:
+        session.kill()
+        waiter = getattr(session, "wait_closed", None)
+        if waiter is not None:
+            task = asyncio.create_task(waiter())
+            self._close_tasks.add(task)
+            task.add_done_callback(self._close_tasks.discard)
+
+    async def wait_closed(self) -> None:
+        """Drain reapers before closing the event loop or local SQLite store."""
+        while self._close_tasks:
+            await asyncio.gather(*tuple(self._close_tasks), return_exceptions=True)
 
     def shutdown(self) -> None:
         """Stop all sessions on supervisor exit. Never called on detach."""
@@ -807,13 +944,16 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
         self._stopped = True
         self._open_locks.clear()
         self._open_users.clear()
+        self._open_requests.clear()
+        self._open_generations.clear()
         sessions = list(self.ptys.values())
         self.ptys.clear()
         self.pty_instances.clear()
         self.pty_surfaces.clear()
+        self.pty_launch_ids.clear()
         for p in sessions:
             try:
-                p.kill()
+                self._stop_session(p)
             except Exception:
                 pass
         self._spool.close()

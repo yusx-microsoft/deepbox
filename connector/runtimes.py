@@ -201,6 +201,7 @@ class ContextControl:
             "continuity": "native_resume",
             "available": installed,
             "resume_scope": self.resume_scope,
+            "explicit_resume": True,
         }
 
 
@@ -340,6 +341,7 @@ class RuntimeAdapter:
                 **({"backend": self.backend} if self.backend != "cli" else {}),
                 **({"renderer": self.renderer, "interactive_approval": False}
                    if self.renderer else {}),
+                "session_lifecycle": 1,
                 "models": list(self.models),
                 "permission_modes": sorted(self.permission_modes),
                 "structured": self.structured,

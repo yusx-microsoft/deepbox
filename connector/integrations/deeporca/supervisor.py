@@ -335,7 +335,8 @@ class DeepOrcaSupervisorMixin:
         session = self.ptys.get(key)
         if kind == "input" and (self.agents.get(aid, {}).get("runtime") == "deeporca"
                                 or self._is_library_session(session)):
-            self.emit(await self._library_input(frame, session))
+            ack = await self._library_input(frame, session)
+            self.emit({**ack, "launch_id": frame.get("launch_id")})
             return True
         if not self._is_library_session(session):
             return False
@@ -352,16 +353,21 @@ class DeepOrcaSupervisorMixin:
                 self.ptys.pop(key, None)
                 self.pty_instances.pop(key, None)
                 self.pty_surfaces.pop(key, None)
+                self.pty_launch_ids.pop(key, None)
             self._schedule_runtime_reconciliation()
             return True
         return False
 
     async def _open_runtime_session(self, adapter, agent_id, session_id, surface,
-                                    pty_instance_id, current):
+                                    pty_instance_id, current, *, launch_id=None):
         """Handle library session creation wholly outside the CLI/PTY path."""
         if adapter.id != "deeporca":
             return False
         key = (agent_id, session_id)
+
+        def emit(frame):
+            if current():
+                self.emit({**frame, "launch_id": launch_id})
 
         async def on_output(data, *, _library_emergency=False):
             if (self._stopped or agent_id not in self.agents
@@ -376,15 +382,17 @@ class DeepOrcaSupervisorMixin:
             if self.ptys.get(key) is not session:
                 return
             self.ptys.pop(key, None)
+            exit_launch_id = self.pty_launch_ids.pop(key, None)
             self.emit({"type": "exit", "agent_id": agent_id, "session_id": session_id,
-                       "pty_instance_id": pty_instance_id, "code": code})
+                       "pty_instance_id": pty_instance_id, "code": code,
+                       "launch_id": exit_launch_id})
             self.pty_instances.pop(key, None)
             self.pty_surfaces.pop(key, None)
 
         try:
             session = await self._make_library_session(agent_id, session_id, on_output, on_exit)
         except BindingError as exc:
-            self.emit({"type": "runtime.unavailable", "agent_id": agent_id,
+            emit({"type": "runtime.unavailable", "agent_id": agent_id,
                        "session_id": session_id, "runtime": "deeporca",
                        "surface": surface, "code": self._library_error(exc)})
             return True
@@ -397,6 +405,7 @@ class DeepOrcaSupervisorMixin:
             self.ptys[key] = session
             self.pty_instances[key] = pty_instance_id
             self.pty_surfaces[key] = surface
+            self.pty_launch_ids[key] = launch_id
             await self._library_recovery_notice(agent_id, session_id, on_output)
         finally:
             if self.ptys.get(key) is not session:
@@ -404,7 +413,7 @@ class DeepOrcaSupervisorMixin:
                     session.kill()
                 except Exception:
                     pass
-        self.emit({"type": "ready", "agent_id": agent_id, "session_id": session_id,
+        emit({"type": "ready", "agent_id": agent_id, "session_id": session_id,
                    "pty_instance_id": pty_instance_id, "surface": surface,
                    "structured": adapter.structured})
         self.emit({"type": "presence", "agent_id": agent_id, "state": "online"})

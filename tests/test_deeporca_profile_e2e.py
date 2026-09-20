@@ -86,9 +86,10 @@ def _profile_settings(binding, llm, sandbox):
     return profile
 
 
-async def _turn(ws, sid, prompt, answer):
+async def _turn(ws, sid, prompt, answer, *, launch_id):
     input_id = str(uuid4())
     await ws.send(json.dumps({"type": "input", "session_id": sid,
+                             "launch_id": launch_id,
                              "client_input_id": input_id, "data": prompt}))
 
     def completed(frame):
@@ -242,6 +243,9 @@ async def test_web_profile_without_template_update_and_restart(hermetic_sdk, tmp
             revision = binding_revision(aid, project.id, config)
 
             async def agent_ready():
+                if connector_task.done():
+                    connector_task.result()
+                    pytest.fail("Connector stopped before profile readiness")
                 response = await browser.get(f"/api/agents/{aid}")
                 assert response.status_code == 200, response.text
                 observed = response.json()
@@ -277,8 +281,10 @@ async def test_web_profile_without_template_update_and_restart(hermetic_sdk, tmp
                 assert response.status_code == 200, response.text
                 return response.json()["id"]
 
-            async def attach(ws, sid):
-                await ws.send(json.dumps({"type": "attach", "session_id": sid, "surface": "structured"}))
+            async def attach(ws, sid, *, resume=False, launch_id=None):
+                await ws.send(json.dumps({"type": "resume" if resume else "attach",
+                                          "session_id": sid, "surface": "structured",
+                                          "launch_id": launch_id}))
                 ready, frames = await _receive_until(ws, lambda f: f.get("type") == "session.ready")
                 _secret_absent(frames, "canonical readiness and restored events")
                 assert ready["surface"] == "structured" and ready["session_id"] == sid
@@ -286,8 +292,8 @@ async def test_web_profile_without_template_update_and_restart(hermetic_sdk, tmp
 
             first_sid = await new_session()
             async with websockets.connect(ws_url, **options) as ws:
-                await attach(ws, first_sid)
-                await _turn(ws, first_sid, FIRST, "First native answer ORCA-ANSWER-731.")
+                ready, _ = await attach(ws, first_sid)
+                await _turn(ws, first_sid, FIRST, "First native answer ORCA-ANSWER-731.", launch_id=ready["launch_id"])
                 assert len(provider.requests) == 1 and not provider.errors
                 assert provider.requests[0]["model"] == MODEL
                 assert provider.requests[0]["reasoning_effort"] == "low"
@@ -298,8 +304,9 @@ async def test_web_profile_without_template_update_and_restart(hermetic_sdk, tmp
                 assert unchanged["runtime_config"]["llm"] == llm
                 assert unchanged["runtime_status"]["revision"] == revision
                 _profile_settings(binding, llm, tmp_path)
-                await ws.send(json.dumps({"type": "terminate", "session_id": first_sid}))
-                _, frames = await _receive_until(ws, lambda f: f.get("type") == "exit")
+                await ws.send(json.dumps({"type": "terminate", "session_id": first_sid,
+                                          "launch_id": ready["launch_id"]}))
+                _, frames = await _receive_until(ws, lambda f: f.get("type") == "status" and f.get("state") == "ended")
                 _secret_absent(frames, "session termination")
 
             response = await browser.patch(f"/api/agents/{aid}", json={"runtime_config": update})
@@ -328,7 +335,7 @@ async def test_web_profile_without_template_update_and_restart(hermetic_sdk, tmp
             async with websockets.connect(ws_url, **options) as ws:
                 ready, _ = await attach(ws, sid)
                 original_pty = ready["pty_instance_id"]
-                await _turn(ws, sid, FIRST, "First native answer ORCA-ANSWER-731.")
+                await _turn(ws, sid, FIRST, "First native answer ORCA-ANSWER-731.", launch_id=ready["launch_id"])
             assert len(provider.requests) == 2 and not provider.errors
             assert provider.requests[1]["reasoning_effort"] == "high"
             native_id = connector.supervisor._library_store().native_session_id(aid, sid)
@@ -369,12 +376,14 @@ async def test_web_profile_without_template_update_and_restart(hermetic_sdk, tmp
             sessions = (await browser.get(f"/api/agents/{aid}/sessions")).json()
             assert next(s for s in sessions if s["id"] == sid)["state"] == "inactive"
             async with websockets.connect(ws_url, **options) as ws:
-                ready, frames = await attach(ws, sid)
+                expected_launch = next(s for s in sessions if s["id"] == sid)["launch_id"]
+                ready, frames = await attach(ws, sid, resume=True, launch_id=expected_launch)
+                assert ready["launch_id"] != expected_launch
                 assert ready["pty_instance_id"] != original_pty
                 restore = next(f for f in frames if f.get("type") == "restore")
                 assert restore["kind"] == "event" and "ORCA-ANSWER-731" in restore["data"]
                 assert len(provider.requests) == 2  # display restore is not a model turn
-                await _turn(ws, sid, SECOND, "Second native answer with restored context.")
+                await _turn(ws, sid, SECOND, "Second native answer with restored context.", launch_id=ready["launch_id"])
             assert len(provider.requests) == 3 and not provider.errors
             request = provider.requests[2]
             assert request["model"] == MODEL and request["reasoning_effort"] == "high"

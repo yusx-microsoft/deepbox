@@ -50,11 +50,15 @@ window.WebSocket = class FixtureSocket {
   }
   send(raw) {
     const frame=JSON.parse(raw); this.frames.push(frame);
-    if(frame.type==='attach') {
+    if(frame.type==='attach' || frame.type==='resume') {
       this.sessionId=frame.session_id;
       setTimeout(()=>{
         this.emit({type:'collaboration',role:'owner',can_operate:true,can_send_messages:true});
-        this.emit({type:'ready'});
+        const launchId=frame.type==='resume' ? 'fixture-resumed-'+this.sessionId
+          : frame.launch_id || 'fixture-live-'+this.sessionId;
+        // Resume changes generation only through starting, never an unsolicited ready.
+        if(frame.type==='resume') this.emit({type:'status',state:'starting',launch_id:launchId});
+        this.emit({type:'ready',launch_id:launchId});
       },0);
     }
   }
@@ -813,7 +817,8 @@ def test_continue_native_is_explicit_operator_action_not_layout_restore(browser_
     h = browser_workbench
     page = h['page']
     for ident, state, agent in [('saved-native', 'inactive', 'native'), ('ended-native', 'ended', 'native'), ('saved-cli', 'inactive', 'cli')]:
-        h['sessions'][ident] = {'id':ident, 'agent_id':agent, 'surface':'structured', 'state':state, 'available':True}
+        h['sessions'][ident] = {'id':ident, 'agent_id':agent, 'surface':'structured', 'state':state,
+                                'available':True, 'launch_id':'prior-'+ident}
     page.locator('[data-agent-menu="native"]').click()
     page.get_by_role('menuitem', name='Session history', exact=True).click()
     proceed = page.get_by_role('button', name='Continue native conversation', exact=True)
@@ -823,8 +828,12 @@ def test_continue_native_is_explicit_operator_action_not_layout_restore(browser_
     proceed.click()
     page.locator('.deeporca-chat').wait_for()
     assert page.evaluate('window.__sockets[0].sessionId') == 'saved-native'
+    intent = page.evaluate('window.__sockets[0].frames[0]')
+    assert intent['type'] == 'resume' and intent['launch_id'] == 'prior-saved-native'
+    page.wait_for_function("!document.querySelector('[data-ui=\"chat-input\"]').disabled")
+    assert page.evaluate("window.__sockets[0].frames.filter(f=>['resume','attach'].includes(f.type)).map(f=>f.type)") == ['resume']
     assert not [r for r in h['requests'] if r[0] == 'POST' and r[1].endswith('/sessions')]
-    # A saved layout never persists the one-shot continuation consent.
+    # The runtime is inactive on restore; layout never persists one-shot consent.
     page.wait_for_function("JSON.stringify(localStorage).includes('saved-native')")
     page.reload()
     page.locator('.deeporca-chat').wait_for()
@@ -832,14 +841,19 @@ def test_continue_native_is_explicit_operator_action_not_layout_restore(browser_
     assert page.locator('[data-ui="replay-controls"]').count() == 1
     page.locator('[data-agent-menu="cli"]').click()
     page.get_by_role('menuitem', name='Session history', exact=True).click()
-    page.get_by_role('button', name='Replay', exact=True).wait_for()
+    page.get_by_role('button', name='View history', exact=True).wait_for()
     assert not page.get_by_role('button', name='Continue native conversation', exact=True).count()
     h['role'] = 'viewer'
     page.reload()
     page.locator('[data-agent-menu="native"]').click()
     page.get_by_role('menuitem', name='Session history', exact=True).click()
-    page.get_by_role('button', name='Replay', exact=True).first.wait_for()
-    assert not page.get_by_role('button', name='Continue native conversation', exact=True).count()
+    page.get_by_role('button', name='View history', exact=True).first.wait_for()
+    # History actions remain discoverable, but a viewer cannot execute them.
+    continuation = page.get_by_role('button', name='Continue native conversation', exact=True)
+    assert continuation.is_disabled()
+    continuation.evaluate('button=>button.click()')
+    assert page.evaluate('window.__sockets.length') == 0
+    assert not [r for r in h['requests'] if r[0] == 'POST' and r[1].endswith('/sessions')]
 
 
 def test_unknown_renderer_notice_and_unfinished_native_replay(browser_workbench):
@@ -865,7 +879,7 @@ def test_unknown_renderer_notice_and_unfinished_native_replay(browser_workbench)
     sockets = page.evaluate('window.__sockets.length')
     page.locator('[data-agent-menu="native"]').click()
     page.get_by_role('menuitem', name='Session history', exact=True).click()
-    page.get_by_role('button', name='Replay', exact=True).click()
+    page.get_by_role('button', name='View history', exact=True).click()
     card = page.locator('details.do-tool')
     card.wait_for()
     assert 'Result not recorded' in card.locator('summary').inner_text()

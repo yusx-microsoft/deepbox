@@ -80,8 +80,8 @@ Technical proposals elsewhere are not evidence that this draft has been accepted
   becomes a live create. End session remains separate and confirmed.
 - [ ] Operator/Admin/Owner can send structured input without keyboard ownership;
   Viewer cannot. Terminal input/resize/termination remain holder-only, including
-  for an Admin/Owner. Structured termination requires holder/Admin/Owner, not just
-  shared-chat permission. Check backend denial as well as UI affordances.
+  for an Admin/Owner. Structured termination requires current Operator/Admin/Owner
+  access without a lease. Check backend denial as well as UI affordances.
 - [ ] Replace/close dialogs and switch user/workspace during asynchronous management
   requests. Stale results must not mutate the new context. Role changes require
   explicit Save; there are no automatic grants or Viewer promotions. One-time

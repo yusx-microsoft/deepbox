@@ -344,15 +344,29 @@ assert.ok(requests.every(path=>path.startsWith('/api/agents/')));
 def test_archived_renderer_metadata_and_unknown_renderer_fallback():
     run_js(r"""
 const b=createBrowser({terminal:false}), mod=b.loadModule('pane.js');
-for(const renderer of ['deeporca-chat-v1','https://untrusted.test/plugin.js']){
+for(const renderer of ['deeporca-chat-v1','https://untrusted.test/plugin.js']) for(const source of ['metadata','replay','replay-session']){
  const root=b.document.createElement('section');b.document.body.appendChild(root);
  const requests=[];
- const pane=mod.createPane({id:'offline'+requests.length,root,services:{getWorkspace:()=>({id:'w',role:'viewer'}),getUser:()=>({id:7}),findAgent:()=>null,
-  api:async(path)=>{requests.push(path);return {surface:'structured',renderer,events:[],checkpoints:[]};}
+ const session={id:'stored',agent_id:'archived',state:'inactive',surface:'structured',title:'Archived conversation',
+  ...(source==='metadata'?{renderer}:{})};
+ const recording={surface:'structured',events:[],checkpoints:[],
+  ...(source==='replay'?{renderer}:source==='replay-session'?{session:{...session,renderer}}:{})};
+ const pane=mod.createPane({id:'offline-'+renderer+'-'+source,root,services:{getWorkspace:()=>({id:'w',role:'viewer'}),getUser:()=>({id:7}),findAgent:()=>null,
+  api:async(path,options={})=>{
+   requests.push(path);assert.equal(options.method||'GET','GET');
+   if(path==='/api/sessions/stored')return session;
+   assert.equal(path,'/api/sessions/stored/replay');return recording;
+  }
  }});
  await pane.open({kind:'replay',agentId:'archived',sessionId:'stored',surface:'structured'});await flush();
+ assert.equal(pane.getState().status,'replay');assert.equal(pane.getState().readOnly,true);
  assert.equal(!!root.querySelector('.deeporca-chat'),renderer==='deeporca-chat-v1');
- assert.deepEqual(requests,['/api/sessions/stored/replay']);assert.equal(b.sockets.length,0);
+ // Current history fetches identity/action metadata before the retained recording.
+ assert.deepEqual(requests,['/api/sessions/stored','/api/sessions/stored/replay']);assert.equal(b.sockets.length,0);
+ assert.equal(root.querySelector('[data-ui="session-title"]').textContent,'Archived conversation');
+ assert.ok(root.querySelector('[data-ui="replay-controls"]'));
+ assert.equal(root.querySelector('[data-ui="chat-renderer-notice"]').hidden,renderer==='deeporca-chat-v1');
+ if(renderer!=='deeporca-chat-v1')assert.match(root.textContent,/Unsupported conversation renderer/);
  assert.equal(root.querySelector('[data-ui="chat-composer"]').hidden,true);
  pane.close();
 }

@@ -340,3 +340,14 @@ code.command-inline{font-size:11px;color:var(--fg);overflow-wrap:anywhere}
   .workspace-member{flex-wrap:wrap}.workspace-member-role{width:100%;padding-left:35px}.workspace-member-role select{flex:1;max-width:none;min-width:0}
 }
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+
+/* Session history actions stay local to the existing pane surfaces. */
+.pane-session-card{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px;border-bottom:1px solid var(--line);flex:none;font-size:11px}
+.pane-session-card .session-title{flex:1;min-width:120px;overflow-wrap:anywhere;font-weight:600}
+.pane-session-card [data-ui="session-detail"],.pane-session-card [data-ui="session-action-reason"],.pane-session-card [data-ui="session-action-error"]{flex-basis:100%;overflow-wrap:anywhere}
+.pane-session-card .pane-session-actions,.pane-session-card .session-rename-form{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.pane-session-card .session-rename-form{flex-basis:100%}
+.pane-session-card .session-rename-form input{flex:1;min-width:100px}
+.pane-session-card button{font-size:10px;padding:3px 8px}
+.pane-session-note{flex:none;margin:0;padding:8px 10px;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.pane-session-card [hidden],.pane-session-note[hidden]{display:none}

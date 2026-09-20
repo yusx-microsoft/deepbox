@@ -148,6 +148,9 @@ class Session(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("user.id", ondelete="CASCADE"))
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String, default="Session")
+    # One opaque lifecycle generation: None=never requested, legacy=migrated.
+    # Opening/resuming/ending rotates it; display rename never does.
+    launch_id: Mapped[str | None] = mapped_column(String, nullable=True)
     # Generic connector-resolved UI contract; NULL preserves legacy sessions.
     surface: Mapped[str | None] = mapped_column(String, nullable=True)
     # Recording retention policy: none|7d|30d|permanent (see VALID_RETENTIONS).
@@ -426,7 +429,8 @@ def _tune_sqlite(engine) -> None:
 def _migrate(engine) -> None:
     """Additive migrations for pre-existing SQLite databases.
 
-    Only adds new nullable/defaulted columns; never drops or rewrites data.
+    Adds nullable/defaulted columns without dropping user data. New lifecycle
+    metadata is conservatively backfilled so old history cannot look unstarted.
     """
     inspector = inspect(engine)
     if "user" not in inspector.get_table_names():
@@ -485,6 +489,10 @@ def _migrate(engine) -> None:
             stmts.append("ALTER TABLE agent ADD COLUMN runtime_status JSON")
     if "session" in inspector.get_table_names():
         session_cols = {c["name"] for c in inspector.get_columns("session")}
+        if "launch_id" not in session_cols:
+            stmts.append("ALTER TABLE session ADD COLUMN launch_id VARCHAR")
+            # Unknown old rows must never be treated as a new, unstarted session.
+            stmts.append("UPDATE session SET launch_id='legacy'")
         if "workspace_id" not in session_cols:
             stmts.append(
                 "ALTER TABLE session ADD COLUMN workspace_id VARCHAR "

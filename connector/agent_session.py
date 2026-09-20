@@ -362,7 +362,10 @@ class StructuredAgentSession:
                  session_option_keys: tuple[str, ...] = (),
                  live_control_builder=None,
                  control_timeout: float = 10.0,
-                 context_started: Callable[[], Awaitable[None]] | None = None):
+                 context_started: Callable[[], Awaitable[None]] | None = None,
+                 context_preparing: Callable[[], None] | None = None,
+                 writer_lease_factory=None,
+                 require_existing_context: bool = False):
         self.cmd = cmd
         self.cwd = cwd or None
         self.on_output = on_output
@@ -386,6 +389,20 @@ class StructuredAgentSession:
         self._live_control_builder = live_control_builder
         self._control_timeout = max(0.1, float(control_timeout))
         self._context_started = context_started
+        self._context_preparing = context_preparing
+        # A resume may tighten an existing lazy session, never loosen it back
+        # into a create. The preparing hook enforces this at every spawn.
+        self.require_existing_context = require_existing_context
+        self._writer_lease_factory = writer_lease_factory
+        self._writer_lease = None
+        self._writer_proc = None
+        self._last_reaped = None
+        self._reap_lock = asyncio.Lock()
+        self._launch_task = None
+        self._launch_cleanups: set[asyncio.Task] = set()
+        self._close_task = None
+        self._reader_tasks: list[asyncio.Task] = []
+        self._exit_reported = False
         self._context_ready_reported = False
         self._active_options: dict[str, object] | None = None
         self._control_counter = 0
@@ -442,6 +459,152 @@ class StructuredAgentSession:
             return list(self.cmd)
         return list(self._command_builder(options, paths))
 
+    def _release_writer(self):
+        lease, self._writer_lease = self._writer_lease, None
+        if lease is not None:
+            # release never erases an active journal. Unknown child state stays
+            # quarantined even if this supervisor goes away.
+            lease.release()
+
+    async def _wait_process(self, proc):
+        async with self._reap_lock:
+            if self._last_reaped is not None and self._last_reaped[0] is proc:
+                return self._last_reaped[1]
+            code = await self._wait_process_once(proc)
+            self._last_reaped = (proc, code)
+            return code
+
+    async def _wait_process_once(self, proc):
+        code = await proc.wait()
+        if self._writer_proc is proc and self._writer_lease is not None:
+            try:
+                self._writer_lease.process_reaped()
+            except Exception:
+                self._alive = False
+                self._killed = True
+                self._turn_queue.clear()
+                self._release_writer()
+                raise ValueError("Native writer cleanup could not be saved. Local recovery is required.") from None
+            self._writer_proc = None
+        return code
+
+    async def _stop_process(self, proc):
+        try:
+            if getattr(proc, "returncode", None) is None:
+                proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        return await self._wait_process(proc)
+
+    async def _discard_stream(self, stream):
+        if stream is None:
+            return
+        try:
+            read = getattr(stream, "read", None)
+            while (await read(65536) if read is not None else await stream.readline()):
+                pass
+        except (OSError, ValueError):
+            pass
+
+    async def _stop_unpublished(self, proc):
+        # A child can appear after close/cancellation, before readers are started.
+        # Drain its pipes concurrently with wait, or a full pipe can block reap.
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        drains = [asyncio.create_task(self._discard_stream(getattr(proc, name, None)))
+                  for name in ("stdout", "stderr")]
+        try:
+            return await self._wait_process(proc)
+        finally:
+            await asyncio.gather(*drains, return_exceptions=True)
+
+    async def _abort_launch(self, task):
+        # This independently retained task, NOT the cancelling caller, owns
+        # cleanup. Repeated cancellation cannot drop the eventual child handle.
+        try:
+            try:
+                proc = await task
+            except OSError:
+                if self._writer_lease is not None:
+                    self._writer_lease.process_reaped()  # definite spawn failure
+                return
+            self._writer_proc = proc
+            # A wait OSError is NOT a spawn failure; leave the journal active.
+            await self._stop_unpublished(proc)
+        finally:
+            if self._launch_task is task:
+                self._launch_task = None
+            self._release_writer()
+
+    def prepare_context(self):
+        """Acquire native ownership and validate context without spawning a CLI.
+
+        Retain a successful lease through the lazy wait for input. On failure,
+        release only idle ownership: a live/in-flight child still owns its guard.
+        This hook is deliberately re-run before every process launch.
+        """
+        try:
+            if self._killed:
+                raise RuntimeError("Session is closed")
+            if self._writer_lease is None and self._writer_lease_factory is not None:
+                lease = self._writer_lease_factory()
+                lease.acquire()
+                self._writer_lease = lease
+            if self._context_preparing is not None:
+                self._context_preparing()
+        except BaseException:
+            if self._writer_proc is None and self._launch_task is None:
+                self._release_writer()
+            raise
+
+    async def _launch_process(self, options, paths=(), prompt=None):
+        try:
+            self.prepare_context()
+            argv = self._command(options, paths)
+            if self._per_turn:
+                argv += self._prompt_argv + [prompt]
+        except BaseException:
+            self._release_writer()
+            raise
+        if self._writer_lease is not None:
+            try:
+                self._writer_lease.begin_process()
+            except Exception:
+                self._release_writer()
+                raise ValueError("Could not secure native writer ownership. No process was started.") from None
+        task = self._launch_task = asyncio.create_task(self._spawn_process(argv, prompt))
+        aborting = False
+        try:
+            proc = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            aborting = True
+            self._alive = False
+            self._killed = True
+            self._turn_queue.clear()
+            cleanup = asyncio.create_task(self._abort_launch(task))
+            self._launch_cleanups.add(cleanup)
+            # Keep even a completed cleanup until wait_closed retrieves errors.
+            try:
+                await asyncio.shield(cleanup)
+            except Exception:
+                pass  # active journal is retained; cancellation still propagates
+            raise
+        except OSError:
+            if self._writer_lease is not None:
+                self._writer_lease.process_reaped()  # no child handle was created
+            self._release_writer()
+            raise
+        except BaseException:
+            self._release_writer()  # uncertain launch -> keep journal active
+            raise
+        finally:
+            if not aborting and self._launch_task is task:
+                self._launch_task = None
+        self._writer_proc = proc
+        return proc
+
     async def start(self):
         if self._killed:
             raise RuntimeError("Session is closed")
@@ -454,20 +617,20 @@ class StructuredAgentSession:
         try:
             # Persistent runtimes must also go through the command builder so
             # session-continuity flags apply; ``cmd`` is only the base command.
-            proc = await self._spawn_process(self._command({}))
+            proc = await self._launch_process({})
         except BaseException:
             self._alive = False
             raise
         if not self._alive:
-            await _terminate_process(proc)
+            await self._stop_unpublished(proc)
             return
         self._proc = proc
         self._start_readers(proc)
 
     def _start_readers(self, proc):
-        asyncio.create_task(self._read_stdout(proc))
+        self._reader_tasks.append(asyncio.create_task(self._read_stdout(proc)))
         if getattr(proc, "stderr", None) is not None:
-            asyncio.create_task(self._read_stderr(proc))
+            self._reader_tasks.append(asyncio.create_task(self._read_stderr(proc)))
 
     def _attachment_metadata(self, options: dict) -> list[dict]:
         raw = options.get(self._attachment_key) if self._attachment_key else None
@@ -567,15 +730,14 @@ class StructuredAgentSession:
                 paths, temp = self._materialize(attachments)
             elif attachments:
                 prompt = self._embed_text_attachments(prompt, attachments)
-            argv = self._command(options, paths) + self._prompt_argv + [prompt]
             async with self._spawn_lock:
                 if not self._alive:
                     return
-                proc = await self._spawn_process(argv, prompt)
+                proc = await self._launch_process(options, paths, prompt)
                 # kill() can run while process creation is awaiting. Never publish a
                 # late process into session state: terminate and reap it here.
                 if not self._alive:
-                    await _terminate_process(proc)
+                    await self._stop_unpublished(proc)
                     return
                 self._proc = proc
                 if getattr(proc, "stderr", None) is not None:
@@ -585,10 +747,12 @@ class StructuredAgentSession:
                 finally:
                     # If output handling failed, stop the child before waiting for
                     # stderr; otherwise a full pipe can keep cleanup and exit stuck.
-                    if getattr(proc, "returncode", None) is None:
-                        await _terminate_process(proc)
                     if stderr_task is not None:
+                        if self._last_reaped is None or self._last_reaped[0] is not proc:
+                            stderr_task.cancel()
                         await asyncio.gather(stderr_task, return_exceptions=True)
+                    if self._last_reaped is None or self._last_reaped[0] is not proc:
+                        await self._stop_unpublished(proc)
         finally:
             if self._proc is proc:
                 self._proc = None
@@ -608,11 +772,7 @@ class StructuredAgentSession:
             if not line:
                 break
             await self._handle_line(line)
-        code = 0
-        try:
-            code = await proc.wait()
-        except Exception:
-            pass
+        code = await self._wait_process(proc)
         # Some CLIs communicate completion only by exiting. Do not add a second
         # turn boundary when their structured transcript already supplied one.
         if not self._turn_end_seen:
@@ -623,7 +783,7 @@ class StructuredAgentSession:
 
     async def _read_stdout(self, proc):
         stream = proc.stdout
-        while self._alive and self._proc is proc:
+        while self._proc is proc:
             try:
                 line = await stream.readline()
             except (asyncio.LimitOverrunError, ValueError):
@@ -636,13 +796,17 @@ class StructuredAgentSession:
         if self._proc is not proc:
             return
         self._alive = False
-        code = 0
         try:
-            code = await proc.wait()
-        except Exception:
-            pass
+            code = await self._wait_process(proc)
+        finally:
+            self._release_writer()
         self._fail_pending_controls("Agent exited before applying runtime control")
-        await self.on_exit(int(code or 0))
+        await self._report_exit(code)
+
+    async def _report_exit(self, code):
+        if not self._exit_reported:
+            self._exit_reported = True
+            await self.on_exit(int(code or 0))
 
     def _fail_pending_controls(self, message: str) -> None:
         pending = list(self._pending_controls.values())
@@ -715,26 +879,24 @@ class StructuredAgentSession:
                 if self._turn_end_seen:
                     continue
                 self._turn_end_seen = True
-                # A completed turn is the runtime-neutral proof that the
-                # conversation we named now exists on this device, so later
-                # turns must resume it instead of creating it again. Provider
-                # transcript ids are deliberately not used: Claude reports a
-                # fresh one per resume and Copilot reports none at all.
+                # A successful turn confirms establishment, but failed/uncertain
+                # launches already have a durable reservation and only resume.
+                # Provider IDs are not an equality contract.
                 if (self._context_started is not None
                         and not self._context_ready_reported
                         and not event.get("is_error")):
-                    self._context_ready_reported = True
                     try:
                         await self._context_started()
                     except Exception:
-                        _LOG.exception(
-                            "Could not record the local agent context marker")
+                        _LOG.error("Could not record the local agent context marker")
                         await self._emit(_event(
-                            EV_ERROR,
-                            message="This agent's context could not be saved, so "
-                                    "the next message may not remember this one.",
-                            code="context_persist_failed",
-                        ))
+                            EV_ERROR, message="Conversation state could not be saved. "
+                            "This session has stopped; fix local storage before resuming.",
+                            code="context_persist_failed"))
+                        await self._emit(dict(event, is_error=True, subtype="context_persist_failed"))
+                        self.kill()
+                        return
+                    self._context_ready_reported = True
             await self._emit(event)
 
     async def _emit(self, ev: dict):
@@ -807,9 +969,9 @@ class StructuredAgentSession:
                 prompt = self._embed_text_attachments(data, attachments)
                 spawned = self._proc is None
                 if spawned:
-                    proc = await self._spawn_process(self._command(options))
+                    proc = await self._launch_process(options)
                     if not self._alive:
-                        await _terminate_process(proc)
+                        await self._stop_unpublished(proc)
                         return
                     self._proc = proc
                     self._start_readers(proc)
@@ -832,8 +994,9 @@ class StructuredAgentSession:
         except ValueError as exc:
             if not self._alive:
                 return
-            await self._emit(_event(EV_ERROR, message=str(exc)))
-            await self._emit(_event(EV_TURN_END, subtype="input_error"))
+            await self._emit(_event(
+                EV_ERROR, message=str(exc), code=getattr(exc, "code", "input_error")))
+            await self._emit(_event(EV_TURN_END, subtype="input_error", is_error=True))
         except OSError as exc:
             if not self._alive:
                 return
@@ -897,9 +1060,7 @@ class StructuredAgentSession:
                 try:
                     await self._dispatch_turn(data, options)
                 except asyncio.CancelledError:
-                    if self._alive:
-                        raise
-                    break
+                    raise
                 except Exception:
                     if self._alive:
                         await self._emit(_event(
@@ -930,6 +1091,35 @@ class StructuredAgentSession:
         self.cols = cols
         self.rows = rows
 
+    async def _finish_close(self):
+        try:
+            if self._turn_task is not None:
+                await asyncio.gather(self._turn_task, return_exceptions=True)
+            if self._launch_cleanups:
+                await asyncio.gather(*self._launch_cleanups, return_exceptions=True)
+                self._launch_cleanups.clear()
+            if self._launch_task is not None:
+                results = await asyncio.gather(self._launch_task, return_exceptions=True)
+                if results and not isinstance(results[0], BaseException):
+                    self._writer_proc = results[0]
+                    await self._stop_unpublished(results[0])
+            if self._reader_tasks:
+                await asyncio.gather(*self._reader_tasks, return_exceptions=True)
+            if self._proc is not None:
+                if self._last_reaped is None or self._last_reaped[0] is not self._proc:
+                    await self._stop_unpublished(self._proc)
+                if not self._per_turn and self._last_reaped is not None:
+                    await self._report_exit(self._last_reaped[1])
+        except Exception:
+            _LOG.error("Native writer could not be reaped; local recovery may be required")
+        finally:
+            self._release_writer()
+
+    async def wait_closed(self):
+        """Wait for owned children and writer ownership to finish closing."""
+        if self._close_task is not None:
+            await asyncio.shield(self._close_task)
+
     def kill(self):
         self._killed = True
         self._alive = False
@@ -940,9 +1130,19 @@ class StructuredAgentSession:
             if not future.done():
                 future.cancel()
         self._pending_controls.clear()
-        if self._proc is None:
-            return
-        try:
-            self._proc.kill()
-        except Exception:
-            pass
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        current = asyncio.current_task()
+        for task in self._reader_tasks:
+            if task is not current and not task.done():
+                task.cancel()
+        # A spawned per-turn child may have blocked in an output callback. Its
+        # finally path owns drain/reap. Pending launches are left to settle.
+        if (self._per_turn and self._proc is not None and self._turn_task is not None
+                and self._turn_task is not current and not self._turn_task.done()):
+            self._turn_task.cancel()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())

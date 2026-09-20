@@ -236,11 +236,37 @@ The connector's registry is the extension boundary. Each adapter describes:
 
 Conversation history belongs to the runtime CLI, not to AgentBridge. The
 connector never replays stored messages into a prompt: it passes its own session
-ID to the CLI, which creates the conversation on the first turn and restores it
-afterwards. The first completed turn records a local marker in the connector's
-SQLite store, so later turns resume even after the connector restarts. Provider
-transcript identifiers are deliberately ignored, because runtimes differ: Claude
-Code reports a fresh identifier on every resume and Copilot CLI reports none.
+ID to the CLI. Under exclusive native-writer ownership, the connector durably
+reserves that ID **before** the first launch, then marks it established after a
+successful translated turn. Any subsequent launch with a reservation uses explicit
+resume, including failed/interrupted first turns; if the CLI never created the
+transcript, resume can fail and the user must start a new session. It never retries
+with create or selects the CLI's latest conversation. Marker writes failing after
+a turn fence the session and stop its child instead of allowing further input.
+
+Provider event IDs are not compared as an identity proof. Tested Claude output
+can include both a fresh internal ID and the requested ID on resume; Copilot's
+translated structured stream does not reliably expose a native ID. This does not
+assert that every CLI version omits/changes IDs. The tested installed versions
+were Claude Code 2.1.119 and Copilot CLI 1.0.84-2, not verified latest releases.
+Installation-based capability reporting is not a version/flag compatibility gate.
+
+`connector/native_writer.py` holds a non-blocking OS file lock keyed by runtime
+family and session ID, independent of agent, working directory, or local DB path.
+It spans persistent-process life and per-turn idle gaps. A flushed active journal
+precedes spawn and is cleared only after the owned CLI child is reaped. Closing
+waits for late launches and drains pipes; repeated cancellation cannot discard a
+child handle. An orphaned/uncertain writer is **not** reclaimed by PID checks or
+TTL: later launches fail closed and require explicit local recovery. This protects
+cooperating, updated AgentBridge connectors under the same OS user/shared state
+root, not manually launched CLIs, older connectors, or other machines.
+
+Transport reattachment to a surviving sessiond is not native recovery. Isolated
+CLI tests verified recall through a fresh supervisor/local store, not a complete
+browser/server/sessiond restart. The current local Rename/explicit Resume changes
+do not add live Workspace, real-CLI acceptance, or deployment evidence. A lost
+transport preserves surviving provider processes; reconnect does not request
+native resume.
 
 Resuming fails closed. When the recorded runtime or, for a `cwd`-scoped runtime,
 the project directory no longer matches, the turn stops with an explicit error
@@ -255,7 +281,8 @@ returns no model ID, the connector keeps that family's static adapter catalog an
 marks `models.status=partial`, `models.source=adapter`; with a runtime result it
 marks `complete/runtime`. Only a reliable non-interactive authentication-status
 probe can block startup; when a safe probe is impossible the status is `unknown`.
-The server stores the capability as opaque JSON. The browser only chooses the chat
+The server stores the capability as opaque JSON, consulting only generic lifecycle
+and context feature keys for explicit Resume. The browser chooses the chat
 surface from `features.structured` and generates model/reasoning/file widgets from
 `features.controls`. Model choices fall back in order: per-control choices,
 `features.models`, then family `models.items`. The UI always offers a
@@ -292,9 +319,11 @@ frames and restore JSONL use the same reducer.
 
 | Direction | Frame | Meaning |
 |---|---|---|
+| Browser → Server | `attach {session_id, surface?}` | restore/watch; only a never-started new row may request its initial launch |
+| Browser → Server | `resume {session_id, launch_id}` | explicit continuation of the same native conversation; observed generation required |
 | Browser → Server → Connector | `input {data, options, client_input_id}` | PTY bytes or a structured turn; options are opaque to the server |
-| Browser → Server → Connector | `resize` / `terminate` | terminal resize requires the keyboard lease; termination requires the holder or workspace Admin/Owner |
-| Server → Connector | `open` | idempotently ensure the local PTY/structured process exists |
+| Browser → Server → Connector | `resize` / `terminate` | terminal controls require the keyboard lease; structured termination requires current Operator/Admin/Owner access, without a lease |
+| Server → Connector | `open` / `resume` | initial launch / require existing native context; distinct controls, with `launch_id` |
 | Connector → Server | `output {seq, pty_instance_id, kind, data}` | `kind` is `output` or `event`; ACK after a durable commit |
 | Server → Browser | `restore {kind?, data}` | terminal screen bytes, or `kind:event` canonical-event JSONL |
 | Server → Browser | `output {kind, data}` | live terminal bytes or a single canonical event |
@@ -305,8 +334,38 @@ schema. Output reliability still comes from the connector's spool, monotonic `se
 the server ACK, a `resend` carrying `expected_seq`, a `fence` for an old instance,
 and fail-closed handling of payload-hash conflicts.
 
+For lifecycle-capable sessions, one opaque `Session.launch_id` fences controls,
+ready, exit, and process snapshots. Initial launch, Resume, and End rotate it;
+Rename does not. Delayed controls cannot target a later run, and a stale snapshot
+entry cannot downgrade an accepted newer active generation. Old structured-instance
+output still enters the durable ledger and is ACKed, but is not fanned into the
+new live conversation.
+This does not replace the `(session_id, pty_instance_id, seq)` delivery identity or
+the connector's native-writer lock.
+
 ### 5.5 Restore and reconnect
 
+- Opening nonlive History is read-only: attach/reload (including legacy `open`)
+  never automatically opens a historical CLI. Attaching an already live session
+  restores/watches it without sending a duplicate connector `open`.
+- Explicit `/ws/term` `type: "resume"` requires current Operator/Admin/Owner
+  access and a `launch_id` field matching the observed metadata token (including
+  explicit `null` if that is the observed value). A stale/missing token is rejected
+  as `session_changed`. The same session, agent, and native conversation ID are
+  retained; there is no replacement-session or create fallback.
+  If the process became live meanwhile, the server replies with matching-token
+  `type: "status", state: "live", reattached: true` without rotating the token or queuing a launch.
+  This explicit acknowledgement also covers that race in the browser.
+- Resume is capability-driven: the stored structured surface must report
+  `features.session_lifecycle: 1`, `context.continuity: "native_resume"`,
+  `context.available: true` (installed), and `context.explicit_resume: true`.
+  Unsupported/terminal historical restart is refused; New session is explicit.
+  The connector still validates local availability and the existing context marker.
+- `ready` is logical readiness, not proof that native history was restored.
+  The browser already displays this limitation while Resume is preparing.
+  `context_resume: "pending"` tells the user that the next real message resumes the
+  CLI conversation; a lazy/per-turn launch may only then detect a missing provider
+  transcript. Failure is visible, never repaired by reconstructing a prompt.
 - Terminal attach: the server restores the current screen from pyte/recording, then
   streams live bytes.
 - Structured attach: the browser first enters chat from capability; the server
@@ -322,7 +381,8 @@ and fail-closed handling of payload-hash conflicts.
   session is configured or the first chat item appears. `New chat` creates an
   empty persisted session and reopens the controls without terminating another
   collaborator's conversation. `End session` is explicit and confirmed; prior
-  history is not deleted.
+  history is not deleted. The resulting ended state is logical, not confirmation
+  that the local child has been reaped; native-writer cleanup remains local.
 - The Claude structured model is turn-scoped; when the value changes the connector
   first sends a `set_model` `control_request` to the same process and waits for
   success before sending the next prompt, so explicit models can still be switched
@@ -390,9 +450,19 @@ and fail-closed handling of payload-hash conflicts.
 | `DELETE` | `/api/devboxes/{id}/tokens/{token_id}` | Cookie + workspace admin | Revoke a connector token |
 | `POST` | `/api/devboxes/{id}/agents` | Cookie + workspace admin | Create an agent; agent lists are embedded in `GET /api/devboxes` |
 | `GET/POST` | `/api/agents/{id}/sessions` | Cookie + workspace role | List / create a shared session |
+| `GET` | `/api/sessions/{id}` | Cookie + workspace role | Current title, launch token, state, and action availability |
+| `PATCH` | `/api/sessions/{id}` | Cookie + current Operator/Admin/Owner | Metadata-only Rename: `{title, expected_title}`; stale title returns 409 |
 | `GET` | `/api/sessions/{id}/messages` | Cookie + participant/role | List persisted structured messages; sending uses the session WebSocket |
 | `POST` | `/api/devboxes/{id}/projects` | Connector token | Replace path-free LocalProject metadata; handle one-cycle legacy migration and refuse to delete a project still referenced by a skill |
 | `POST` | `/api/devboxes/{id}/skills` | Connector token | Replace the sanitized skill inventory (up to 256 items, no paths) |
+
+Rename trims surrounding whitespace, then requires `title` to be a single line
+of 1–120 characters without control/line separator characters. Only `title` and
+the exact observed `expected_title` are accepted; the update is an atomic
+compare-and-swap. It changes no session, agent, or native ID, launch token,
+recording, or local context marker and sends no CLI
+command. `session.updated` notifies attached views; a conflict preserves the edit
+for an explicit refresh/retry.
 
 The trust boundary for Microsoft sign-in is Azure App Service Easy Auth: the
 platform verifies OAuth/OIDC and then injects `X-MS-CLIENT-PRINCIPAL*` headers. The
@@ -483,7 +553,8 @@ Surface behavior retains the existing capability and backend authorization rules
   spool/ACK/resend/fence, DVR/retention, workspace RBAC and keyboard lease, and
   Azure deployment.
 - **Current local draft:** phased agentbridge naming, a plain transcript/list UI,
-  and independent user-controlled panes on the retained structured/PTY architecture.
+  independent user-controlled panes, and metadata-only Rename/explicit native
+  Resume on the retained structured/PTY architecture.
   Visual/code acceptance and integrated verification are pending in [review](review.md).
 - **Next:** real multi-machine end-to-end tests, more adapters, auditable runtime
   permissions, long-running tasks/notifications, and production capacity controls.

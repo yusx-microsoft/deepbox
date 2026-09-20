@@ -14,6 +14,10 @@
 
   const OPERATORS = ['operator', 'admin', 'owner'];
   const ADMINS = ['admin', 'owner'];
+  const titleObservers = new Set();
+  function publishTitle(workspaceId, sessionId, title) {
+    for (const observer of titleObservers) observer(workspaceId, sessionId, title);
+  }
   const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
   const XTERM_THEME = {
     background: '#10120f', foreground: '#cfd7c8', cursor: '#a3c57f',
@@ -44,7 +48,7 @@
     const document = root.ownerDocument;
     const window = document.defaultView || environment;
     const namespace = 'ab-pane-' + Array.from(id, c => c.codePointAt(0).toString(16)).join('-');
-    let epoch = 0, closed = false, target = null, status = 'empty', statusText = '';
+    let epoch = 0, closed = false, target = null, status = 'empty', statusText = '', targetWorkspace = null;
     let restoreRequested = false, lastChange = '', abortController = null;
     let terminal = null, fit = null, terminalSubscription = null, resizeObserver = null;
     let resizeSocket = null, resizeSize = '';
@@ -59,17 +63,22 @@
     let nativeSubmission = null;
     let recording = null, replayTimer = null, replayPlaying = false, replaySpeed = 1, replayCursor = 0, replayGeneration = 0;
     let nodes = {}, listeners = [];
+    let sessionCards = [], sessionActionPending = false;
     const readers = new Set();
+    const observeTitle = (workspaceId, sessionId, title) => {
+      if (workspaceId === targetWorkspace) updateSessionTitle(sessionId, title);
+    };
+    titleObservers.add(observeTitle);
 
-    function current(view) { return !closed && view === epoch; }
+    function current(view) { return !closed && view === epoch && targetWorkspace === workspace()?.id; }
     function workspace() { return services.getWorkspace ? services.getWorkspace() : null; }
     function canOperate() {
-      return !closed && !!target && OPERATORS.includes(workspace()?.role)
+      return current(epoch) && !!target && OPERATORS.includes(workspace()?.role)
         && (!collaboration || collaboration.canOperate);
     }
-    function canManageRecording() { return !closed && ADMINS.includes(workspace()?.role); }
+    function canManageRecording() { return current(epoch) && ADMINS.includes(workspace()?.role); }
     function connected() {
-      return !closed && target?.kind === 'live' && !!target.sessionId && wantOpen && liveActive
+      return current(epoch) && target?.kind === 'live' && !!target.sessionId && wantOpen && liveActive
         && !!socket && socket.readyState === 1;
     }
     function canWriteChat() {
@@ -81,10 +90,9 @@
         && Collaboration.canSendInput(collaboration);
     }
     function canEndSession() {
-      if (target?.surface === 'terminal') return canWriteTerminal();
+      // Chat uses the current role; Terminal still requires its keyboard lease.
       return connected() && canOperate() && !!collaboration
-        && (Collaboration.canSendInput(collaboration)
-          || ADMINS.includes(workspace()?.role) && ADMINS.includes(collaboration.role));
+        && (target.surface === 'structured' || canWriteTerminal());
     }
     function getState() {
       const localRole = OPERATORS.indexOf(workspace()?.role);
@@ -169,8 +177,11 @@
       nodes.error = element('p', 'error', 'pane-error');
       nodes.error.hidden = true;
       nodes.error.setAttribute('role', 'alert');
+      nodes.resumeNote = element('p', 'resume-notice', 'pane-session-note');
+      nodes.resumeNote.hidden = true;
+      nodes.resumeNote.setAttribute('role', 'status');
       nodes.body = element('div', 'content', 'pane-session-content');
-      root.append(nodes.status, nodes.error, nodes.body);
+      root.append(nodes.status, nodes.error, nodes.resumeNote, nodes.body);
     }
     function stopHeartbeat() {
       if (heartbeat !== null) window.clearInterval(heartbeat);
@@ -222,6 +233,7 @@
       for (const remove of listeners) remove();
       listeners = [];
       nodes = {};
+      sessionCards = []; sessionActionPending = false;
       chat = null; controls = []; controlValues = {}; attachments = {}; readingFiles = false;
       turnPending = false;
       nativeSubmission = null;
@@ -248,8 +260,11 @@
     function runtimeContract() {
       return Chat.runtimeContract(services.findAgent?.(target?.agentId)?.agent, capability(), selectedRenderer());
     }
+    function sessionRuntimeContract(session) {
+      return Chat.runtimeContract(services.findAgent?.(target?.agentId)?.agent, capability(), session?.renderer || selectedRenderer());
+    }
     function canContinueNative(session) {
-      return runtimeContract().explicitContinuation
+      return sessionRuntimeContract(session).explicitContinuation
         && canOperate() && session?.state === 'inactive'
         && session.surface === 'structured' && session.available !== false;
     }
@@ -260,19 +275,18 @@
       reportError(message);
       const actions = element('div', 'unavailable-actions', 'pane-session-actions');
       if (allowReplay && target.sessionId)
-        actions.appendChild(button('open-replay', 'View recording', () => open({ ...snapshot(), kind: 'replay' })));
+        actions.appendChild(button('open-replay', 'View history', () => open({ ...snapshot(), kind: 'replay' })));
       if (canOperate())
-        actions.appendChild(button('open-live', 'Open live session', () => open({
-          kind: 'live', agentId: target.agentId, title: target.title, surface: target.surface,
-        })));
+        actions.appendChild(button('open-live', 'New session', newSession));
       nodes.body.appendChild(actions);
     }
 
-    async function open(next) {
+    async function open(next, activation = null) {
       if (closed) return getState();
       if (!next || !['live', 'history', 'replay'].includes(next.kind) || !next.agentId)
         throw new TypeError('A pane target needs kind and agentId.');
       reset();
+      targetWorkspace = workspace()?.id;
       const view = epoch;
       const found = services.findAgent ? services.findAgent(String(next.agentId)) : null;
       target = {
@@ -289,7 +303,8 @@
       mountShell();
       setStatus(status, statusText);
       try {
-        if (target.kind === 'live') await openLive(view, next.forceNew === true, !!validSurface(next.surface), next.continueNative === true && !restoreRequested);
+        if (activation && !restoreRequested) await openActivated(view, activation);
+        else if (target.kind === 'live') await openLive(view, next.forceNew === true, !!validSurface(next.surface), next.continueNative === true && !restoreRequested);
         else if (target.kind === 'history') await loadHistory(view);
         else await loadReplay(view);
       } catch (error) {
@@ -303,7 +318,7 @@
     async function openLive(view, forceNew, explicitSurface, continueNative = false) {
       // Restoration is navigation, not consent to spawn a new model, even if forceNew was persisted elsewhere.
       if (restoreRequested && !target.sessionId) {
-        unavailable('No saved session ID. Choose Open live session or New session to start explicitly.', false);
+        unavailable('No saved session ID. Choose New session to start explicitly.', false);
         return;
       }
       let session = null, created = false;
@@ -328,6 +343,7 @@
         }
       }
       if (!current(view)) return;
+      if (session) applySessionMetadata(session);
       // Preflight the renderer BEFORE any create request. Chat never touches xterm.
       if (target.surface === 'terminal' && services.ensureTerminal) {
         setStatus('opening', 'Loading terminal renderer…');
@@ -344,7 +360,8 @@
       }
       if (!session || !session.id) throw new Error('The server did not return a session ID.');
       target.sessionId = String(session.id);
-      if (session.renderer) persistedRenderer = session.renderer;
+      applySessionMetadata(session);
+      mountSessionCard(session, nodes.body, false);
       if (session.surface !== target.surface) {
         unavailable('The server returned a different or unknown session surface. Use History to select it.');
         return;
@@ -354,8 +371,8 @@
         await open({ ...snapshot(), kind: 'replay' });
         return;
       }
-      wantOpen = true; liveActive = true;
-      connectSocket();
+      wantOpen = true; liveActive = false;
+      connectSocket(null, continueNative);
     }
     function mountSurface() {
       if (target.surface === 'structured') { mountChat(); return true; }
@@ -420,9 +437,10 @@
       }
     }
     function sendFrame(type, fields) {
-      if (closed || !target?.sessionId || !socket || socket.readyState !== 1) return false;
+      if (!current(epoch) || !target?.sessionId || !socket || socket.readyState !== 1) return false;
       try {
-        socket.send(JSON.stringify({ type, session_id: target.sessionId, ...fields }));
+        socket.send(JSON.stringify({ type, session_id: target.sessionId,
+          ...(target.launchId != null ? { launch_id: target.launchId } : {}), ...fields }));
         return true;
       } catch (error) { reportError(error.message || 'Session connection failed.'); return false; }
     }
@@ -432,11 +450,14 @@
       const active = services.isActive ? services.isActive() : root.contains(document.activeElement);
       return !!(active && sendFrame('input', { data: '\u0002' }));
     }
-    function connectSocket() {
-      if (closed || !wantOpen || !target?.sessionId || target.kind !== 'live') return;
+    function connectSocket(resume = null, continueNative = false) {
+      if (!current(epoch) || !wantOpen || !target?.sessionId || target.kind !== 'live') return;
+      // SDK continuation uses the same explicit, generation-checked wire intent;
+      // the Server routes it to the library, not a generic CLI resume operation.
+      if (continueNative) resume = { launch_id: target.launchId ?? null };
       stopReconnect(); detachSocket();
-      liveActive = true;
-      setStatus('connecting', 'Connecting…');
+      liveActive = false;
+      setStatus('connecting', resume ? 'Preparing resume…' : 'Connecting…');
       const view = epoch, sessionId = target.sessionId;
       let ownSocket;
       try {
@@ -454,21 +475,54 @@
         if (!isCurrent() || !(target.surface === 'structured' ? canWriteChat() : canWriteTerminal())) return false;
         const clientInputId = runtimeContract().inputReceipts && options?.client_input_id;
         if (clientInputId) { options = {...options}; delete options.client_input_id; }
-        ownSocket.send(JSON.stringify({ type: 'input', session_id: sessionId, data, options,
-          ...(clientInputId ? {client_input_id:clientInputId} : {}) }));
-        return true;
+        return sendFrame('input', { data, options,
+          ...(clientInputId ? {client_input_id:clientInputId} : {}) });
       });
+      // Owned by this socket callback only, never by target/snapshot/reconnect.
+      let opened = false, resumeOnce = resume;
+      let awaitingStart = !!resume || target.launchId == null, awaitingReady = !!resume, attachPending = !resume;
       ownSocket.onopen = () => {
-        if (!isCurrent() || !wantOpen) return;
-        if (!sendFrame('attach', { cols: terminal?.cols || 120, rows: terminal?.rows || 30, surface: target.surface })) return;
-        setStatus('connected', 'Attached · waiting for runtime');
+        if (!isCurrent() || !wantOpen || opened) return;
+        opened = true;
+        const intent = resumeOnce; resumeOnce = null;
+        if ((intent || continueNative) && !canOperate()) {
+          wantOpen = false; setStatus('unavailable', 'Read-only');
+          reportError(continueNative ? 'Read-only: permission to continue was revoked.' : 'Read-only: permission to resume was revoked.'); return;
+        }
+        if (!sendFrame(intent ? 'resume' : 'attach', { cols: terminal?.cols || 120, rows: terminal?.rows || 30,
+          surface: target.surface, ...(intent ? { agent_id: target.agentId, launch_id: intent.launch_id ?? null } : {}) })) return;
+        setStatus(intent ? 'starting' : 'connected', intent ? 'Preparing resume…' : 'Attached · waiting for runtime');
       };
-      ownSocket.onmessage = event => {
+      ownSocket.onmessage = async event => {
         if (!isCurrent() || !wantOpen) return;
         let frame;
         try { frame = JSON.parse(event.data); } catch (_) { reportError('Received an invalid session frame. Reconnect to retry.'); return; }
         if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return;
+        if (frame.type === 'session.updated') { publishTitle(targetWorkspace, frame.session_id, frame.title); return; }
         if (frame.session_id && frame.session_id !== sessionId) return;
+        const starting = frame.type === 'status' && frame.state === 'starting';
+        if (starting) {
+          // Only the first starting response may replace the CAS token used to resume.
+          // A late starting/ready from the previous process must not regress this pane.
+          if (!(awaitingStart || attachPending && frame.launch_id === target.launchId)
+            || (resume && (!frame.launch_id || frame.launch_id === resume.launch_id))) return;
+        } else if (frame.launch_id != null && target.launchId != null && frame.launch_id !== target.launchId) {
+          // End invalidates the generation; an offline send can roll it back. Reattach
+          // may also discover a newer live generation. Verify these status transitions
+          // against metadata, never trust a mismatched ready/error/output/exit.
+          if (frame.type !== 'status' || !(['ended', 'offline'].includes(frame.state)
+            || attachPending && ['live', 'inactive'].includes(frame.state))) return;
+          const previousLaunch = target.launchId;
+          try {
+            const latest = validateSession(await request(sessionPath(sessionId)), sessionId, target.agentId);
+            if (!isCurrent() || !wantOpen || target.launchId !== previousLaunch
+              || latest.launch_id !== frame.launch_id
+              || (frame.state === 'offline' ? latest.state === 'live' : latest.state !== frame.state)) return;
+          } catch (_) { return; }
+          target.launchId = frame.launch_id;
+        } else if (target.launchId != null && frame.launch_id == null
+          && ['ready', 'session.ready', 'status', 'exit'].includes(frame.type)) return;
+        if ((frame.type === 'ready' || frame.type === 'session.ready') && resume && awaitingStart) return;
         if (frame.surface && frame.surface !== target.surface) {
           unavailable('The attached session surface changed. Select a matching session from History.');
           return;
@@ -480,12 +534,15 @@
         switch (frame.type) {
           case 'ready':
           case 'session.ready':
+            awaitingReady = false; awaitingStart = false; attachPending = false;
             liveActive = true; reconnectDelay = 500;
+            updateLaunch(frame);
             if (frame.capabilities && typeof frame.capabilities === 'object' && !Array.isArray(frame.capabilities)) {
               announcedCapability = frame.capabilities;
               if (target.surface === 'structured') setupChatControls();
             }
-            clearError(); setStatus('live', target.surface === 'structured' ? 'Chat ready' : 'Terminal ready');
+            setStatus('live', ['next_turn', 'pending'].includes(frame.context_resume) ? 'Next message resumes the CLI conversation'
+              : target.surface === 'structured' ? 'Chat ready' : 'Terminal ready');
             break;
           case 'restore':
             if (terminal) { terminal.reset(); terminal.write(frame.data || ''); }
@@ -494,16 +551,38 @@
             if (terminal) terminal.write(frame.data || '');
             break;
           case 'runtime.unavailable':
-            liveActive = false; turnPending = false;
+            liveActive = false; turnPending = false; wantOpen = false; stopReconnect(); stopHeartbeat();
+            nodes.resumeNote.hidden = true;
             setStatus('unavailable', 'Runtime unavailable');
-            reportError('Runtime unavailable: ' + String(frame.code || 'runtime_unavailable').replace(/_/g, ' ') + '. Check the connector configuration and reconnect.');
+            reportError(frame.message || ('Runtime unavailable: ' + String(frame.code || 'runtime_unavailable') + '. View History for available actions. No new session was created.'));
             break;
           case 'status':
-            if (frame.state === 'live') { liveActive = true; setStatus('live', 'Live'); }
+            if (frame.state === 'live') {
+              // A Resume may race an existing process becoming ready. The server
+              // explicitly confirms reattachment without launching another one.
+              const reattached = resume && awaitingStart && frame.reattached === true
+                && frame.launch_id === resume.launch_id;
+              if (awaitingReady && !reattached) return; // Preparation alone is not readiness.
+              awaitingReady = false;
+              if (reattached) nodes.resumeNote.hidden = true;
+              awaitingStart = false; attachPending = false;
+              liveActive = true; updateLaunch(frame);
+              setStatus('live', ['next_turn', 'pending'].includes(frame.context_resume) ? 'Next message resumes the CLI conversation' : 'Live');
+            }
+            else if (frame.state === 'starting') {
+              awaitingStart = false; awaitingReady = true; attachPending = false;
+              if (Object.prototype.hasOwnProperty.call(frame, 'launch_id')) target.launchId = frame.launch_id;
+              for (const card of sessionCards) if (String(card.session.id) === sessionId) card.session.state = 'starting';
+              liveActive = false;
+              if (resume) showPreparingResumeNotice(); else nodes.resumeNote.hidden = true;
+              setStatus('starting', resume ? 'Preparing resume…' : 'Preparing session…');
+            }
             else if (frame.state === 'ended' || frame.state === 'inactive') finishSession(frame);
             else if (frame.state === 'offline') {
-              liveActive = false; setStatus('offline', 'Connector offline');
-              reportError('The connector is offline. Reconnect the connector, then retry.');
+              liveActive = false; wantOpen = false; turnPending = false; stopReconnect(); stopHeartbeat();
+              nodes.resumeNote.hidden = true;
+              setStatus('offline', 'Connector offline');
+              reportError(frame.message || 'The connector is offline. Reconnect the connector, then retry.');
             }
             break;
           case 'exit': finishSession(frame); break;
@@ -527,7 +606,15 @@
               }
             }
             break;
-          case 'error': reportError(frame.message || 'The session request failed.'); break;
+          case 'error':
+            if (awaitingReady || awaitingStart || ['resume_required', 'session_changed', 'start_failed', 'session_failed',
+              'configuration_changed', 'context.not_found', 'context.changed', 'context.in_use',
+              'context.recovery_required', 'context.writer_unavailable'].includes(frame.code)) {
+              liveActive = false; turnPending = false; wantOpen = false; stopReconnect(); stopHeartbeat();
+              nodes.resumeNote.hidden = true;
+              setStatus('unavailable', 'Session unavailable');
+            }
+            reportError(frame.message || frame.code || 'The session request failed.'); break;
           case 'snapshot':
           case 'collaboration': {
             const hadKeyboard = canWriteTerminal();
@@ -571,8 +658,9 @@
       if (terminal && frame.data) terminal.write(frame.data);
       wantOpen = false; liveActive = false; turnPending = false;
       stopReconnect(); detachSocket();
+      nodes.resumeNote.hidden = true;
       setStatus(frame.state === 'inactive' ? 'inactive' : 'ended', 'Session ended');
-      reportError('Session ended' + (frame.code != null ? ', code ' + frame.code : '') + '. Start a New session to continue; history is preserved.');
+      reportError('Session ended' + (frame.code != null ? ', code ' + frame.code : '') + '. View History to resume if supported, or explicitly start a New session.');
     }
     function syncHeartbeat() {
       if (!canWriteTerminal()) { stopHeartbeat(); return; }
@@ -587,6 +675,7 @@
     function syncAccess() {
       syncHeartbeat();
       syncChatControls();
+      for (const card of sessionCards) card.sync();
       if (terminal) terminal.options.disableStdin = !canWriteTerminal();
       if (!nodes.status) return;
       const state = getState(), parts = [statusText];
@@ -791,6 +880,7 @@
     }
     function handleChatFrame(frame) {
       if (!chat) return;
+      if (frame.type === 'restore' && !String(frame.data || '').trim()) return;
       const folded = Chat.foldEventPayload(chat, frame.data, frame.type === 'restore');
       chat = folded.state;
       if (frame.type === 'restore') turnPending = false;
@@ -928,35 +1018,231 @@
       }
     }
 
+    function sessionPath(sessionId) { return '/api/sessions/' + encodeURIComponent(sessionId); }
+    function sessionTitle(session) { return typeof session.title === 'string' && session.title ? session.title : session.id; }
+    function validateSession(session, sessionId, agentId) {
+      if (!session || String(session.id) !== sessionId || String(session.agent_id) !== agentId)
+        throw new Error('Session metadata changed or belongs to a different agent. Reopen History to retry.');
+      return session;
+    }
+    function updateSessionTitle(sessionId, title) {
+      if (!current(epoch) || typeof title !== 'string') return;
+      for (const card of sessionCards) {
+        if (String(card.session.id) !== String(sessionId)) continue;
+        card.session.title = title;
+        card.sync(); // Never touch an in-progress edit or the chat/composer DOM.
+      }
+      if (target.sessionId === String(sessionId)) { target.title = title; notify(); }
+    }
+    function applySessionMetadata(session) {
+      if (session.renderer) persistedRenderer = session.renderer;
+      if (typeof session.title === 'string') target.title = session.title;
+      target.launchId = session.launch_id;
+    }
+    function updateLaunch(frame) {
+      if (Object.prototype.hasOwnProperty.call(frame, 'launch_id')) target.launchId = frame.launch_id;
+      for (const card of sessionCards) if (String(card.session.id) === target.sessionId) card.session.state = 'live';
+      if (['next_turn', 'pending'].includes(frame.context_resume)) {
+        nodes.resumeNote.textContent = 'Next message resumes the CLI conversation. Native history is checked on that turn, not during preparation.';
+        nodes.resumeNote.hidden = false;
+      } else if (Object.prototype.hasOwnProperty.call(frame, 'context_resume')) nodes.resumeNote.hidden = true;
+    }
+    function showPreparingResumeNotice() {
+      nodes.resumeNote.textContent = 'Preparing to resume the same CLI conversation. Native history has not been verified; the next message may perform that check.';
+      nodes.resumeNote.hidden = false;
+    }
+    function resumeBlocked(session) {
+      if (!canOperate()) return 'Read-only: an Operator, Admin or Owner is required to resume.';
+      // DeepOrca's explicit continuation has its own native binding checks.
+      // Generic resume metadata must not authorize adopting an unknown context.
+      if (sessionRuntimeContract(session).explicitContinuation)
+        return 'Use Continue native conversation for an inactive DeepOrca session; generic native resume is unavailable.';
+      if (session.surface !== 'structured') return 'Native resume is supported only for compatible Chat sessions, not Terminal sessions.';
+      if (!session.resume_supported) return session.resume_reason || 'This runtime does not support native resume.';
+      if (session.state === 'starting') return 'This session is already starting. View history or attach once it is live.';
+      if (!session.can_resume) return session.resume_reason || 'Resume is unavailable. Check that the connector is online.';
+      return '';
+    }
+    function mountSessionCard(metadata, parent, navigation = true, history = false) {
+      const session = { ...metadata }, view = epoch, agentId = target.agentId, sessionId = String(session.id);
+      const row = element('div', history ? 'history-item' : 'session-header', history ? 'history-item pane-session-card' : 'pane-session-card');
+      const title = element('b', 'session-title', 'session-title');
+      const detail = element('span', 'session-detail', 'muted');
+      const actions = element('div', null, 'pane-session-actions');
+      const reason = element('span', 'session-action-reason', 'muted');
+      const error = element('span', 'session-action-error', 'pane-error');
+      error.setAttribute('role', 'alert');
+      const edit = element('form', 'session-rename-form', 'session-rename-form');
+      edit.hidden = true;
+      const input = element('input', 'session-rename-input');
+      input.type = 'text'; input.maxLength = 120; input.setAttribute('aria-label', 'Session title');
+      let editing = false, saving = false, expectedTitle;
+      const allowedRename = () => canOperate() && session.can_rename === true;
+      const rename = button('session-rename', 'Rename', () => {
+        if (editing || saving || sessionActionPending || !allowedRename()) return;
+        expectedTitle = session.title;
+        input.value = session.title || '';
+        editing = true; error.textContent = ''; card.sync(); input.focus();
+      });
+      const save = button('session-rename-save', 'Save', saveTitle);
+      const cancel = button('session-rename-cancel', 'Cancel', () => {
+        if (saving) return;
+        editing = false; error.textContent = ''; card.sync();
+      });
+      edit.append(input, save, cancel);
+      listen(edit, 'submit', event => { event.preventDefault(); saveTitle(); });
+      listen(input, 'keydown', event => { if (event.key === 'Escape') { event.preventDefault(); cancel.click(); } });
+      async function saveTitle() {
+        if (!current(view) || !editing || saving || !allowedRename()) return;
+        const value = input.value.trim();
+        if (!value || Array.from(value).length > 120 || /[\r\n\u0000-\u001f\u007f\u0085\u2028\u2029]/.test(value)) {
+          error.textContent = 'Use a single-line title of 1–120 characters.'; card.sync(); return;
+        }
+        saving = true; error.textContent = ''; card.sync();
+        try {
+          const updated = await request(sessionPath(sessionId), { method: 'PATCH',
+            body: JSON.stringify({ title: value, expected_title: expectedTitle }) });
+          if (!current(view) || !allowedRename()) return;
+          validateSession(updated, sessionId, agentId);
+          Object.assign(session, updated);
+          editing = false;
+          publishTitle(targetWorkspace, sessionId, updated.title);
+        } catch (failure) {
+          if (current(view)) error.textContent = failure.status === 409
+            ? 'Title changed elsewhere. Your draft is kept. Cancel and reopen History to refresh before retrying.'
+            : failure.message || 'Could not rename. Your draft is kept.';
+        } finally { if (current(view)) { saving = false; card.sync(); } }
+      }
+      const action = button(history && session.state === 'live' && validSurface(session.surface) ? 'history-attach' : 'session-resume',
+        session.state === 'live' ? 'Attach live' : 'Resume', async () => {
+          if (sessionActionPending || saving || editing) return;
+          if (session.state === 'live') {
+            if (session.available === false || !validSurface(session.surface)) return;
+            return open({ kind: 'live', agentId, sessionId, title: sessionTitle(session), surface: session.surface });
+          }
+          if (resumeBlocked(session)) return;
+          sessionActionPending = true; error.textContent = ''; syncAccess();
+          try {
+            const latest = await request(sessionPath(sessionId));
+            if (!current(view) || !canOperate()) return;
+            validateSession(latest, sessionId, agentId);
+            Object.assign(session, latest); updateSessionTitle(sessionId, latest.title);
+            if (latest.state !== 'live' && resumeBlocked(latest)) { error.textContent = resumeBlocked(latest); return; }
+            if (latest.state === 'live' && (latest.available === false || latest.surface !== 'structured')) {
+              error.textContent = 'The live session is unavailable or its surface changed. Reopen History.'; return;
+            }
+            const activation = { session: latest, resume: latest.state !== 'live',
+              recording: target.kind === 'replay' && target.sessionId === sessionId ? recording : null };
+            await open({ kind: 'live', agentId, sessionId, title: sessionTitle(latest), surface: latest.surface }, activation);
+          } catch (failure) { if (current(view)) error.textContent = failure.message || 'Could not prepare resume.'; }
+          finally { if (current(view)) { sessionActionPending = false; syncAccess(); } }
+        });
+      const continuation = navigation && sessionRuntimeContract(session).explicitContinuation && session.state === 'inactive'
+        ? button('history-continue-native', 'Continue native conversation', () => {
+          if (saving || editing || sessionActionPending || !canContinueNative(session)) return;
+          return open({ kind: 'live', agentId, sessionId, title: sessionTitle(session),
+            surface: session.surface, continueNative: true });
+        }) : null;
+      if (history) actions.appendChild(button('history-replay', 'View history', () => open({
+        kind: 'replay', agentId, sessionId, title: sessionTitle(session), surface: validSurface(session.surface),
+      })));
+      actions.appendChild(rename);
+      if (continuation) actions.appendChild(continuation);
+      if (navigation) actions.appendChild(action);
+      row.append(title, detail, actions, edit, reason, error);
+      const card = { session, sync() {
+        title.textContent = sessionTitle(session);
+        detail.textContent = sessionId + ' · ' + (session.surface === 'structured' ? 'Chat' : session.surface === 'terminal' ? 'Terminal' : 'Legacy surface unknown')
+          + ' · ' + (session.state || 'unknown') + (session.created_at ? ' · started ' + session.created_at : '');
+        edit.hidden = !editing; rename.hidden = editing;
+        rename.disabled = saving || sessionActionPending || !allowedRename();
+        input.disabled = saving || !allowedRename(); save.disabled = saving || !allowedRename(); cancel.disabled = saving;
+        action.textContent = sessionActionPending ? 'Preparing resume…' : session.state === 'live' ? 'Attach live' : 'Resume';
+        const blocked = session.state === 'live'
+          ? session.available === false ? 'The connector or runtime is offline; live attach is unavailable.'
+            : !validSurface(session.surface) ? 'This session has no supported live surface.' : ''
+          : resumeBlocked(session);
+        action.disabled = saving || editing || sessionActionPending || !!blocked;
+        if (continuation) continuation.disabled = saving || editing || sessionActionPending || !canContinueNative(session);
+        const renameReason = allowedRename() ? '' : !canOperate() ? 'Read-only: renaming requires an Operator, Admin or Owner.' : 'Renaming is not available for this session.';
+        reason.textContent = [renameReason, navigation ? blocked : ''].filter(Boolean).join(' ');
+        reason.hidden = !reason.textContent; error.hidden = !error.textContent;
+      } };
+      sessionCards.push(card);
+      if (history) parent.appendChild(row); else parent.insertBefore(row, parent.firstChild);
+      card.sync();
+      return card;
+    }
+    function recordingNote(message) {
+      if (!nodes.recordingNote) {
+        nodes.recordingNote = element('p', 'recording-notice', 'pane-session-note');
+        nodes.body.insertBefore(nodes.recordingNote, nodes.scroll?.parentNode || nodes.terminal || null);
+      }
+      nodes.recordingNote.textContent = message + ' Recording retention is separate from native CLI resume availability.';
+    }
+    async function openActivated(view, activation) {
+      const session = activation.session;
+      applySessionMetadata(session);
+      mountSessionCard(session, nodes.body, false);
+      if (!mountSurface()) return;
+      setStatus('starting', activation.resume ? 'Preparing resume…' : 'Attaching live…');
+      if (activation.resume) showPreparingResumeNotice();
+      let data = activation.recording;
+      if (!data) {
+        try { data = await request(sessionPath(target.sessionId) + '/replay'); }
+        catch (failure) { if (current(view)) recordingNote('The recorded transcript is unavailable: ' + (failure.message || 'not retained') + '.'); }
+      }
+      if (!current(view)) return;
+      if (data) {
+        const saved = Replay.normalizeReplay(data);
+        for (const event of saved.events)
+          if (event.kind === 'event' || event.type === 'event') chat = Chat.foldEventPayload(chat, event.data, false).state;
+        if (!saved.events.length && !saved.checkpoints.length) recordingNote('No recorded transcript is available for this session.');
+        // A historical permission prompt is not a current runtime request.
+        chat.pendingPermission = null;
+        controlValues = Chat.reconcileControlValues(controls, controlValues, chat.config);
+        renderChat();
+      }
+      if (activation.resume && !canOperate()) { reportError('Read-only: permission to resume was revoked.'); return; }
+      wantOpen = true; liveActive = false;
+      connectSocket(activation.resume ? { launch_id: session.launch_id ?? null } : null);
+    }
     async function loadHistory(view) {
       const sessions = await request(agentPath());
       if (!current(view)) return;
       if (!Array.isArray(sessions)) throw new Error('Invalid session list.');
       const list = element('div', 'history', 'history-wrap');
-      const saved = snapshot();
-      list.appendChild(button('history-live', 'Open live session', () => open({ ...saved, kind: 'live', sessionId: undefined })));
+      const create = button('history-new', 'New session', newSession);
+      create.disabled = !canOperate();
+      list.appendChild(create);
       if (!sessions.length) list.appendChild(element('p', null, 'muted', 'No sessions recorded.'));
       for (const session of sessions) {
-        const row = element('div', 'history-item', 'history-item');
-        row.append(element('span', null, 'status', session.state || 'unknown'), element('b', null, 'mono', session.id),
-          element('span', null, 'muted', (session.surface === 'structured' ? 'Chat' : session.surface === 'terminal' ? 'Terminal' : 'Legacy surface unknown') + ' · started ' + (session.created_at || '')));
-        const metadata = { kind: 'live', agentId: target.agentId, sessionId: session.id, title: target.title, surface: validSurface(session.surface) };
-        if (session.state === 'live' && session.available !== false && metadata.surface)
-          row.appendChild(button('history-attach', 'Attach live', () => open(metadata)));
-        if (canContinueNative(session))
-          row.appendChild(button('history-continue-native', 'Continue native conversation', () => open({ ...metadata, continueNative:true })));
-        row.appendChild(button('history-replay', 'Replay', () => open({ ...metadata, kind: 'replay' })));
-        list.appendChild(row);
+        mountSessionCard(session, list, true, true);
       }
       nodes.body.appendChild(list);
       setStatus('history', 'Session history');
     }
     async function loadReplay(view) {
       if (!target.sessionId) { unavailable('Choose a saved session from History to replay.', false); return; }
-      const data = await request('/api/sessions/' + encodeURIComponent(target.sessionId) + '/replay');
+      const sessionId = target.sessionId, agentId = target.agentId;
+      const metadata = await request(sessionPath(sessionId));
+      if (!current(view)) return;
+      validateSession(metadata, sessionId, agentId);
+      applySessionMetadata(metadata);
+      target.surface = validSurface(metadata.surface) || target.surface;
+      mountSessionCard(metadata, nodes.body);
+      let data;
+      try { data = await request(sessionPath(sessionId) + '/replay'); }
+      catch (failure) {
+        if (!current(view)) return;
+        data = { surface: target.surface, events: [], checkpoints: [] };
+        recordingNote('The recorded transcript is unavailable: ' + (failure.message || 'not retained') + '.');
+      }
       if (!current(view)) return;
       recording = Replay.normalizeReplay(data);
       persistedRenderer = data.renderer || data.session?.renderer || persistedRenderer;
+      if (!recording.events.length && !recording.checkpoints.length && !nodes.recordingNote)
+        recordingNote('No recorded transcript is available for this session.');
       target.surface = validSurface(data.surface) || target.surface ||
         (recording.events.some(event => event.kind === 'event' || event.type === 'event') ? 'structured' : 'terminal');
       let rendererReady = true;
@@ -1112,11 +1398,11 @@
     }
     async function endSession() {
       if (endPending || !canEndSession()) return false;
-      const view = epoch, sessionId = target.sessionId;
+      const view = epoch, sessionId = target.sessionId, launchId = target.launchId;
       endPending = true;
       try {
         const ok = services.confirm && await services.confirm('End this session?', 'This stops the runtime for everyone in this session. Saved history remains available.', 'End session');
-        if (!ok || !current(view) || target.sessionId !== sessionId || !canEndSession()) return false;
+        if (!ok || !current(view) || target.sessionId !== sessionId || target.launchId !== launchId || !canEndSession()) return false;
         return sendFrame('terminate');
       } catch (error) { if (current(view)) reportError(error.message || 'Could not end the session.'); return false; }
       finally { if (current(view)) endPending = false; }
@@ -1128,11 +1414,14 @@
     function close() {
       if (closed) return;
       reset(); closed = true; target = null; status = 'closed'; statusText = 'Closed';
+      titleObservers.delete(observeTitle);
       notify();
     }
     function refreshAccess() {
       if (closed) return;
       syncAccess();
+      const create = root.querySelector('[data-ui="history-new"]');
+      if (create) create.disabled = !canOperate();
       for (const control of root.querySelectorAll('[data-ui="replay-retention"], [data-ui="replay-delete"]'))
         control.disabled = !canManageRecording();
       notify();

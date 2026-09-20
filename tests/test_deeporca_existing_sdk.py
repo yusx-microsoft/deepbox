@@ -272,11 +272,11 @@ async def test_advertised_native_binding_is_read_only_and_busy_safe(existing_sdk
                        "origin": base, "proxy": None}
             async with websockets.connect(base.replace("http://", "ws://") + "/ws/term", **options) as ws:
                 await ws.send(json.dumps({"type": "attach", "session_id": sid, "surface": "structured"}))
-                _, frames = await _receive_until(ws, lambda f: f.get("type") == "session.ready")
+                ready, frames = await _receive_until(ws, lambda f: f.get("type") == "session.ready")
                 _private_absent(frames)
-                events = await _turn(ws, sid, FIRST, "First native answer ORCA-ANSWER-731.")
+                events = await _turn(ws, sid, FIRST, "First native answer ORCA-ANSWER-731.", launch_id=ready["launch_id"])
                 _private_absent(events)
-                events = await _turn(ws, sid, SECOND, "Second native answer with restored context.")
+                events = await _turn(ws, sid, SECOND, "Second native answer with restored context.", launch_id=ready["launch_id"])
                 _private_absent(events)
             assert len(env.provider.requests) == 2 and not env.provider.errors
             request = env.provider.requests[-1]

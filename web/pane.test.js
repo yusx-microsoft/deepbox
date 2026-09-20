@@ -17,7 +17,7 @@ const collaboration = (role = 'operator', holder = false) => ({
 function harness(options = {}) {
   const browser = createBrowser(options);
   const module = browser.loadModule('pane.js');
-  const requests = [], changes = [], confirms = [], alerts = [];
+  const requests = [], changes = [], confirms = [], alerts = [], panes = [];
   const sessions = new Map(), recordings = new Map();
   const workspace = { id: 'workspace', role: options.role || 'operator' };
   const user = { id: 7, username: 'me' };
@@ -46,12 +46,27 @@ function harness(options = {}) {
       const agentId = decodeURIComponent(list[1]);
       if (!options.method || options.method === 'GET') return sessions.get(agentId) || [];
       assert.equal(options.method, 'POST');
-      const created = session(agentId + '-created-' + ++nextSession, JSON.parse(options.body).surface);
+      const created = session(agentId + '-created-' + ++nextSession, JSON.parse(options.body).surface,
+        'live', { agent_id: agentId, title: 'New chat', can_rename: true });
       sessions.set(agentId, [...(sessions.get(agentId) || []), created]);
       return created;
     }
     const replay = path.match(/^\/api\/sessions\/([^/]+)\/replay$/);
     if (replay) return recordings.get(decodeURIComponent(replay[1])) || { surface: 'structured', events: [], checkpoints: [] };
+    const metadata = path.match(/^\/api\/sessions\/([^/]+)$/);
+    if (metadata) {
+      const sessionId = decodeURIComponent(metadata[1]);
+      let found;
+      for (const [agentId, items] of sessions) {
+        const item = items.find(item => item.id === sessionId);
+        if (item) { found = { title: item.id, agent_id: agentId, ...item }; break; }
+      }
+      // Legacy replay fixtures did not need a catalog row. Supply the new GET contract.
+      found ||= { id: sessionId, agent_id: panes.find(pane => pane.getState().sessionId === sessionId)?.getState().agentId,
+        title: sessionId, surface: recordings.get(sessionId)?.surface || 'structured', state: 'inactive' };
+      if (options.method === 'PATCH') return { ...found, title: JSON.parse(options.body).title };
+      return found;
+    }
     if (options.method === 'PATCH' || options.method === 'DELETE') return {};
     throw new Error('Unexpected request: ' + path);
   }
@@ -65,6 +80,7 @@ function harness(options = {}) {
       confirm: async (...args) => { confirms.push(args); return h.confirmOverride ? h.confirmOverride(...args) : true; },
       alert: (...args) => alerts.push(args), onChange: state => changes.push(plain(state)), ...extraServices,
     } });
+    panes.push(pane);
     return { pane, root };
   };
   h.attach = async function (pane, agentId, surface = 'structured', extra = {}, role = workspace.role, holder = false) {
@@ -83,17 +99,18 @@ function submit(root, text) {
   input.dispatchEvent({ type: 'keydown', key: 'Enter', preventDefault() { this.prevented = true; } });
 }
 
-test('terminal End follows the server lease rule even for a workspace owner', async () => {
-  const h = harness({role:'owner'});
-  const {pane} = h.create('owned-terminal');
-  const socket = await h.attach(pane, 'agent', 'terminal', {}, 'owner', false);
-  assert.equal(pane.getState().canEndSession, false);
-  await pane.endSession();
-  assert.equal(h.confirms.length, 0);
-  assert.ok(!socket.frames.some(frame => frame.type === 'terminate'));
-  socket.receive(collaboration('owner', true));
-  assert.equal(pane.getState().canEndSession, true);
-  pane.close();
+test('End uses current Chat role and keeps Terminal keyboard-lease enforcement', async () => {
+  for (const surface of ['terminal', 'structured']) for (const role of ['viewer', 'operator', 'admin', 'owner']) for (const holder of [false, true]) {
+    const h = harness({ role }), { pane } = h.create(role + '-' + surface);
+    h.sessions.set('agent', [session('shared', surface)]);
+    const socket = await h.attach(pane, 'agent', surface, {}, role, holder);
+    const allowed = role !== 'viewer' && (surface === 'structured' || holder);
+    assert.equal(pane.getState().canEndSession, allowed);
+    assert.equal(await pane.endSession(), allowed);
+    assert.equal(h.confirms.length, allowed ? 1 : 0);
+    assert.equal(socket.frames.filter(frame => frame.type === 'terminate').length, allowed ? 1 : 0);
+    pane.close();
+  }
 });
 
 test('metadata refresh resolves a promotion without bypassing either permission check',async()=>{
@@ -110,8 +127,9 @@ test('metadata refresh resolves a promotion without bypassing either permission 
   assert.equal(pane.getState().role,'operator');
   h.workspace.role='owner';
   socket.receive(collaboration('operator'));
-  assert.equal(pane.getState().canEndSession,false,'stale catalog owner cannot override the live role');
+  assert.equal(pane.getState().canEndSession,true,'the live Operator role permits End');
   socket.receive(collaboration('viewer'));
+  assert.equal(pane.getState().canEndSession,false,'stale catalog owner cannot override the live Viewer role');
   assert.equal(ui(root,'chat-input').disabled,true);
   pane.close();
 });
@@ -427,7 +445,9 @@ test('keyboard acquire/release/handoff/renew are per-terminal and End alone send
   const sa = await h.attach(a.pane, 'a', 'terminal'), sb = await h.attach(b.pane, 'b', 'terminal', {}, 'operator', true);
   assert.equal(a.pane.requestKeyboard(), true);
   assert.equal(a.pane.releaseKeyboard(), false);
+  assert.equal(a.pane.getState().canEndSession, false, 'Terminal End requires holding its keyboard lease');
   assert.equal(await a.pane.endSession(), false);
+  assert.equal(h.confirms.length, 0);
   sa.receive(collaboration('operator', true));
   assert.equal(a.pane.releaseKeyboard(), true);
   sa.receive({ type: 'keyboard_request', requester_user_id: 9, requester_username: 'next' });
@@ -645,6 +665,8 @@ test('reconnect uses capped backoff and cannot create; closing one pane tears do
     if (i < 5) sa.close();
   }
   assert.deepEqual(delays, [500, 1000, 2000, 4000, 5000, 5000]);
+  assert.equal(h.timers.size, 1, 'socket-open alone cannot renew a runtime lease before ready');
+  sa.receive({ type: 'session.ready', surface: 'terminal' });
   sa.receive(collaboration('operator', true));
   assert.equal(h.timers.size, 2);
   oldRenew();
@@ -996,4 +1018,444 @@ test('prefix focus fallback, replay and terminal interrupt cannot cross structur
   assert.equal(ui(a.root, 'chat-interrupt').hidden, true);
   assert.equal(inputFrames(sa).length, 1);
   a.pane.close(); b.pane.close();
+});
+
+function archived(extra = {}) {
+  return session('archived', 'structured', 'inactive', { agent_id: 'a', title: 'Earlier work',
+    launch_id: 'previous-launch', can_rename: true, resume_supported: true, can_resume: true, ...extra });
+}
+
+test('Rename uses an inline guarded PATCH, escapes titles and preserves live socket, transcript and draft', async () => {
+  const h = harness(), { pane, root } = h.create('rename-live');
+  const socket = await h.attach(pane, 'a');
+  const sessionId = pane.getState().sessionId;
+  socket.receive({ type: 'output', kind: 'event', data: payload({ ev: 'message.delta', text: 'keep transcript' }) });
+  const compose = ui(root, 'chat-input'); compose.value = 'keep draft';
+  ui(root, 'session-rename').click();
+  const edit = ui(root, 'session-rename-input');
+  edit.value = '  <img src=x onerror=alert(1)>  ';
+  ui(root, 'session-rename-save').click(); await flush();
+  const patch = h.requests.find(request => request.method === 'PATCH');
+  assert.equal(patch.path, '/api/sessions/' + sessionId);
+  assert.deepEqual(JSON.parse(patch.body), { title: '<img src=x onerror=alert(1)>', expected_title: 'New chat' });
+  assert.equal(ui(root, 'session-title').textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(ui(root, 'session-title').children.length, 0);
+  assert.equal(pane.getState().title, '<img src=x onerror=alert(1)>');
+  assert.equal(pane.getState().sessionId, sessionId);
+  assert.equal(ui(root, 'chat-input'), compose); assert.equal(compose.value, 'keep draft');
+  assert.match(ui(root, 'chat-scroll').textContent, /keep transcript/);
+  assert.equal(h.sockets.length, 1); assert.equal(socket.readyState, 1);
+  assert.equal(h.requests.filter(request => request.method === 'POST').length, 1);
+  ui(root, 'session-rename').click(); ui(root, 'session-rename-save').click(); await flush();
+  assert.equal(h.requests.filter(request => request.method === 'PATCH').length, 2, 'saving the existing title is allowed');
+  pane.close();
+});
+
+test('Rename validation and 409 preserve the edit; pending duplicate saves issue one PATCH', async () => {
+  const h = harness(), { pane, root } = h.create('rename-conflict');
+  h.sessions.set('a', [archived()]);
+  await pane.open({ kind: 'history', agentId: 'a' });
+  ui(root, 'session-rename').click();
+  const input = ui(root, 'session-rename-input');
+  for (const value of ['', 'a\nb', 'x'.repeat(121)]) {
+    input.value = value; ui(root, 'session-rename-save').click();
+    assert.equal(ui(root, 'session-action-error').hidden, false);
+  }
+  assert.equal(h.requests.filter(request => request.method === 'PATCH').length, 0);
+  const pending = deferred();
+  h.apiOverride = (path, options) => options.method === 'PATCH' ? pending.promise : undefined;
+  input.value = 'my draft';
+  ui(root, 'session-rename-save').click(); ui(root, 'session-rename-save').click();
+  assert.equal(h.requests.filter(request => request.method === 'PATCH').length, 1);
+  pending.reject(Object.assign(new Error('Conflict'), { status: 409 })); await flush();
+  assert.equal(input.value, 'my draft'); assert.equal(input.disabled, false);
+  assert.match(ui(root, 'session-action-error').textContent, /Title changed elsewhere.*draft is kept/);
+  assert.equal(ui(root, 'session-rename-form').hidden, false);
+  assert.equal(ui(root, 'session-title').textContent, 'Earlier work');
+  assert.equal(h.sockets.length, 0); assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  ui(root, 'session-rename-cancel').click(); assert.equal(ui(root, 'session-rename-form').hidden, true);
+  pane.close();
+});
+
+test('History and replay are titled read-only views with no socket or POST, even when a recording was not retained', async () => {
+  const h = harness(), { pane, root } = h.create('history-only');
+  h.sessions.set('a', [archived({ title: '<script>unsafe()</script>' })]);
+  h.apiOverride = path => path.endsWith('/replay') ? Promise.reject(new Error('Recording not retained')) : undefined;
+  await pane.open({ kind: 'history', agentId: 'a', title: 'Agent label' });
+  assert.equal(ui(root, 'session-title').textContent, '<script>unsafe()</script>');
+  assert.equal(ui(root, 'history-replay').textContent, 'View history');
+  assert.equal(ui(root, 'history-live'), null);
+  ui(root, 'history-replay').click(); await flush();
+  assert.equal(pane.getState().kind, 'replay'); assert.equal(pane.getState().title, '<script>unsafe()</script>');
+  assert.equal(ui(root, 'session-title').children.length, 0);
+  assert.equal(ui(root, 'chat-composer').hidden, true);
+  assert.equal(ui(root, 'session-resume').disabled, false); assert.equal(ui(root, 'session-rename').disabled, false);
+  assert.match(ui(root, 'recording-notice').textContent, /not retained.*separate from native CLI resume/);
+  assert.equal(h.sockets.length, 0); assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  pane.close();
+});
+
+test('Viewer, unsupported, offline and Terminal rows expose blocked reasons and cannot Rename or Resume', async () => {
+  for (const [role, extra, reason] of [
+    ['viewer', {}, /Read-only.*Operator/],
+    ['operator', { resume_supported: false, can_resume: false, resume_reason: 'Native context unsupported' }, /Native context unsupported/],
+    ['operator', { can_resume: false, resume_reason: 'Connector offline' }, /Connector offline/],
+    ['operator', { surface: 'terminal', resume_supported: false, can_resume: false }, /not Terminal/],
+  ]) {
+    const h = harness({ role }), { pane, root } = h.create('blocked');
+    h.sessions.set('a', [archived(extra)]);
+    await pane.open({ kind: 'history', agentId: 'a' });
+    assert.equal(ui(root, 'session-resume').disabled, true);
+    assert.match(ui(root, 'session-action-reason').textContent, reason);
+    ui(root, 'session-resume').click();
+    if (role === 'viewer') {
+      assert.equal(ui(root, 'session-rename').disabled, true); ui(root, 'session-rename').click();
+      assert.equal(ui(root, 'session-rename-form').hidden, true);
+    }
+    assert.equal(h.requests.some(request => request.path === '/api/sessions/archived'), false);
+    assert.equal(h.requests.some(request => request.method === 'POST' || request.method === 'PATCH'), false);
+    assert.equal(h.sockets.length, 0); pane.close();
+  }
+});
+
+test('Resume fetches current metadata and sends one same-ID websocket resume; starting remains read-only until ready', async () => {
+  const h = harness(), { pane, root } = h.create('resume');
+  h.sessions.set('a', [archived()]);
+  h.recordings.set('archived', { surface: 'structured', events: [
+    { time: 0, kind: 'event', data: payload({ ev: 'message.delta', text: 'Earlier transcript' }) },
+  ] });
+  await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'archived' });
+  const latest = deferred();
+  h.apiOverride = path => path === '/api/sessions/archived' ? latest.promise : undefined;
+  ui(root, 'session-resume').click(); ui(root, 'session-resume').click();
+  assert.equal(h.requests.filter(request => request.path === '/api/sessions/archived').length, 2, 'initial replay GET and only one resume GET');
+  latest.resolve(archived({ launch_id: 'fresh-launch', title: 'Fresh title' })); await flush();
+  assert.equal(pane.getState().sessionId, 'archived'); assert.equal(pane.getState().title, 'Fresh title');
+  assert.equal(pane.getState().kind, 'live');
+  assert.match(ui(root, 'chat-scroll').textContent, /Earlier transcript/);
+  assert.match(ui(root, 'status').textContent, /Preparing resume/);
+  const socket = h.sockets[0]; socket.open(); socket.open();
+  assert.deepEqual(socket.frames, [{ type: 'resume', session_id: 'archived', agent_id: 'a', surface: 'structured', launch_id: 'fresh-launch', cols: 120, rows: 30 }]);
+  socket.receive(collaboration('operator', true));
+  assert.equal(ui(root, 'chat-input').disabled, true);
+  socket.receive({ type: 'status', state: 'starting', launch_id: 'new-launch' });
+  assert.equal(ui(root, 'chat-send').disabled, true); assert.equal(pane.getState().readOnly, true);
+  socket.receive({ type: 'session.ready', session_id: 'archived', surface: 'structured', launch_id: 'new-launch', context_resume: 'next_turn' });
+  assert.equal(ui(root, 'chat-input').disabled, false);
+  assert.match(ui(root, 'resume-notice').textContent, /Next message resumes the CLI conversation.*checked on that turn/);
+  socket.receive({ type: 'restore', data: '' });
+  assert.match(ui(root, 'chat-scroll').textContent, /Earlier transcript/);
+  submit(root, 'Continue');
+  assert.equal(inputFrames(socket)[0].launch_id, 'new-launch');
+  assert.equal(pane.interrupt(), true); await pane.endSession();
+  assert.ok(socket.frames.some(frame => frame.type === 'terminate'));
+  assert.ok(socket.frames.filter(frame => ['input', 'interrupt', 'terminate'].includes(frame.type)).every(frame => frame.launch_id === 'new-launch'));
+  assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  const snapshot = plain(pane.snapshot());
+  assert.deepEqual(Object.keys(snapshot).sort(), ['agentId', 'kind', 'sessionId', 'surface', 'title']);
+  assert.doesNotMatch(JSON.stringify(snapshot), /launch|resume|intent/);
+  pane.close();
+});
+
+test('Resume is never replayed by disconnect, explicit reconnect or restored layout, including before the first socket opens', async () => {
+  for (const opens of [true, false]) {
+    const h = harness(), { pane, root } = h.create('one-shot');
+    h.sessions.set('a', [archived()]);
+    await pane.open({ kind: 'history', agentId: 'a' });
+    ui(root, 'session-resume').click(); await flush();
+    const original = h.sockets[0], oldOpen = original.onopen;
+    if (opens) original.open();
+    original.close();
+    const [timer] = [...h.timers].find(([, entry]) => !entry.repeat); h.runTimer(timer);
+    const reconnected = h.sockets.at(-1); reconnected.open(); oldOpen();
+    assert.equal(reconnected.frames[0].type, 'attach'); assert.equal(reconnected.frames[0].session_id, 'archived');
+    pane.reconnect(); const explicit = h.sockets.at(-1); explicit.open();
+    assert.equal(explicit.frames[0].type, 'attach');
+    assert.equal(h.sockets.flatMap(socket => socket.frames).filter(frame => frame.type === 'resume').length, opens ? 1 : 0);
+    const saved = plain(pane.snapshot()), socketCount = h.sockets.length;
+    await pane.open({ ...saved, restore: true, resume: true, launch_id: 'ignored', forceNew: true });
+    assert.equal(pane.getState().kind, 'replay'); assert.equal(h.sockets.length, socketCount);
+    assert.equal(h.requests.some(request => request.method === 'POST'), false); pane.close();
+  }
+});
+
+test('Fresh metadata blocks stale Resume eligibility or a changed agent and attaches rather than resumes if already live', async () => {
+  for (const extra of [{ can_resume: false, resume_reason: 'Context is in use' }, { agent_id: 'different' }, { id: 'different' }, { state: 'live' }]) {
+    const h = harness(), { pane, root } = h.create('fresh');
+    h.sessions.set('a', [archived()]); await pane.open({ kind: 'history', agentId: 'a' });
+    h.apiOverride = path => path === '/api/sessions/archived' ? archived(extra) : undefined;
+    ui(root, 'session-resume').click(); await flush();
+    if (extra.state === 'live') {
+      assert.equal(h.sockets.length, 1); h.sockets[0].open();
+      assert.equal(h.sockets[0].frames[0].type, 'attach');
+      assert.equal(h.sockets[0].frames[0].session_id, 'archived');
+    } else {
+      assert.equal(h.sockets.length, 0);
+      assert.match(ui(root, 'session-action-error').textContent, /Context is in use|metadata changed/);
+    }
+    assert.equal(h.requests.some(request => request.method === 'POST'), false); pane.close();
+  }
+});
+
+test('Delayed Rename and Resume callbacks cannot affect another target, closed pane, workspace or revoked access', async () => {
+  for (const operation of ['rename', 'resume']) for (const change of ['target', 'close', 'workspace', 'role']) {
+    const h = harness(), { pane, root } = h.create(operation + change);
+    h.sessions.set('a', [archived()]); await pane.open({ kind: 'history', agentId: 'a' });
+    const pending = deferred();
+    h.apiOverride = path => path === '/api/sessions/archived' ? pending.promise : undefined;
+    if (operation === 'rename') {
+      ui(root, 'session-rename').click(); ui(root, 'session-rename-input').value = 'Stale title'; ui(root, 'session-rename-save').click();
+    } else ui(root, 'session-resume').click();
+    if (change === 'target') await pane.open({ kind: 'history', agentId: 'b', title: 'Other pane target' });
+    if (change === 'close') pane.close();
+    if (change === 'workspace') h.workspace.id = 'another-workspace';
+    if (change === 'role') { h.workspace.role = 'viewer'; pane.refreshAccess(); }
+    pending.resolve(archived({ title: 'Stale title' })); await flush();
+    assert.equal(h.sockets.length, 0);
+    assert.notEqual(pane.getState().title, 'Stale title');
+    assert.equal(h.requests.some(request => request.method === 'POST'), false);
+    if (change === 'role') assert.equal(ui(root, 'session-resume').disabled, true);
+    pane.close();
+  }
+});
+
+test('Access revoked while loading history or before socket-open consumes Resume without sending it', async () => {
+  for (const stage of ['recording', 'socket']) {
+    const h = harness(), { pane, root } = h.create('revoke-' + stage);
+    h.sessions.set('a', [archived()]); await pane.open({ kind: 'history', agentId: 'a' });
+    const pending = deferred();
+    if (stage === 'recording') h.apiOverride = path => path.endsWith('/replay') ? pending.promise : undefined;
+    ui(root, 'session-resume').click(); await flush();
+    h.workspace.role = 'viewer'; pane.refreshAccess();
+    if (stage === 'recording') { pending.resolve({ surface: 'structured', events: [] }); await flush(); }
+    else h.sockets[0].open();
+    assert.equal(h.sockets.flatMap(socket => socket.frames).filter(frame => frame.type === 'resume').length, 0);
+    assert.match(ui(root, 'error').textContent, /permission to resume was revoked/);
+    assert.equal(h.requests.some(request => request.method === 'POST'), false); pane.close();
+  }
+});
+
+test('Native resume errors stay visible and never fall back to create or automatic resume', async () => {
+  for (const code of ['resume_required', 'session_changed', 'context.not_found', 'context.in_use', 'context.recovery_required', 'cli_failed']) {
+    const h = harness(), { pane, root } = h.create('error-' + code);
+    h.sessions.set('a', [archived()]); await pane.open({ kind: 'history', agentId: 'a' });
+    ui(root, 'session-resume').click(); await flush();
+    const socket = h.sockets[0]; socket.open();
+    socket.receive({ type: code === 'cli_failed' ? 'runtime.unavailable' : 'error', code, message: 'CLI reported ' + code });
+    assert.match(ui(root, 'error').textContent, new RegExp(code.replace('.', '\\.')));
+    assert.equal(ui(root, 'chat-input').disabled, true);
+    socket.close(); assert.equal(h.timers.size, 0);
+    assert.equal(h.requests.some(request => request.method === 'POST'), false);
+    assert.equal(socket.frames.filter(frame => frame.type === 'resume').length, 1); pane.close();
+  }
+});
+
+test('Title broadcasts update matching panes safely without resetting drafts or in-progress edits', async () => {
+  const h = harness(), a = h.create('title-live'), b = h.create('title-history');
+  const socket = await h.attach(a.pane, 'a');
+  await b.pane.open({ kind: 'history', agentId: 'a' });
+  ui(a.root, 'chat-input').value = 'unsent';
+  ui(b.root, 'session-rename').click(); ui(b.root, 'session-rename-input').value = 'editing';
+  socket.receive({ type: 'session.updated', session_id: a.pane.getState().sessionId, title: '<svg onload=bad()>' });
+  assert.equal(a.pane.getState().title, '<svg onload=bad()>');
+  assert.equal(ui(b.root, 'session-title').textContent, '<svg onload=bad()>');
+  assert.equal(ui(b.root, 'session-title').children.length, 0);
+  assert.equal(ui(b.root, 'session-rename-input').value, 'editing');
+  assert.equal(ui(a.root, 'chat-input').value, 'unsent');
+  const staleMessage = socket.onmessage;
+  await a.pane.open({ kind: 'history', agentId: 'b', title: 'Other target' });
+  staleMessage({ data: JSON.stringify({ type: 'session.updated', session_id: 'a-created-1', title: 'stale' }) });
+  assert.equal(a.pane.getState().title, 'Other target');
+  assert.notEqual(ui(b.root, 'session-title').textContent, 'stale');
+  a.pane.close(); b.pane.close();
+});
+
+test('Current launch generation accompanies Terminal input, keyboard controls, resize and terminate', async () => {
+  const h = harness(), { pane } = h.create('generation');
+  h.sessions.set('a', [session('term', 'terminal', 'live', { launch_id: 'first', agent_id: 'a' })]);
+  await pane.open({ kind: 'live', agentId: 'a', sessionId: 'term', surface: 'terminal' });
+  const socket = h.sockets[0]; socket.open(); assert.equal(socket.frames[0].launch_id, 'first');
+  socket.receive({ type: 'session.ready', surface: 'terminal', launch_id: 'first' });
+  socket.receive(collaboration('operator', true));
+  h.terminals[0].emit('x'); pane.releaseKeyboard();
+  socket.receive({ type: 'keyboard_request', requester_user_id: 22, requester_username: 'other' }); pane.handoffKeyboard();
+  pane.resize(); await pane.endSession();
+  assert.ok(socket.frames.filter(frame => frame.type !== 'attach').every(frame => frame.launch_id === 'first'));
+  assert.ok(socket.frames.some(frame => frame.type === 'input')); assert.ok(socket.frames.some(frame => frame.type === 'terminate'));
+  pane.close();
+});
+
+test('Resume waits for the new starting token and matching ready; stale lifecycle frames cannot regress it', async () => {
+  const h = harness(), { pane, root } = h.create('resume-generation');
+  h.sessions.set('a', [archived()]);
+  await pane.open({ kind: 'history', agentId: 'a' });
+  ui(root, 'session-resume').click(); await flush();
+  const socket = h.sockets[0]; socket.open(); socket.receive(collaboration('operator', true));
+  assert.equal(ui(root, 'resume-notice').hidden, false);
+  assert.match(ui(root, 'resume-notice').textContent, /Native history has not been verified/);
+  for (const frame of [
+    { type: 'ready', launch_id: 'previous-launch' },
+    { type: 'ready', launch_id: 'new-launch' },
+    { type: 'status', state: 'live', launch_id: 'previous-launch' },
+    { type: 'status', state: 'starting', launch_id: 'previous-launch' },
+  ]) socket.receive(frame);
+  assert.equal(pane.getState().status, 'starting'); assert.equal(ui(root, 'chat-input').disabled, true);
+  h.sessions.set('a', [archived({ state: 'starting', launch_id: 'new-launch' })]);
+  socket.receive({ type: 'status', state: 'starting', launch_id: 'new-launch' });
+  assert.equal(ui(root, 'resume-notice').hidden, false);
+  assert.match(ui(root, 'resume-notice').textContent, /next message may perform/);
+  socket.receive({ type: 'status', state: 'live', launch_id: 'new-launch' });
+  socket.receive({ type: 'ready' });
+  assert.equal(ui(root, 'chat-input').disabled, true, 'neither live status nor untagged ready finishes a resume');
+  for (const frame of [
+    { type: 'ready', surface: 'terminal' }, { type: 'session.ready' }, { type: 'exit' },
+    { type: 'status', state: 'starting' }, { type: 'status', state: 'live' },
+    { type: 'status', state: 'ended' }, { type: 'status', state: 'offline' },
+    { type: 'error', code: 'start_failed', message: 'stale failure' },
+    { type: 'runtime.unavailable', message: 'stale unavailable' },
+  ]) socket.receive({ ...frame, launch_id: 'previous-launch' });
+  await flush();
+  assert.equal(pane.getState().status, 'starting'); assert.equal(ui(root, 'error').textContent, '');
+  socket.receive({ type: 'ready', launch_id: 'new-launch', context_resume: 'next_turn' });
+  assert.equal(ui(root, 'chat-input').disabled, false);
+  assert.match(ui(root, 'status').textContent, /Next message resumes/);
+  assert.equal(ui(root, 'resume-notice').hidden, false);
+  socket.receive({ type: 'status', state: 'starting', launch_id: 'new-launch' });
+  socket.receive({ type: 'status', state: 'starting', launch_id: 'unrelated-launch' });
+  assert.equal(pane.getState().status, 'live', 'a late starting cannot regress readiness');
+  submit(root, 'current turn'); assert.equal(inputFrames(socket)[0].launch_id, 'new-launch');
+  assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  pane.close();
+});
+
+test('Resume may acknowledge an already-live same-generation process without a second launch', async () => {
+  const h = harness(), { pane, root } = h.create('resume-reattach');
+  h.sessions.set('a', [archived()]);
+  await pane.open({ kind: 'history', agentId: 'a' });
+  ui(root, 'session-resume').click(); await flush();
+  const socket = h.sockets[0]; socket.open(); socket.receive(collaboration('operator', true));
+  socket.receive({ type: 'status', state: 'live', launch_id: 'previous-launch' });
+  assert.equal(ui(root, 'chat-input').disabled, true, 'an ordinary live status is not a resume acknowledgement');
+  socket.receive({ type: 'status', state: 'live', launch_id: 'unrelated-launch', reattached: true });
+  assert.equal(ui(root, 'chat-input').disabled, true);
+  socket.receive({ type: 'status', state: 'live', launch_id: 'previous-launch', reattached: true });
+  assert.equal(ui(root, 'chat-input').disabled, false);
+  assert.equal(pane.getState().status, 'live');
+  assert.equal(ui(root, 'resume-notice').hidden, true, 'reattachment makes no new context-restoration claim');
+  assert.equal(socket.frames.filter(frame => frame.type === 'resume').length, 1);
+  assert.equal(h.requests.some(request => request.method === 'POST'), false);
+  pane.close();
+});
+
+test('Safe current-generation start failures retain the restored transcript and cannot be revived by late ready', async () => {
+  for (const failure of [
+    { type: 'error', code: 'start_failed', message: 'The saved conversation could not be opened.' },
+    { type: 'runtime.unavailable', code: 'runtime_unavailable', message: 'This runtime is not available.' },
+  ]) {
+    const h = harness(), { pane, root } = h.create(failure.type);
+    h.sessions.set('a', [archived()]);
+    h.recordings.set('archived', { surface: 'structured', events: [
+      { time: 0, kind: 'event', data: payload({ ev: 'message.delta', text: 'Keep the readable transcript' }) },
+    ] });
+    await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'archived' });
+    ui(root, 'session-resume').click(); await flush();
+    const transcript = ui(root, 'chat-scroll'), socket = h.sockets[0];
+    socket.open(); socket.receive(collaboration('operator', true));
+    socket.receive({ type: 'status', state: 'starting', launch_id: 'new-launch' });
+    socket.receive({ ...failure, session_id: 'archived', launch_id: 'new-launch' });
+    assert.equal(pane.getState().status, 'unavailable');
+    assert.strictEqual(ui(root, 'chat-scroll'), transcript);
+    assert.match(transcript.textContent, /Keep the readable transcript/);
+    assert.equal(ui(root, 'error').textContent, failure.message);
+    assert.equal(ui(root, 'chat-input').disabled, true); assert.equal(ui(root, 'resume-notice').hidden, true);
+    socket.receive({ type: 'ready', launch_id: 'new-launch' }); socket.close(); assert.equal(h.timers.size, 0);
+    assert.equal(pane.getState().status, 'unavailable'); assert.equal(h.sockets.length, 1);
+    assert.equal(h.requests.some(request => request.method === 'POST'), false);
+    pane.close();
+  }
+});
+
+test('Renaming the current replay updates sibling watchers in place, including subsequent server title events', async () => {
+  const h = harness(), replay = h.create('replay-title'), history = h.create('history-title'), live = h.create('watch-title');
+  h.sessions.set('a', [session('shared', 'structured', 'live', { title: 'Original', agent_id: 'a', can_rename: true })]);
+  h.recordings.set('shared', { surface: 'structured', events: [
+    { time: 0, kind: 'event', data: payload({ ev: 'message.delta', text: 'Recorded conversation' }) },
+  ] });
+  await replay.pane.open({ kind: 'replay', agentId: 'a', sessionId: 'shared' });
+  await history.pane.open({ kind: 'history', agentId: 'a' });
+  const socket = await h.attach(live.pane, 'a', 'structured', { sessionId: 'shared' });
+  const transcript = ui(replay.root, 'chat-scroll'), row = ui(history.root, 'session-card'), composer = ui(live.root, 'chat-input');
+  composer.value = 'Unsent draft';
+  ui(replay.root, 'session-rename').click(); ui(replay.root, 'session-rename-input').value = 'Renamed replay';
+  ui(replay.root, 'session-rename-save').click(); await flush();
+  for (const item of [replay, live]) assert.equal(item.pane.getState().title, 'Renamed replay');
+  assert.equal(ui(history.root, 'session-title').textContent, 'Renamed replay');
+  socket.receive({ type: 'session.updated', session_id: 'shared', title: 'From another watcher' });
+  assert.equal(replay.pane.getState().title, 'From another watcher');
+  assert.equal(ui(history.root, 'session-title').textContent, 'From another watcher');
+  assert.strictEqual(ui(replay.root, 'chat-scroll'), transcript); assert.match(transcript.textContent, /Recorded conversation/);
+  assert.strictEqual(ui(history.root, 'session-card'), row);
+  assert.strictEqual(ui(live.root, 'chat-input'), composer); assert.equal(composer.value, 'Unsent draft');
+  replay.pane.close(); history.pane.close(); live.pane.close();
+});
+
+test('Old socket lifecycle callbacks cannot alter a new reattachment even with the same launch token', async () => {
+  const h = harness(), { pane, root } = h.create('socket-generation');
+  h.sessions.set('a', [session('shared', 'structured', 'live', { launch_id: 'current', agent_id: 'a' })]);
+  await pane.open({ kind: 'live', agentId: 'a', sessionId: 'shared' });
+  const old = h.sockets[0]; old.open(); old.receive({ type: 'ready', launch_id: 'current' }); old.receive(collaboration());
+  const callbacks = { message: old.onmessage, error: old.onerror, close: old.onclose, open: old.onopen };
+  await pane.reconnect();
+  const socket = h.sockets[1]; socket.open(); socket.receive({ type: 'status', state: 'live', launch_id: 'current' });
+  socket.receive(collaboration());
+  const state = plain(pane.getState());
+  for (const frame of [
+    { type: 'ready', surface: 'terminal' }, { type: 'status', state: 'ended' }, { type: 'exit' },
+    { type: 'error', code: 'start_failed', message: 'Old failure' }, { type: 'runtime.unavailable' },
+  ]) callbacks.message({ data: JSON.stringify({ ...frame, session_id: 'shared', launch_id: 'current' }) });
+  callbacks.error({}); callbacks.close({}); callbacks.open({});
+  for (const timer of [...h.timers.keys()]) h.runTimer(timer);
+  assert.deepEqual(plain(pane.getState()), state); assert.equal(ui(root, 'error').textContent, '');
+  assert.equal(h.sockets.length, 2); assert.equal(socket.frames[0].type, 'attach');
+  assert.equal(socket.frames.some(frame => frame.type === 'resume'), false);
+  pane.close();
+});
+
+test('Rotated End status is verified against metadata; stale generations cannot end the current pane', async () => {
+  const h = harness(), { pane, root } = h.create('end-generation');
+  const metadata = extra => session('shared', 'structured', 'live', { launch_id: 'current', agent_id: 'a', ...extra });
+  h.sessions.set('a', [metadata()]);
+  await pane.open({ kind: 'live', agentId: 'a', sessionId: 'shared' });
+  const socket = h.sockets[0]; socket.open(); socket.receive({ type: 'ready', launch_id: 'current' }); socket.receive(collaboration());
+  socket.receive({ type: 'status', state: 'ended', launch_id: 'old-end' }); await flush();
+  assert.equal(pane.getState().status, 'live'); assert.equal(ui(root, 'chat-input').disabled, false);
+  h.sessions.set('a', [metadata({ state: 'ended', launch_id: 'ended-generation' })]);
+  socket.receive({ type: 'status', state: 'ended', launch_id: 'ended-generation' }); await flush();
+  assert.equal(pane.getState().status, 'ended'); assert.equal(ui(root, 'chat-input').disabled, true);
+  pane.close();
+});
+
+test('Status generation verification is socket and workspace guarded, and supports authoritative live reattach', async () => {
+  const h = harness(), { pane } = h.create('status-metadata');
+  const metadata = launch_id => session('shared', 'structured', 'live', { launch_id, agent_id: 'a' });
+  h.sessions.set('a', [metadata('old')]);
+  await pane.open({ kind: 'live', agentId: 'a', sessionId: 'shared' });
+  const old = h.sockets[0]; old.open();
+  const pending = deferred(); h.apiOverride = path => path === '/api/sessions/shared' ? pending.promise : undefined;
+  old.receive({ type: 'status', state: 'live', launch_id: 'new' });
+  await pane.reconnect();
+  const socket = h.sockets[1]; socket.open();
+  pending.resolve(metadata('new')); await flush();
+  assert.equal(pane.getState().status, 'connected', 'old socket cannot finish its metadata check into the new socket');
+  h.apiOverride = null; h.sessions.set('a', [metadata('new')]);
+  socket.receive({ type: 'status', state: 'live', launch_id: 'new' }); await flush(); socket.receive(collaboration());
+  assert.equal(pane.getState().status, 'live');
+  assert.equal(pane.interrupt(), true); assert.equal(socket.frames.at(-1).launch_id, 'new');
+  const ending = deferred(); h.apiOverride = path => path === '/api/sessions/shared' ? ending.promise : undefined;
+  socket.receive({ type: 'status', state: 'ended', launch_id: 'ended' });
+  h.workspace.id = 8;
+  ending.resolve({ ...metadata('ended'), state: 'ended' }); await flush();
+  assert.equal(pane.getState().status, 'live', 'another workspace ignores the delayed response');
+  assert.equal(socket.frames.some(frame => frame.type === 'resume'), false);
+  pane.close();
 });

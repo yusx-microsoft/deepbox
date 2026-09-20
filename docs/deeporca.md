@@ -343,9 +343,18 @@ SDK's own model context. A native `done` event alone is not a durable commit mar
 After a normal Connector restart, an operator can choose **Session history →
 Continue native conversation** for an inactive DeepOrca conversation. This uses
 the same authorized conversation/native mapping with a new worker/output epoch.
-It is not offered for ended conversations, other runtimes or viewers. Ordinary
+The browser sends an explicit `resume` request with the expected `launch_id`;
+after authorization and generation checks, the Server routes it to the library
+session's `open` operation, not a CLI native-context adoption or writer lease.
+DeepOrca continuation is not offered for ended conversations or viewers. Supported
+CLI runtimes retain their separate native-writer/resume lifecycle. Ordinary
 Replay, opening an inactive conversation, and workspace-layout restore remain
 read-only: the one-shot continuation choice is not saved in layout state.
+
+Termination advances the Server's lifecycle generation immediately. A late exit
+or input acknowledgment from the previous generation cannot revive the session.
+Its stale-control rejection does not stop the Connector or acknowledge pending
+durable output; those rows still require their exact output acknowledgment.
 
 A private `.embedded-contexts.json` manifest outside native `chat/` records known
 conversations. If one cannot be recovered from native files/history, it fails

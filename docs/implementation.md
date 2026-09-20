@@ -74,10 +74,12 @@ Browser  <--WSS /ws/term-->  Server  <--WSS /ws/devbox-->  Connector  -->  CLI a
 - **`models.py`** — SQLAlchemy ORM schema and `init_db()` (per-connection SQLite
   PRAGMAs: WAL, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout`,
   `wal_autocheckpoint`). Holds `PROTOCOL_VERSION`, retention constants, and the
-  additive `_migrate()` / workspace backfill. `Session.surface` stores `terminal`
+  additive schema migrations / workspace backfill. `Session.surface` stores `terminal`
   or `structured`; migrated sessions remain unknown until a validated ready or
   snapshot establishes their surface. No runtime-name inference is needed. The
   SQL table is still **`session`**; `/api/devboxes` retains its domain identity.
+  New session IDs use canonical UUID text. `Session.launch_id` is the lightweight
+  lifecycle fence; migration marks old rows `legacy` without changing their IDs.
 - **`hub.py`** — in-memory `Hub`: routes frames between connected browsers and
   connectors, per-devbox bounded send queues, hello ordering, duplicate-connection
   retirement, and presence.
@@ -120,12 +122,18 @@ across all of the caller's memberships. Highlights:
   `DELETE /api/agents/{id}`), and connector inventory intake
   (`POST /api/devboxes/{id}/runtimes|projects|skills`, bearer authenticated).
 - **Sessions & replay:** `GET|POST /api/agents/{id}/sessions`,
+  `GET /api/sessions/{id}` (current title, launch token and action availability),
   `GET /api/sessions/{id}/messages`, `GET /api/sessions/{id}/recording`
   (asciicast v2), `GET /api/sessions/{id}/replay` (header/events/checkpoints/
   duration/metadata), `DELETE /api/sessions/{id}/recording` (workspace admin/owner
   secure erase), `PATCH /api/sessions/{id}/retention`
   (`none|7d|30d|permanent`, workspace admin/owner). All enforce session ownership
   for legacy sessions or workspace RBAC for workspace sessions.
+- **Rename:** `PATCH /api/sessions/{id}` accepts only `{title, expected_title}`.
+  The trimmed title must be a single line of 1–120 characters without controls.
+  Current Operator/Admin/Owner access is required; an atomic title compare-and-swap
+  returns 409 on conflict. Only display metadata changes, with `session.updated`
+  notifying attached views; no CLI command, identity or context change occurs.
 
 WebSockets:
 
@@ -133,7 +141,14 @@ WebSockets:
   header only (never query string). Carries the `hello`, inventory, control, and
   durable output/event frames.
 - **`/ws/term`** — browser session channel. Origin-checked; cookie-authenticated.
-  Carries input, resize, keyboard-lease, and the relayed output/event stream.
+  Carries attach, explicit resume, input, resize, keyboard-lease, and the relayed
+  output/event stream. Nonlive History is read-only; only an authorized initial
+  attach to a never-started row may launch automatically. Already-live attach
+  sends no duplicate connector `open`. Resume requires the observed `launch_id`,
+  current Operator/Admin/Owner access, and installed generic native-resume support
+  (`context.explicit_resume` plus `session_lifecycle: 1`); it keeps the same
+  session/agent/native ID, with no create fallback. Terminal/unsupported historical
+  restart is refused. See [the lifecycle contract](design.md#55-restore-and-reconnect).
 
 Session create/list and ready/snapshot frames carry the generic `surface` value.
 An attach cannot silently change an existing session's surface. Structured
@@ -141,14 +156,20 @@ An attach cannot silently change an existing session's surface. Structured
 but not the terminal keyboard lease. Terminal input, resize, and termination
 require the keyboard holder, including for an Admin/Owner. Structured keyboard
 REST requests return 400; browser keyboard frames return `keyboard_not_required`.
-Structured termination requires the holder or workspace Admin/Owner; shared-chat
-permission alone cannot end the session. Closing a pane only detaches its viewer.
+Structured termination requires current Operator/Admin/Owner access without a
+keyboard lease. Closing a pane only detaches its viewer.
 
 Every input checks current identity, membership, and attachment. Every connector
 session frame checks the current devbox connection, session's owning agent, and
 instance fence—including legacy output, ready, exit and process snapshots, not
 just durable v3 frames. Malformed frames return an error instead of tearing down
 the connection. Valid legacy wire forms remain supported at this boundary.
+For lifecycle-capable sessions, `launch_id` fences controls, ready, exit, and
+snapshots; stale snapshot entries cannot downgrade a newer active generation.
+Old structured-instance output is still committed and ACKed, but not live-fanned.
+End marks the session logically ended, not locally reaped. Session-scoped connector
+`error` and `runtime.unavailable` frames use safe server guidance, not raw connector
+exception/stderr text; no replacement session is created.
 
 ## 4. Connector (`connector/`)
 
@@ -172,6 +193,8 @@ the connection. Valid legacy wire forms remain supported at this boundary.
   supervisor-property facades have been removed. Diagnostics and both transports
   share URL validation: HTTPS is required off loopback, and credential-bearing,
   query-bearing or fragment-bearing base URLs are rejected before using a token.
+  Lifecycle controls use awaited IPC and preserve `launch_id`; `resume` is never
+  translated to `open`. Lost transport/reconnect is not a request for native resume.
 - **`spool.py`** — durable output spool (SQLite, WAL, `synchronous=FULL`); see
   [`persistence.md`](persistence.md).
 - **`runtimes.py`** — single source of truth for runtime adapters. `RuntimeAdapter`
@@ -235,14 +258,34 @@ the connection. Valid legacy wire forms remain supported at this boundary.
   history.
 - Structured adapters may declare a `ContextControl` (`connector/runtimes.py`)
   naming the flags that create and resume a provider-owned conversation. The
-  supervisor passes AgentBridge's own session ID: the first turn uses the create
-  flag, later turns use the resume flag. A marker is written to the connector's
-  `native_context` table only after a turn completes without error, so a failed
-  first turn never claims a transcript exists. Persistent and per-turn runtimes
-  both spawn through the adapter's command builder, so continuity flags apply to
-  each process. Resume is refused when the recorded runtime changed, or when a
-  `cwd`-scoped runtime's project directory changed; the turn ends with a visible
-  error instead of an empty conversation.
+  supervisor passes AgentBridge's own session ID. Under a family/session writer
+  lock it re-reads the durable marker, reserves `state=attempted` before create,
+  and promotes it to `established` after a successful turn. Existing reservations
+  always resume, even if a failed first launch left no provider transcript; there
+  is no create fallback. `BEGIN IMMEDIATE` serializes marker read/check/write;
+  failure to promote fences input. Inventory omission does not delete markers.
+  Effective cwd is captured (including inherited cwd), and changed runtime or
+  cwd-scoped project bindings are refused. Configuration changed during probing
+  is rejected. Eager and lazy launches both use the command builder; the previous
+  lazy supervisor path already did so, so the earlier eager-path fix was not a
+  demonstrated production-Claude context-loss root cause.
+- Explicit Resume requires an existing local `attempted`/`established` marker,
+  checked under native-writer ownership before logical ready and again before
+  every spawn. `require_existing_context` cannot fall back to create or change the
+  session/agent/native ID. The existing runtime/cwd binding rules are unchanged.
+  `context_resume: "pending"` means the next real message performs native resume;
+  lazy/per-turn preparation does not prove that the provider transcript exists.
+- `native_writer.py` provides a user-local, non-blocking OS lock and fsynced
+  active journal. Scope is runtime family + session ID, not agent/cwd/database.
+  The lock spans per-turn idle gaps and is released after confirmed child reap;
+  cancelled/late spawn and full-pipe cleanup are regression-tested. Uncertain
+  cleanup keeps the journal active for explicit recovery, never TTL/PID takeover.
+  `StructuredAgentSession.wait_closed()` and supervisor reaper tracking let CLI
+  shutdown finish cleanup before closing the local store/event loop.
+- `agentbridge context status|release` (`connector/cli.py`) inspects/recovers
+  guards locally without starting a connector or CLI. Release requires the exact
+  journal owner plus `--confirm-writer-stopped`, and cannot break a live OS lock.
+  That flag is human attestation, not automatic verification that an orphan died.
 - Adding a new runtime is one registry entry plus an adapter — no server or
   browser changes.
 
@@ -269,6 +312,11 @@ the connection. Valid legacy wire forms remain supported at this boundary.
   reconnect, file reads, stale-response guards, and teardown. Closing detaches;
   it never terminates the backend session. New chat leaves the old session alive.
   Unsent drafts remain independent in memory and never enter layout storage.
+  History/replay and live session headers provide metadata-only Rename with a
+  retained draft on title conflict. History separates View history, Attach live,
+  and explicit Resume; unsupported/terminal historical restart is disabled with
+  a reason, not converted into New session. Preparation and safe resume failures
+  are visible; logical ready does not claim restored native history.
 - **`app.js`** — shell composition, signed-in/workspace context, top navigation,
   collapsible sidebar, management, and optional keyboard/command affordances.
   **`main.js`** is the small bootstrap entry point.
@@ -360,6 +408,8 @@ Representative coverage:
 
 ## 8. Current boundaries
 
+- Rename/explicit Resume describe the current local changes, not new live
+  Workspace or real-CLI acceptance evidence, and not a deployment claim.
 - The in-memory `Hub` / `LiveRegistry` have single-server-instance semantics;
   horizontal scale-out needs shared active-connection and live-screen state.
 - The app itself does not terminate TLS; a deployment front end such as Azure App
