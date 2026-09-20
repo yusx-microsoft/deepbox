@@ -1150,7 +1150,10 @@ async def _accept_runtime_status(s: OrmSession, conn: DevboxConn, frame: dict) -
     aid = frame.get("agent_id")
     if not isinstance(aid, str) or len(aid) > 64 or aid not in conn.agent_ids:
         return False
-    agent = s.get(Agent, aid)
+    # WebSocket sessions keep objects across frames (expire_on_commit=False).
+    # A rollback with no open transaction does not expire them, so explicitly
+    # refresh desired configuration before accepting any observed revision.
+    agent = s.get(Agent, aid, populate_existing=True)
     if not agent or agent.devbox_id != conn.devbox_id:
         return False
     accepted = runtime_policy(agent.runtime).observed_status(agent, frame.get("runtime_status"))
@@ -1427,6 +1430,7 @@ async def create_agent(devbox_id: str, request: Request, s: OrmSession = Depends
         raise HTTPException(422, "runtime_config must be an object")
     if len(json.dumps(runtime_config)) > 16 * 1024:
         raise HTTPException(422, "runtime_config is too large")
+    policy.validate_create_capabilities(runtime_config, d.capabilities)
     a = Agent(
         id=new_id(), devbox_id=d.id,
         handle=body["handle"], display_name=body.get("display_name") or body["handle"],
@@ -1452,23 +1456,51 @@ async def get_agent(agent_id: str, request: Request, s: OrmSession = Depends(db)
     return _agent_json(a)
 
 
+def _agent_has_active_sessions(s: OrmSession, agent: Agent) -> bool:
+    """Include idle attached conversations, not just running Connector turns.
+
+    A stored historical session alone does not block settings. Open viewers and
+    queued input do: replacing configuration must never terminate their work.
+    """
+    for sid in s.scalars(select(Session.id).where(Session.agent_id == agent.id)):
+        if hub.is_session_active(agent.id, sid):
+            return True
+        live_session = live_registry.get(sid)
+        if live_session is not None and live_session.ended:
+            continue
+        if hub.session_watchers.get(sid) or (live_session and live_session.pending_inputs):
+            return True
+    return False
+
+
 @app.patch("/api/agents/{agent_id}")
 async def rename_agent(agent_id: str, request: Request, s: OrmSession = Depends(db)):
-    """Display-only edits never repoint a native profile or reset its history."""
+    """Apply authorized display edits and policy-approved desired settings."""
     u = current_user(request, s)
     a = s.get(Agent, agent_id)
     if not a:
         raise HTTPException(404, "not found")
     _devbox_role(s, u.id, a.devbox, WS_ROLE_ADMIN)
     body = await _session_body(request)
-    runtime_policy(a.runtime).validate_agent_update(a, body)
+    policy = runtime_policy(a.runtime)
+    runtime_config = policy.validate_agent_update(a, body)
+    if runtime_config is not None:
+        if len(json.dumps(runtime_config)) > 16 * 1024:
+            raise HTTPException(422, "runtime_config is too large")
+        if _agent_has_active_sessions(s, a):
+            raise HTTPException(409, "close active conversations before changing runtime configuration")
     if "display_name" in body:
         name = body["display_name"]
         if not isinstance(name, str) or not name.strip() or len(name) > 200:
             raise HTTPException(422, "display_name must be a nonempty string of at most 200 characters")
         a.display_name = name.strip()
+    if runtime_config is not None:
+        a.runtime_config = runtime_config
+        policy.initialize_agent(a)
     s.commit()
     await _push_agent_directory(a.devbox_id)
+    if runtime_config is not None:
+        await _broadcast_runtime_status(s, a)
     return _agent_json(a)
 
 

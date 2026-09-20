@@ -2,7 +2,8 @@
 
 This follow-up reorganizes the existing v1 implementation and replaces the first
 chat presentation. It does not introduce a second native WebServer, change the
-wire protocol, adopt existing profiles, or enable interactive approvals.
+wire protocol or enable interactive approvals. The later existing-profile
+extension adds explicit binding without importing native chat history.
 
 ## Ownership
 
@@ -12,6 +13,8 @@ agentbridge/integrations/deeporca/
 connector/integrations/deeporca/
   adapter.py           # Runtime descriptor registered by the platform
   probe.py             # Disposable, optional SDK capability probe
+  profiles.py          # Bounded existing-profile discovery and opaque local references
+  credentials.py       # Local key ownership and sealed profile credential decoding
   store.py             # Private binding/admission/native-context mappings
   supervisor.py        # Owned worker/session lifecycle extension
   worker.py            # Spawn/IPC, deadlines and bounded native event coalescing
@@ -23,6 +26,7 @@ server/app/integrations/
 web/integrations/deeporca/
   runtime.js           # Local renderer/access/input/presentation contract
   agent-ui.js          # Managed-profile creation and settings presentation
+  agent-ui.css         # Scoped, responsive model-configuration form
   chat.js              # Pane-local conversation view and safe Markdown
   chat.css             # Scoped conversation styling
 ```
@@ -45,6 +49,23 @@ does not hot-reload Python modules. **No state migration or deletion is needed.*
 Binding database names/schema, managed homes/profile names, enrollment scopes,
 session/receipt identifiers and `deeporca-chat-v1` are unchanged. Browser assets
 use the new local paths; refresh the page to load the complete matching bundle.
+
+## Native security policy boundary
+
+Native DeepOrca defaults to `minimal`. The Connector calls `ensure_profile()`
+without a security-default override; the SDK copies native defaults or trusted
+template security unchanged. Explicit profile security is respected. Embedded
+execution delegates to the unmodified native `SecurityManager`, with no forced
+`standard` level or `allowlist` approval floor.
+
+There is no security migration, new-profile-only opt-in, creation marker, extra
+Connector flag or separately versioned security-default API. Existing files are
+not proactively rewritten, but existing managed and bound profiles using `minimal`
+now also receive that native policy at runtime rather than the former floor.
+`NonInteractivePolicy` still rejects final `REVIEW`/`DENY` and unsupported
+background/autonomous tools; no approval UI or transport is added. The
+[existing-profile binding](deeporca-existing-profiles.md) native-stop requirement
+and exclusive embedded ownership checks are unchanged.
 
 ## Native-style chat
 
@@ -89,3 +110,7 @@ real tool execution; the SDK/Server/Connector tests are separate.
 
 See [validation](deeporca-validation.md) for test results and
 [acceptance mapping](deeporca-design-checklist.md) for the original v1 guarantees.
+
+The subsequent [web profile configuration](deeporca-profile-configuration.md)
+extension adds DeepOrca-only model setup/editing, sealed credentials and
+revisioned configuration updates without changing these ownership boundaries.

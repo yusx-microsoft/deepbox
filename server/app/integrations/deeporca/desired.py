@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 
-from agentbridge.integrations.deeporca.contract import binding_revision, validate_runtime_config
+from agentbridge.integrations.deeporca.contract import (
+    binding_identity_revision, binding_revision, validate_runtime_config,
+)
 
 if TYPE_CHECKING:
     from ...models import Agent
@@ -39,11 +41,41 @@ def create_config(body: dict) -> dict:
     return config
 
 
-def validate_identity_update(agent: Agent, body: dict, identity_fields: set[str]) -> None:
-    for key in identity_fields & body.keys():
-        value = runtime_config(body[key]) if key == "runtime_config" else body[key]
-        if value != getattr(agent, key):
+def validate_identity_update(agent: Agent, body: dict, identity_fields: set[str]) -> dict | None:
+    """Return a changed desired configuration without modifying the Agent.
+
+    Profile identity is immutable; only the explicit LLM settings and encrypted
+    credential are editable. Omission retains a sealed credential only while
+    explicit LLM configuration remains, never by accepting plaintext secrets.
+    """
+    for key in (identity_fields - {"runtime_config"}) & body.keys():
+        if body[key] != getattr(agent, key):
             raise HTTPException(409, "DeepOrca binding is immutable; create a new Agent/binding")
+    if "runtime_config" not in body:
+        return None
+    previous = runtime_config(agent.runtime_config)
+    value = body["runtime_config"]
+    if (isinstance(value, dict) and "llm" in value and "credential" not in value
+            and "credential" in previous):
+        value = {**value, "credential": previous["credential"]}
+    config = runtime_config(value)
+    try:
+        old_identity = binding_identity_revision(agent.id, agent.local_project_id, previous)
+        new_identity = binding_identity_revision(agent.id, agent.local_project_id, config)
+    except ValueError:
+        raise HTTPException(409, "invalid DeepOrca binding; create a new Agent/binding") from None
+    if old_identity != new_identity:
+        raise HTTPException(409, "DeepOrca binding is immutable; create a new Agent/binding")
+    old_credential = previous.get("credential")
+    new_credential = config.get("credential")
+    if (old_credential and old_credential["mode"] == "sealed"
+            and previous.get("llm", {}).get("base_url") != config.get("llm", {}).get("base_url")
+            and (new_credential is None or new_credential == old_credential)):
+        raise HTTPException(409, "changing the endpoint requires a new sealed credential or explicit no authentication")
+    if binding_revision(agent.id, agent.local_project_id, previous) == binding_revision(
+            agent.id, agent.local_project_id, config):
+        return None
+    return config
 
 
 def pending_status(agent: Agent) -> dict:

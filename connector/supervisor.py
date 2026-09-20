@@ -117,6 +117,7 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
 
     def replace_agents(self, agents) -> None:
         self.agents = self._resolve_agents(agents)
+        self._schedule_runtime_reconciliation()
 
     def pending_project_migrations(self) -> list[dict]:
         return list(self._project_migrations.values())
@@ -329,7 +330,7 @@ class SessionSupervisor(DeepOrcaSupervisorMixin):
                    for agent in agents):
                 return
             updated = self._resolve_agents(agents)
-            removed_agent_ids = set(self.agents) - set(updated)
+            removed_agent_ids = (set(self.agents) | self._runtime_bound_agent_ids()) - set(updated)
             self.agents = updated
             if removed_agent_ids:
                 for removed_agent_id in removed_agent_ids:

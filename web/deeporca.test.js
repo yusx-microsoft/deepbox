@@ -78,9 +78,9 @@ test('tool summaries describe intent and missing/interrupted/failed tools never 
 test('agent UI explains automatic profile mode without rendering diagnostic paths', () => {
   assert.equal(AgentUI.runtimeStatus({state:'C:/private/state'}).state, 'pending');
   const fields = AgentUI.creationFields({templates:[]});
-  assert.equal(fields.length, 1);
-  assert.equal(fields[0].name, 'template');
-  assert.match(fields[0].helpHtml, /Automatic managed profile/);
+  assert.deepEqual(fields.map(field=>field.name), ['profile_mode', 'profile_ref', 'native_stopped', 'base_url', 'model', 'auth_mode', 'api_key', 'context_window', 'reasoning_effort']);
+  assert.equal(fields.find(field=>field.name === 'api_key').type, 'password');
+  assert.ok(fields.every(field=>!['profile_path','template','command'].includes(field.name)));
   assert.equal(AgentUI.settingsHtml.includes('password'), false);
 });
 

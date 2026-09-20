@@ -126,19 +126,29 @@ const manager=b.loadModule('management.js').createManagement({dialogs,context:()
  }});
 manager.createAgent('m');await flush();
 let root=b.document.querySelector('.overlay');
-assert.equal(root.querySelector('[data-field="profile_mode"]'),null);
+assert.equal(root.querySelector('[data-field="profile_mode"]').closest('.field').hidden,true);
+assert.equal(root.querySelector('[data-field="profile_mode"]').disabled,true);
 assert.match(root.textContent,/Automatic managed profile/);
-assert.match(root.textContent,/credentials stay on the Connector/);
+assert.match(root.textContent,/Encrypted in this browser/);
+assert.equal(root.querySelector('[data-field="template"]'),null);
 root.querySelector('[data-field="handle"]').value='Local helper';
 root.querySelector('[data-field="runtime"]').value='deeporca';
-root.querySelector('[data-field="template"]').value='connector-default';
+root.querySelector('[data-field="base_url"]').value='http://localhost:11434/v1';
+root.querySelector('[data-field="model"]').value='provider/model-name';
+root.querySelector('[data-field="context_window"]').value='32768';
+root.querySelector('[data-field="auth_mode"]').value='none';
+root.querySelector('[data-field="auth_mode"]').dispatchEvent({type:'change'});
 root.querySelector('form').dispatchEvent({type:'submit'});await flush();
 assert.equal(calls.length,0);assert.match(root.querySelector('[data-error]').textContent,/requires a registered local project/);
 const project=root.querySelector('[data-field="local_project_id"]');assert.equal(project.required,true);
 const runtime=root.querySelector('[data-field="runtime"]');
 runtime.value='cli';runtime.dispatchEvent({type:'change'});assert.equal(project.required,false);
+assert.equal(root.querySelector('.do-agent-group').hidden,true);
+assert.equal(root.querySelector('[data-field="model"]').disabled,true);
 assert.match(project.textContent,/No project \(runtime default\)/);
 runtime.value='deeporca';runtime.dispatchEvent({type:'change'});assert.equal(project.required,true);
+assert.equal(root.querySelector('[data-field="model"]').value,'provider/model-name');
+assert.equal(root.querySelector('.do-agent-group').hidden,false);
 machine.projects=[{id:'project-local-1',name:'Registered test project'}];
 root.querySelector('[data-refresh-projects]').click();await flush();
 assert.equal(project.value,'');project.value='project-local-1';
@@ -152,15 +162,17 @@ root.querySelector('[data-refresh-projects]').click();await flush();project.valu
 root.querySelector('form').dispatchEvent({type:'submit'});await flush();
 assert.equal(calls.length,1);assert.equal(calls[0].path,'/api/devboxes/m/agents');
 assert.deepEqual(calls[0].body,{handle:'Local helper',display_name:'Local helper',runtime:'deeporca',local_project_id:'project-local-1',
- runtime_config:{integration_version:1,profile:{mode:'create',configuration_template_ref:'connector-default'}}});
-root=b.document.querySelector('.overlay');assert.match(root.textContent,/needs configuration/);
+ runtime_config:{integration_version:1,profile:{mode:'create',configuration_template_ref:'connector-default'},
+ llm:{provider:'openai',base_url:'http://localhost:11434/v1',model:'provider/model-name',context_window:32768,reasoning_effort:''},credential:{mode:'none'}}});
+root=b.document.querySelector('.overlay');assert.match(root.textContent,/Needs configuration/);
 assert.match(root.textContent,/Retry initialization/);
 assert.match(root.textContent,/Agent settings/);
 root.querySelector('[data-refresh-status]').click();await flush();
 assert.equal(calls.length,1);assert.ok(refreshes>=3);dialogs.close();await flush();
 manager.agentSettings('a');await flush();root=b.document.querySelector('.overlay');
-assert.match(root.textContent,/needs configuration/);assert.equal(machine.agents.length,1);
-assert.equal(root.querySelectorAll('input').length,1);dialogs.close();await flush();
+assert.match(root.textContent,/Needs configuration/);assert.equal(machine.agents.length,1);
+assert.equal(root.querySelector('[data-field="api_key"]').value,'');
+assert.equal(root.querySelector('[data-field="auth_mode"]').value,'keep');dialogs.close();await flush();
 // Existing CLI behavior remains optional and sends null.
 manager.createAgent('m');await flush();root=b.document.querySelector('.overlay');
 root.querySelector('[data-field="handle"]').value='CLI helper';
@@ -169,6 +181,130 @@ root.querySelector('[data-field="runtime"]').dispatchEvent({type:'change'});
 root.querySelector('form').dispatchEvent({type:'submit'});await flush();
 assert.equal(calls.length,2);assert.equal(calls[1].body.local_project_id,null);
 assert.deepEqual(calls[1].body.runtime_config,{});
+""")
+
+
+def test_switch_to_cli_does_not_submit_runtime_fields_or_key_draft():
+    run_js(r"""
+const b=createBrowser({terminal:false}),calls=[];
+const box={id:'m',name:'Fixture',workspace_id:'w',capabilities:{runtimes:[descriptor,{runtime:'cli',installed:true}]},
+ projects:[{id:'p',name:'Project'}],agents:[]};
+const context={user:{id:'u'},workspace:{id:'w',role:'owner'},epoch:1,devboxes:[box]};
+const dialogs=b.loadModule('dialogs.js').createDialogs(b.document);
+const manager=b.loadModule('management.js').createManagement({dialogs,context:()=>context,refresh:async()=>{},api:async(path,options)=>{
+ calls.push({path,body:JSON.parse(options.body)});return {id:'cli-agent',runtime:'cli'};
+}});
+manager.createAgent('m');await flush();
+const root=b.document.querySelector('.overlay'),field=name=>root.querySelector(`[data-field="${name}"]`);
+field('handle').value='CLI Agent';field('base_url').value='https://fixture.test/v1';field('model').value='provider/model';
+field('api_key').value='cli-must-never-receive-this-fixture-key';
+field('runtime').value='cli';field('runtime').dispatchEvent({type:'change'});
+assert.equal(root.querySelector('.do-agent-group').hidden,true);
+assert.equal(root.querySelector('.modal').classList.contains('do-agent-modal'),false);
+root.querySelector('form').dispatchEvent({type:'submit'});await flush();
+assert.deepEqual(calls,[{path:'/api/devboxes/m/agents',body:{handle:'CLI Agent',display_name:'CLI Agent',runtime:'cli',local_project_id:null,runtime_config:{}}}]);
+assert.ok(!JSON.stringify(calls).includes('fixture-key'));
+""")
+
+
+def test_model_configuration_validation_and_sealed_credentials():
+    run_js(r"""
+const catalog=require('./web/integrations/deeporca/agent-ui.js');
+const crypto=require('node:crypto');
+const values={base_url:'http://localhost:11434/v1',model:'provider/model-name:latest',context_window:'32768',reasoning_effort:'',auth_mode:'none'};
+for(const [name,badValues] of Object.entries({base_url:['','file:///private','https://key:secret@test/v1','https://test/v1?api_key=x','https://test/v1#x','https://test/v1\\bad','https://test:0/v1'],model:['','not a model','${secret}'],context_window:['','0','-1','1.5','1e5','9007199254740992'],reasoning_effort:['automatic']})){
+  for(const bad of badValues) assert.throws(()=>catalog.modelConfig({...values,[name]:bad}));
+}
+for(const effort of ['', 'none','minimal','low','medium','high','xhigh','max']){
+  assert.equal(catalog.modelConfig({...values,reasoning_effort:effort}).reasoning_effort,effort);
+}
+assert.equal(catalog.modelConfig({...values,context_window:'9007199254740991'}).context_window,Number.MAX_SAFE_INTEGER);
+const none=await catalog.configuredPayload(values,descriptor);
+assert.deepEqual(none.credential,{mode:'none'});
+const secret='fixture-only-key/round-trip';
+await assert.rejects(catalog.configuredPayload({...values,auth_mode:'api_key',api_key:secret},descriptor),/HTTPS/);
+const pair=crypto.generateKeyPairSync('rsa',{modulusLength:2048});
+const key_id=crypto.createHash('sha256').update(pair.publicKey.export({format:'der',type:'spki'})).digest('hex');
+const key={version:1,algorithm:'RSA-OAEP-256+A256GCM',key_id,public_key:pair.publicKey.export({format:'jwk'})};
+const advertised={...descriptor,agent_config:{...descriptor.agent_config,credential_key:key}};
+await assert.rejects(catalog.sealCredential(' invalid fixture key ',values.base_url,advertised),/whitespace/);
+const encrypted=await catalog.configuredPayload({...values,auth_mode:'api_key',api_key:secret},advertised);
+const envelope=encrypted.credential;
+assert.deepEqual(Object.keys(envelope).sort(),['mode','key_id','wrapped_key','iv','ciphertext'].sort());
+assert.equal(envelope.mode,'sealed');assert.equal(envelope.key_id,key_id);
+assert.ok(!JSON.stringify(encrypted).includes(secret));
+for(const field of ['wrapped_key','iv','ciphertext'])assert.match(envelope[field],/^[A-Za-z0-9+/]+={0,2}$/);
+const raw=crypto.privateDecrypt({key:pair.privateKey,padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},Buffer.from(envelope.wrapped_key,'base64'));
+assert.equal(raw.length,32);assert.equal(Buffer.from(envelope.iv,'base64').length,12);
+const data=Buffer.from(envelope.ciphertext,'base64');
+function decrypt(url){
+ const decipher=crypto.createDecipheriv('aes-256-gcm',raw,Buffer.from(envelope.iv,'base64'));
+ decipher.setAAD(Buffer.from('agentbridge/deeporca/credential/v1\0'+key_id+'\0'+url));
+ decipher.setAuthTag(data.subarray(-16));
+ return Buffer.concat([decipher.update(data.subarray(0,-16)),decipher.final()]).toString('utf8');
+}
+assert.equal(decrypt(values.base_url),secret);assert.throws(()=>decrypt('https://other.test/v1'));
+const again=await catalog.sealCredential(secret,values.base_url,advertised);
+assert.notEqual(again.iv,envelope.iv);assert.notEqual(again.wrapped_key,envelope.wrapped_key);
+await assert.rejects(catalog.sealCredential(secret,values.base_url,advertised,{}),/HTTPS/);
+await assert.rejects(catalog.sealCredential(secret,values.base_url,{...advertised,agent_config:{credential_key:{...key,key_id:'0'.repeat(64)}}}),/HTTPS/);
+await assert.rejects(catalog.sealCredential('',values.base_url,advertised),/API key is required/);
+await assert.rejects(catalog.sealCredential('x'.repeat(4097),values.base_url,advertised),/4,096/);
+const agent={runtime:'deeporca',runtime_config:{...encrypted,credential:{...envelope,untrusted_plaintext:secret}}};
+const keep=await catalog.settingsPayload({...values,auth_mode:'keep',display_name:'Renamed'},agent,descriptor);
+assert.equal(keep.runtime_config.credential,undefined);assert.ok(!JSON.stringify(keep).includes(secret));
+assert.deepEqual(keep.runtime_config.profile,encrypted.profile);
+await assert.rejects(catalog.settingsPayload({...values,auth_mode:'keep',base_url:'https://other.test/v1'},agent,descriptor),/Endpoint changed/);
+const replaced=await catalog.settingsPayload({...values,auth_mode:'api_key',api_key:secret,display_name:'Renamed'},agent,advertised);
+assert.equal(replaced.runtime_config.credential.mode,'sealed');assert.ok(!JSON.stringify(replaced).includes(secret));
+""")
+
+
+def test_edit_model_settings_validation_drafts_refresh_retry_and_legacy():
+    run_js(r"""
+const b=createBrowser({terminal:false}),calls=[];
+const agent={id:'edit',runtime:'deeporca',handle:'orca',display_name:'Orca',local_project_id:'p',
+ runtime_config:{integration_version:1,profile:{mode:'create',configuration_template_ref:'connector-default'}},
+ runtime_status:{state:'needs_configuration',code:'model_not_configured'}};
+const box={id:'m',workspace_id:'w',capabilities:{runtimes:[descriptor]},projects:[{id:'p',name:'Fixture project'}],agents:[agent]};
+const context={user:{id:'u'},workspace:{id:'w',role:'owner'},epoch:1,devboxes:[box]};
+const dialogs=b.loadModule('dialogs.js').createDialogs(b.document);
+let fail=true;
+const manager=b.loadModule('management.js').createManagement({dialogs,context:()=>context,refresh:async()=>{},api:async(path,options)=>{
+ const body=options.body?JSON.parse(options.body):null;calls.push({path,body,method:options.method});
+ if(options.method==='PATCH'){
+  if(fail)throw new Error('End active conversations before changing model settings.');
+  Object.assign(agent,body);return agent;
+ }
+ return agent;
+}});
+manager.agentSettings('edit');await flush();
+const root=b.document.querySelector('.overlay'),field=name=>root.querySelector(`[data-field="${name}"]`);
+const submit=async()=>{root.querySelector('form').dispatchEvent({type:'submit'});await flush();};
+assert.equal(field('base_url').value,'');assert.equal(field('model').value,'');assert.equal(field('context_window').value,'');
+assert.equal(field('api_key').getAttribute('autocomplete'),'new-password');
+field('context_window').value='32768'; // An edited model field requires full setup, unlike rename-only.
+await submit();assert.match(root.querySelector('[data-error]').textContent,/Endpoint is required/);assert.equal(calls.length,0);
+field('base_url').value='http://localhost:11434/v1';field('base_url').dispatchEvent({type:'input'});
+assert.match(root.textContent,/Endpoint changed/);
+field('model').value='provider/model';field('context_window').value='32768';
+await submit();assert.match(root.querySelector('[data-error]').textContent,/Endpoint changed/);assert.equal(calls.length,0);
+field('auth_mode').value='api_key';field('auth_mode').dispatchEvent({type:'change'});field('api_key').value='in-memory-only-fixture';
+await submit();assert.equal(calls.length,0);assert.match(root.querySelector('[data-error]').textContent,/HTTPS/);
+assert.equal(field('api_key').value,'in-memory-only-fixture');assert.equal(field('api_key').disabled,false);
+root.querySelector('[data-refresh-status]').click();await flush();assert.equal(field('api_key').value,'in-memory-only-fixture');
+root.querySelector('[data-retry-runtime]').click();await flush();assert.deepEqual(calls[0],{path:'/api/agents/edit/runtime/retry',body:null,method:'POST'});
+field('auth_mode').value='none';field('auth_mode').dispatchEvent({type:'change'});
+await submit();assert.match(root.querySelector('[data-error]').textContent,/End active conversations/);
+assert.equal(field('model').value,'provider/model');assert.equal(field('api_key').disabled,true);
+assert.ok(!JSON.stringify(calls).includes('in-memory-only-fixture'));
+fail=false;await submit();assert.equal(field('api_key').value,'');assert.equal(field('auth_mode').value,'keep');
+assert.equal(root.querySelector('[data-submit]').textContent,'Saved');
+assert.deepEqual(calls.at(-1).body,{display_name:'Orca',runtime_config:{integration_version:1,profile:{mode:'create',configuration_template_ref:'connector-default'},
+ llm:{provider:'openai',base_url:'http://localhost:11434/v1',model:'provider/model',context_window:32768,reasoning_effort:''},credential:{mode:'none'}}});
+field('reasoning_effort').value='high';await submit();assert.equal(calls.at(-1).body.runtime_config.credential,undefined);
+assert.equal(calls.at(-1).body.runtime_config.llm.reasoning_effort,'high');
+dialogs.close();await flush();
 """)
 
 

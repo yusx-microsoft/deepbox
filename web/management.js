@@ -108,15 +108,26 @@
         const error = root.querySelector('[data-error]');
         const inputs = config.fields.map(field=>root.querySelector(`[data-field="${field.name}"]`));
         let busy = false;
+        inputs.forEach(input=>{
+          const edited = ()=>{
+            if(busy) return;
+            error.textContent = '';
+            if(button.textContent === 'Saved') button.textContent = config.submit || 'Save';
+          };
+          input.addEventListener('input', edited);
+          input.addEventListener('change', edited);
+        });
         form.onsubmit = async event=>{
           event.preventDefault();
           if(busy || button.disabled || !live(snapshot, root)) return;
           error.textContent = '';
           const values = {};
-          config.fields.forEach((field,index)=>{ values[field.name] = inputs[index].value.trim(); });
+          config.fields.forEach((field,index)=>{ values[field.name] = field.type === 'checkbox' ? inputs[index].checked
+            : field.type === 'password' ? inputs[index].value : inputs[index].value.trim(); });
           const missing = config.fields.find(field=>field.required && !values[field.name]);
           if(missing){ error.textContent = missing.label + ' is required.'; return; }
           busy = true; button.disabled = true;
+          const disabled = inputs.map(input=>input.disabled);
           inputs.forEach(input=>{ input.disabled = true; });
           try { await submit(values, root); }
           catch(problem){ if(live(snapshot, root)) error.textContent = message(problem); }
@@ -124,7 +135,8 @@
             busy = false;
             if(live(snapshot, root)){
               button.disabled = false;
-              inputs.forEach(input=>{ input.disabled = false; });
+              inputs.forEach((input,index)=>{ input.disabled = disabled[index]; });
+              config.onSettled?.(root);
             }
           }
         };
@@ -514,6 +526,7 @@
       }
       target = machine(snapshot, machineId);
       if(!target || !canManage(snapshot)){ if(live(snapshot, pending.element)) dialogs.close(); return; }
+      const bindings = [];
       return mutationForm(snapshot, {
         title:'Add agent', desc:`Register an agent runtime on ${target.name}.`,
         fields:[
@@ -546,7 +559,8 @@
               : 'Projects are connector-local. Optional for this runtime; add one below, then refresh.';
           };
           runtime.addEventListener('change', updateProjects); updateProjects();
-          for(const [id, {ui, config}] of runtimeUis) ui.bindCreation(root, runtime, config, id);
+          for(const [id, {ui, config}] of runtimeUis) bindings.push(ui.bindCreation(root, runtime, config, id,
+            ()=>UI.findRuntimeCapability(target.capabilities, id)));
           const update = ()=>{ if(live(snapshot, root)) command.textContent = UI.projectAddCommand(path.value, name.value); };
           path.oninput = name.oninput = update; update();
           bindCopy(snapshot, root, root.querySelector('[data-project-copy]'), ()=>command.textContent, error);
@@ -559,10 +573,12 @@
               target = machine(snapshot, machineId);
               if(!target) throw new Error('This Machine is no longer available.');
               updateProjects();
+              bindings.forEach(binding=>binding?.update?.());
             } catch(problem){ if(live(snapshot, root)) error.textContent = message(problem); }
             finally { if(live(snapshot, root)) button.disabled = submit.disabled = false; }
           };
         },
+        onSettled:()=>bindings.forEach(binding=>binding?.update?.()),
       }, async(values, root)=>{
         requireManager(snapshot);
         const current = machine(snapshot, machineId);
@@ -572,11 +588,16 @@
         if(selectedContract.requiresRegisteredProject && !values.local_project_id) throw new Error(`${selectedContract.label || values.runtime} requires a registered local project. Add one on this Machine, refresh projects, then select it.`);
         if(!projects(current, values.runtime).some(project=>project.value === values.local_project_id)) throw new Error('This project is no longer available. Refresh projects and choose again.');
         const runtimeUi = runtimeUis.get(values.runtime)?.ui;
-        const runtimeConfig = runtimeUi ? runtimeUi.creationConfigFromValues(UI.findRuntimeCapability(current.capabilities, values.runtime), values) : {};
+        const runtimeConfig = runtimeUi ? await runtimeUi.creationConfigFromValues(UI.findRuntimeCapability(current.capabilities, values.runtime), values) : {};
+        if(!live(snapshot, root)) return;
+        // Runtime-owned preparation may await credential encryption. Permission
+        // must still be current after that yield, not just when Save was clicked.
+        requireManager(snapshot);
         const created = await api(`/api/devboxes/${enc(machineId)}/agents`, {method:'POST', body:JSON.stringify({
           handle:values.handle, display_name:values.handle, runtime:values.runtime,
           local_project_id:values.local_project_id || null, runtime_config:runtimeConfig,
         })});
+        runtimeUi?.afterSave?.(root, created);
         if(await reloadAfterMutation(snapshot, root)){
           dialogs.close();
           if(runtimeUi && canManage(snapshot)) return agentSettings(created?.id);
@@ -614,7 +635,7 @@
       found = find();
       if(!found || found.agent.runtime !== runtime){ dialogs.close(); return; }
       const retryable = catalog.retryable;
-      let render, refreshButton, retryButton;
+      let render, refreshButton, retryButton, binding;
       const check = root=>{
         if(!live(snapshot, root)) return null;
         const current = find();
@@ -623,18 +644,22 @@
       };
       return mutationForm(snapshot, {
         title:'Agent settings', desc:catalog.settingsDescription,
-        fields:[{name:'display_name',label:'Agent name',type:'text',required:true,value:found.agent.display_name || found.agent.handle}],
-        submit:'Save name',
+        fields:[{name:'display_name',label:'Agent name',type:'text',required:true,value:found.agent.display_name || found.agent.handle},
+          ...(catalog.settingsFields?.(found.agent) || [])],
+        submit:catalog.settingsSubmit || 'Save name',
         extraHtml:catalog.settingsHtml,
         onReady:root=>{
           const save = root.querySelector('[data-submit]'), input = root.querySelector('[data-field="display_name"]');
           const error = root.querySelector('[data-error]');
           refreshButton = root.querySelector('[data-refresh-status]');
           retryButton = root.querySelector('[data-retry-runtime]');
+          binding = catalog.bindSettings?.(root, found.agent,
+            ()=>UI.findRuntimeCapability(find()?.box.capabilities, runtime));
           render = ()=>{
             const current = check(root); if(!current) return;
             const {box, agent} = current;
             catalog.renderSettings(root, box, agent, UI);
+            binding?.update?.(agent);
             refreshButton.disabled = false;
           };
           const run = async retry=>{
@@ -659,15 +684,26 @@
           retryButton.onclick = ()=>run(true);
           render();
         },
+        onSettled:()=>render(),
       }, async(values, root)=>{
         if(!check(root)) return;
         requireManager(snapshot);
         if(values.display_name.length > 200) throw new Error('Agent name must be at most 200 characters.');
         refreshButton.disabled = retryButton.disabled = true;
         try {
-          const result = await api(UI.agentApiPath(id), {method:'PATCH', body:JSON.stringify({display_name:values.display_name})});
+          const current = check(root); if(!current) return;
+          const payload = catalog.settingsPayload
+            ? await catalog.settingsPayload(values, current.agent, UI.findRuntimeCapability(current.box.capabilities, runtime))
+            : {display_name:values.display_name};
+          if(!check(root)) return;
+          const result = await api(UI.agentApiPath(id), {method:'PATCH', body:JSON.stringify(payload)});
           const latest = check(root); if(!latest) return;
-          if(result?.id === id) latest.agent.display_name = result.display_name;
+          if(result?.id === id){
+            latest.agent.display_name = result.display_name;
+            if(result.runtime_config) latest.agent.runtime_config = result.runtime_config;
+            if(result.runtime_status) latest.agent.runtime_status = result.runtime_status;
+          }
+          catalog.afterSave?.(root, result);
           if(await reloadAfterMutation(snapshot, root) && check(root)){
             render(); root.querySelector('[data-submit]').textContent = 'Saved';
           }

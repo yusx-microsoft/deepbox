@@ -101,7 +101,8 @@ class Connector:
         self.ws = None
         self.connect_count = 0
         self.last_heartbeat_ack = None
-        self.runtime_probe_cache = RuntimeProbeCache()
+        self.runtime_probe_cache = RuntimeProbeCache(
+            local_state_path=local_store.path if local_store is not None else None)
 
     # -- HTTP bootstrap ----------------------------------------------------
 

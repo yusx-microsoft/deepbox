@@ -446,7 +446,7 @@
     if (global[entry.global]) return Promise.resolve(global[entry.global]);
     if (!loadingModules.has(id)) loadingModules.set(id, new Promise((resolve, reject) => {
       const script = global.document.createElement('script');
-      script.src = '/static/' + entry.file + '?v=deeporca-2';
+      script.src = '/static/' + entry.file + '?v=deeporca-4';
       script.onload = () => global[entry.global] ? resolve(global[entry.global]) : reject(new Error('Local renderer unavailable'));
       script.onerror = () => reject(new Error('Local renderer unavailable. Reload to retry.'));
       global.document.head.appendChild(script);

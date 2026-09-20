@@ -6,7 +6,172 @@ This records local branch verification, not a production deployment or external-
 - Native SDK branch: `feat/deepbox-library-host`, tested commit `9206c0b` (embedded API v1).
 - Setup: Windows, existing Python/Node/Chromium test dependencies. SDK and live integration tests used temporary profiles, projects, databases and test-only credentials, with a scripted loopback OpenAI/SSE provider. The user's agent/profile and running preview service were not used for model turns.
 
-## Module and native-style presentation follow-up
+## Native security inheritance simplification (current working tree)
+
+At the user's request, the security-default implementation was reduced to
+removing the embedded overrides. Native DeepOrca already defaults to `minimal`.
+`ensure_profile()` now copies native/template security unchanged, and runtime
+startup no longer forces `standard` or `allowlist`. The added security-default
+capability, keyword, persisted marker and opt-in branches were removed, along
+with the Connector capability requirement. No old-profile compatibility or
+migration mechanism is introduced. Explicit native security configuration is
+respected; final `REVIEW` is still refused, actual denials remain denied, and
+unsupported autonomous/background tools remain unavailable.
+
+Validation for this focused simplification:
+
+- Native embedded/default/existing/configuration: **247 passed, 6 skipped**;
+  native security: **62 passed**. Windows skips are unavailable symlink checks.
+- Connector worker/configuration/existing/supervisor/import checks:
+  **97 passed, 2 skipped** (`security-default-simplification/connector.xml`).
+- Actual SDK and Server → Connector → SDK E2E: **7 passed**
+  (`security-default-simplification/sdk-e2e.xml`, 112.79s). These use disposable
+  profiles, dummy credentials and a scripted loopback provider.
+- Updated documentation and CRLF-aware diff checks passed.
+
+Artifact paths above are under
+`C:/Users/chec/.deeporca/agents/deepbox/tmp/`. This was a focused regression, not
+another full-suite run. No commit, push, service restart or live-profile edit
+was performed. Earlier implementation results below remain historical evidence,
+not a claim that the removed opt-in machinery is still present.
+
+## Existing-profile binding and minimal-security extension (preceding round)
+
+This extends DeepBox `8da1462` plus the preceding configuration work, and native
+SDK `3978d2f` plus the narrow new-profile security-default opt-in. These changes
+are uncommitted. See [existing-profile operations](deeporca-existing-profiles.md)
+and [fixture screenshots](prototypes/deeporca-bind-profile/README.md).
+
+Evidence directory:
+`C:/Users/chec/.deeporca/agents/deepbox/tmp/existing-profile-evidence/`.
+
+| Group | Result | Artifact / scope |
+|---|---:|---|
+| Complete DeepBox suite before final startup-retirement hardening | **1112 passed, 13 skipped, 20 subtests passed** | `deepbox-release.xml`; 548.65s |
+| Complete DeepBox suite including final hardening | **1113 passed, 1 failed, 13 skipped, 20 subtests passed** | `deepbox-final.xml`; 583.46s; Windows PTY reader-shutdown failure described below |
+| PTY file and repeated failing case | **10 passed, 1 skipped**, then **1 passed** | `pty-confirm.xml`, `pty-reader-confirm.xml`; 20.88s / 3.50s |
+| Actual SDK / Server–Connector E2E / existing binding / supervisor | **52 passed, 1 skipped** | `sdk-e2e-final.xml`; 182.48s; real SDK, disposable profiles and scripted loopback provider |
+| Native focused regression | **597 passed, 6 skipped** | `native.xml`; 90.26s; existing mode, security default, configuration, turn/tool/security suites |
+| Recursive Node suite | **336 passed** | `node-release.log` |
+| Chromium / web / import boundary | **23 passed within final full run** | `deepbox-final.xml`: 12 browser scenarios, 9 web cases, 2 import-boundary cases; not a separate run |
+| Retirement / configuration / supervisor regression | **105 passed, 2 skipped, 9 subtests passed** | `retirement.xml`; 65.85s; includes cancellation during startup and provisioning |
+| Actual existing-profile E2E and Server validation | **31 passed** | `existing-e2e.xml`; 26.10s; includes current list and legacy capability descriptor shapes |
+
+These scopes overlap and must not be added together. Seven opt-in SDK cases in
+the full suite were exercised in the explicit SDK group. Other skips are POSIX
+checks or unavailable Windows symlink privileges.
+
+The final full run is **not claimed to be all-green**. Its sole failure was
+`test_native_windows_kill_isolated_idle_python_releases_reader`: the unchanged
+Windows PTY reader thread had not exited at the assertion. The complete PTY file
+and a subsequent repeat of that exact case both passed without code changes.
+The failed full-run artifact is retained. A separate overlapping browser run
+(`browser-release.xml`) had a 10-second `page.goto` setup timeout (22 passed,
+1 error); all 23 cases later passed in the final full run. The earlier
+`deepbox-full.xml` branded-environment boundary failure was corrected by resolving
+source/home through `agentbridge.product.env` before the disposable probe child.
+
+Verified behavior includes target-Machine advertised references, strict native-stop
+consent, immutable local target resolution, duplicate binding refusal, known-live
+native PID refusal, read-only bound configuration and retained native files/history.
+The actual Server → Connector → SDK binding test executes a turn without changing
+the original configuration/persona/native-chat files. It does not import old chats
+or prove provider authentication outside the scripted provider.
+
+Authoritative directory reconciliation retires offline-deleted Agent reservations
+only in the current enrollment. Startup/provisioning workers remain owned through
+cancellation, and an unconfirmed exit retains the worker and reservation. New
+DeepBox-managed profiles use real native minimal policy, not merely a YAML label;
+trusted template levels win, retries/older/bound profiles are not migrated, and
+final review/denial plus unsupported autonomous-tool restrictions remain intact.
+
+Documentation links, fences, examples and named test references, plus CRLF-aware
+diff checks, passed. No real user's profile was bound, no external provider was
+contacted, and this extension did not restart the preview Server or Connector.
+
+## Web profile configuration extension (preceding round)
+
+This extends DeepBox `8da1462` (the squash of the original three integration
+commits) and native SDK `9206c0b`; it does not change their historical results
+below. Scope: [complete browser profile setup/editing](deeporca-profile-configuration.md),
+DeepOrca-only fields, sealed keys, authorized idle-only updates, profile
+configuration/recovery under SDK ownership, and ordinary-runtime compatibility.
+
+Evidence directory:
+`C:/Users/chec/.deeporca/agents/deepbox/tmp/profile-config-evidence/`.
+
+| Final group | Result | Artifact / scope |
+|---|---:|---|
+| Complete DeepBox Python suite | **1058 passed, 11 skipped, 20 subtests passed** | `deepbox-release.xml`; 379.42s, Chromium cache located outside isolated LOCALAPPDATA; six SDK opt-ins separately executed, three POSIX guards, two unavailable symlink privileges |
+| SDK integration + Server/Connector E2E + configuration/lifecycle | **51 passed, 1 skipped** | `sdk-e2e-final.xml`; all six SDK opt-in scenarios executed; skip is unavailable Windows symlink privilege |
+| Recursive Node suites | **321 passed** | `node-final.log`; async permission/dialog invalidation, runtime-contract delegation and crypto/form regressions |
+| Chromium / web / import-boundary group | **21 passed** | `browser-release.xml`; 44.68s, ten Chromium scenarios, nine web tests, two boundary tests |
+| Native SDK focused regression | **501 passed, 3 skipped** | `native-final-rerun.xml`; embedded configuration, ownership, LLM parsing, turns/cancellation and tools/security; not the entire native suite |
+
+Counts overlap and must not be summed. Tests never use the operator's live
+preview database, profiles or provider. No operator credentials/Tokens are
+regenerated and these checks do not restart their Connector.
+
+### Acceptance evidence
+
+- `tests/test_deeporca_configuration_contract.py`: bounded declarative settings,
+  native effort/window/model rules, invalid endpoint/plaintext-key rejection,
+  envelope bounds, and mutable desired revision versus immutable identity.
+- `tests/test_deeporca_settings.py`: create/update authorization, immutable
+  project/profile fences, active-session conflict, retained sealed keys,
+  endpoint-change safeguards, stale status and no-op/rename behavior.
+- `tests/test_deeporca_configuration.py`: public-key publication, private key
+  persistence/recovery fencing, worker-only decoding, tamper/endpoint failure,
+  old SDK errors, revision updates and busy-worker safety.
+- `tests/test_deeporca_profile_e2e.py`: actual browser-module WebCrypto in Node,
+  real HTTP/WS Server, real Connector and spawned real native SDK, with **no model
+  template**. A loopback scripted provider verifies dummy key, model and effort.
+  The test updates the same profile, rejects changes with an active session,
+  restarts the Connector, continues preserved native context and checks no
+  plaintext dummy key enters Server HTTP bodies/responses, DB files, logs,
+  canonical events or recordings.
+- `tests/test_deeporca_browser.py`: real Chromium fixture UI, encrypted creation
+  independently decrypted in Python, settings retention/replacement, failed-save
+  draft preservation, explicit no-auth, runtime toggling and mobile sizing.
+- `web/deeporca-agent-configuration.test.js` and `web/management.test.js`:
+  native-compatible fields, randomized endpoint-bound encryption, runtime-agnostic
+  delegation, legacy fixed models/rename-only behavior; deferred preparation
+  cannot submit after permissions/context/dialog change.
+- Native `tests/test_embedded_configuration.py`: ownership before writes,
+  literal-key round trip, unrelated YAML/env preservation, interrupted two-file
+  recovery, symlink/reparse rejection and protected Windows DACLs established
+  **before** private staged/published bytes are written.
+
+Fixture-only screenshots:
+[`prototypes/deeporca-agent-config/`](prototypes/deeporca-agent-config/README.md).
+
+### Retained intermediate failures and review fixes
+
+- The first full Python run isolated `LOCALAPPDATA`, making installed Chromium
+  undiscoverable: **1040 passed, 29 skipped** (`deepbox-full.xml`). The release
+  command explicitly sets `PLAYWRIGHT_BROWSERS_PATH`; browser skips are not
+  counted as presentation coverage.
+- A subsequent browser/full run exposed an obsolete fixture API key containing
+  surrounding whitespace, which the SDK cannot round-trip. It now uses a valid
+  dummy key and separately asserts whitespace rejection. Failure evidence remains
+  in `deepbox-final.xml` / `browser-final.xml`; the corrected scenario, browser
+  group and complete release suite passed (`cmd_abad87b3`, `cmd_00af7020`,
+  task `6109c2cd`).
+- The first broad native run had a Windows `WinError 5` directory-rename failure
+  creating one temporary fixture, before configuration application. The
+  configuration group and complete focused group subsequently passed; the failed
+  `native-final.xml` remains, rather than being presented as passing evidence.
+- Review found Windows atomic replacement could weaken an existing file's ACL;
+  protected current-user/SYSTEM DACLs and before-write tests were added. Node
+  regressions caught status sanitization, an asynchronous Add Agent permission
+  recheck gap, and hardcoded runtime-ID handling; these production paths were
+  corrected before the final Node run.
+
+Readiness does not authenticate externally. This report does not claim paid
+model execution, Copilot browser login, external deployment or protection against
+actively compromised Server JavaScript.
+
+## Historical module and native-style presentation follow-up
 
 See [module layout and visual evidence](deeporca-module-layout.md). Runtime-specific
 implementation now lives in dedicated packages; the Server main module and
@@ -109,8 +274,8 @@ python -m pytest tests/test_embedded.py tests/test_turn_error_settlement.py test
 
 ## Important assertions
 
-- Browser inputs/configuration never choose an executable, package, environment, credential, or arbitrary workspace/template path. Only registered project references and the Connector's `connector-default` template reference are accepted.
-- DeepOrca has no approval request/response UI, transport or waiting state. Native checks are preserved under the embedded standard/allowlist floor; final human-review requirements fail immediately. Other runtimes retain their approval behavior.
+- Browser inputs/configuration never choose an executable, package, environment or arbitrary workspace/template/profile path. Configuration uses registered projects, the Connector's `connector-default` template or advertised opaque existing-profile references. Web-entered API keys are sealed before Server submission.
+- DeepOrca has no approval request/response UI, transport or waiting state. Native defaults/configuration determine security policy for every profile; there is no embedded standard/allowlist floor. Final review and denial are never auto-approved. Other runtimes retain their approval behavior.
 - Durable input receipts prevent re-execution of repeated input IDs; crash/forced-stop uncertainty is not automatically retried and is not called exactly-once tool execution.
 - Synchronous threaded tools are not declared quiescent merely because an await was cancelled. The embedded host waits for their cleanup, bounded by outer worker retirement.
 - A previously used conversation with unrecoverable native state is refused before another provider/tool call. UI transcript replay never becomes native model context.
@@ -131,4 +296,4 @@ These are the **real workbench renderer with test fixture data**, not external-m
 
 The separate [offline prototype](prototypes/deeporca.md) is illustrative and non-normative.
 
-Not verified here: real external-provider credentials/billing, remote deployment, existing standalone-profile adoption, autonomous/background execution, or arbitrary subprocess rollback. No production deployment or restart of the user's existing preview/Connector was performed. See [operational setup and limits](deeporca.md) and [the reconciled design](deeporca-integration-design.md) before enabling the runtime in a real Connector.
+Not verified here: real external-provider credentials/billing, remote deployment, binding a real user's live profile, autonomous/background execution, or arbitrary subprocess rollback. Existing-profile binding is verified with disposable native profiles and a loopback provider, not a shared native/embedded writer lease. No production deployment or restart for the binding extension was performed; the earlier model-configuration preview restart is a separate operational action. See [operational setup and limits](deeporca.md) and [the reconciled design](deeporca-integration-design.md) before enabling the runtime in a real Connector.

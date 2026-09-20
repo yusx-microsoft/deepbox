@@ -16,13 +16,16 @@ external-provider verification, deployment validation, or production readiness.
 
 - Runtime ID `deeporca`, embedded API version `1`, renderer `deeporca-chat-v1`.
 - Create a **new managed profile**, using a **registered Connector-local
-  project** as its workspace. Binding/importing an existing standalone profile
-  is not supported.
+  project** as its workspace, or **bind an existing native profile**. Binding
+  requires native writers to be manually stopped and kept stopped; it is not chat
+  import or a shared lease. See [existing profiles](deeporca-existing-profiles.md).
 - Text chat, streamed text/reasoning and tool events, saved native conversation
   context, display replay, and Stop. One foreground turn per Agent/profile,
   including across that Agent's sessions.
 - Only the `connector-default` configuration-template reference is supported.
-  It resolves on the Connector, not in the browser or server.
+  It resolves on the Connector, not in the browser or server. Model settings can
+  be completed directly in **Add agent** and edited in **Agent settings**;
+  preparing a local model template is optional.
 - No interactive approval workflow, autonomous/background agent work, subagents,
   arbitrary SDK options, file attachments, or terminal-style raw input.
 
@@ -36,6 +39,12 @@ package that actually includes `deeporca.embedded` API v1 and its Python
 dependencies into the **same interpreter that runs the Connector**. An unrelated
 `deeporca` command on `PATH`, or installation into another virtual environment,
 does not make this runtime available.
+
+Browser profile configuration additionally needs native
+`PROFILE_CONFIGURATION_API_VERSION = 1` and an updated Connector with the
+`cryptography` dependency. A package version alone is not sufficient: editable
+installs follow the checkout's current branch. Keep the embedded SDK in a
+dedicated checkout/worktree if the ordinary development branch lacks these APIs.
 
 For a local checkout, the following Windows CMD command is illustrative. Replace
 both paths with your own; do not run it with the placeholder paths:
@@ -87,15 +96,23 @@ request. Source paths and raw import errors are not sent as capability diagnosti
 
 The running Connector advertises a `deeporca` capability descriptor even when
 unavailable; successful probing enables its surface. The descriptor includes
-`backend: python-library`, `agent_config.profile_modes: [create]`, template
-reference `connector-default`, and unknown authentication. Reconnect/restart
+`backend: python-library`, `agent_config.profile_modes: [create, bind]` when the
+SDK supports existing mode, its bounded profile inventory, template reference
+`connector-default`, and unknown authentication. Reconnect/restart
 after changing the package or environment so the browser receives fresh
 capabilities. This is a local import/API-version gate, not proof that a particular
 profile can start, all runtime dependencies are installed, or credentials work.
 
-## 2. Prepare trusted local configuration
+## 2. Optional trusted local defaults
 
-Set a Connector-local template directory before creating an Agent:
+**For ordinary setup, skip to [Add an Agent](#3-add-an-agent-in-the-browser).**
+Endpoint, model, context window, reasoning effort and API key can all be supplied
+in the DeepOrca form. No hand-written profile or model template is required.
+This section is for operators who want local security/MCP defaults or an existing
+locally configured provider. Browser setup currently supports OpenAI-compatible
+endpoints; it does not implement Copilot's separate device-login flow.
+
+Optionally set a Connector-local template directory before creating an Agent:
 
 ```bat
 set "AGENTBRIDGE_DEEPORCA_TEMPLATE_DIR=C:\path\to\private\deeporca-template"
@@ -125,8 +142,9 @@ be created successfully but remain `needs_configuration`.
 
 ### Placeholder configuration example
 
-These are **placeholders, not working provider settings**. Replace them locally
-before use; do not commit credentials or paste them into AgentBridge forms.
+These are **placeholders, not working provider settings** for the optional local
+template. Do not commit credentials. In the browser, use only the dedicated
+password-style API-key field, never a URL, model name or general text field.
 
 `config.yaml`:
 
@@ -158,7 +176,11 @@ Copilot authorization, if used, must be established locally; AgentBridge has no
 device-login/token-import flow. The template copy is not a migration of a
 standalone profile's credentials or cached login.
 
-An optional conservative `security.yaml` starting point is:
+Native DeepOrca defaults to **minimal**. Managed creation copies the native
+defaults or trusted template security configuration unchanged; explicit security
+settings are respected. The embedded runtime adds no `standard`/`allowlist` floor.
+Minimal permits broader tool execution; the following optional `security.yaml`
+explicitly chooses a conservative policy, rather than an embedded requirement:
 
 ```yaml
 level: standard
@@ -182,12 +204,18 @@ one of these native names or adopting an existing profile.
 Profile creation is idempotent for a completed SDK-managed profile. Existing
 unmanaged/incomplete directories are not silently adopted. The configuration
 template is copied **once**, not reapplied on every retry. To repair an already
-created profile, stop its worker/Connector and edit the managed profile's local
-configuration files, then reconnect. Merely editing the template does not repair
-existing profiles. Do not delete ownership markers or manipulate the binding
-database to bypass a conflict.
+created profile's model configuration, use **Agent settings**. Explicit browser
+settings are applied locally while the SDK owns the profile lock; they do not
+replace native memory, sessions, security or MCP configuration. Merely editing
+the template does not repair existing profiles. Do not delete ownership markers
+or manipulate the binding database to bypass a conflict.
 
 ## 3. Add an Agent in the browser
+
+For an existing native profile, select **Bind an existing profile** and follow
+the [native-stop and inventory workflow](deeporca-existing-profiles.md#operator-flow).
+Its model/security configuration is reused, not edited here. The following steps
+describe creating a new managed profile with complete model configuration.
 
 1. On the Connector machine, register the workspace directory:
 
@@ -197,11 +225,26 @@ database to bypass a conflict.
 
 2. Connect the Connector with the intended SDK/template environment. In the
    browser, choose the Machine, open **Add agent**, and select **DeepOrca**.
-3. Select a registered local project, **Create a managed local profile**, and
-   the **Connector default** template. If no project appears, register one on
-   that Machine and use **Refresh projects**.
-4. Add the Agent and inspect its runtime status. Creation records desired state;
+3. Select a registered local project. If no project appears, register one on
+   that Machine and use **Refresh projects**. A private managed profile is created
+   automatically; there is no separate profile-creation step.
+4. Complete the DeepOrca-only model fields:
+   - **LLM endpoint**: the provider's HTTP(S) base URL, normally including `/v1`.
+     Loopback means the **Connector machine**, not the browser. Private/local
+     endpoints are supported; URL credentials, query strings and fragments are not.
+   - **Model**: the exact provider identifier; names containing `/` or `:` are
+     supported. No provider model-discovery request is made.
+   - **Authentication**: enter an API key or explicitly choose no authentication
+     for a keyless local service.
+   - **Context window**: a positive integer token count supported by the model.
+   - **Reasoning effort**: Provider default, none, minimal, low, medium, high,
+     xhigh or max. These are native options, not a promise every model supports them.
+5. Add the Agent and inspect its runtime status. Creation records desired state;
    it does not mean that provisioning, credentials, or a model call succeeded.
+
+The API-key path requires browser WebCrypto (HTTPS or a secure localhost origin)
+and the Connector's advertised public key. It fails closed if either is absent;
+there is no plaintext fallback. Other runtimes never display these fields.
 
 The Add-agent payload uses a project ID and this allowlisted configuration:
 
@@ -211,17 +254,49 @@ The Add-agent payload uses a project ID and this allowlisted configuration:
   "profile": {
     "mode": "create",
     "configuration_template_ref": "connector-default"
-  }
+  },
+  "llm": {
+    "provider": "openai",
+    "base_url": "http://127.0.0.1:1234/v1",
+    "model": "vendor/model:latest",
+    "context_window": 32768,
+    "reasoning_effort": ""
+  },
+  "credential": {"mode": "none"}
 }
 ```
 
-It does not accept arbitrary work/home/template/checkout paths, commands,
-environment variables, token/API-key configuration, or `profile.mode: bind`.
-The shared contract also permits a validated optional `model` identifier; it is
-not a credential channel or a substitute for complete local configuration.
+This is a keyless endpoint example, not a working provider recommendation.
+For API-key authentication, `credential` instead contains an opaque sealed
+envelope; the Server never accepts a plaintext key field. It does not accept
+arbitrary work/home/template/checkout paths, commands, environment variables, or
+free-form existing-profile names/paths. `profile.mode: bind` uses the separate
+[existing-profile reference protocol](deeporca-existing-profiles.md), without
+model/credential overrides. Legacy template-only configurations remain supported.
 
-Native home/workspace paths and binding credentials remain Connector-local and
-are not included in the runtime status/capability payload. Conversation text and
+### Editing model settings
+
+For managed-create mode, use **Agent settings** to fill an unconfigured profile or change its
+model parameters. Keep the API-key field empty to retain the existing credential;
+keys are never returned for display. Changing the endpoint requires a replacement
+key or an explicit no-authentication choice. Close active conversations before
+saving changed model settings; saving never silently interrupts a model/tool turn.
+Profile/project identity and native history remain unchanged. A new desired
+revision returns to pending until the Connector applies it; a stale ready report
+cannot satisfy the new revision. Renaming alone does not restart the runtime.
+For a legacy profile whose settings were only configured locally, the first web
+configuration requires re-entering its key (or choosing no authentication): the
+browser cannot safely assume its previously private endpoint. Legacy top-level
+model overrides remain fixed; ordinary web-configured model IDs are editable.
+
+See [Web profile configuration](deeporca-profile-configuration.md) for the sealed
+credential protocol, ownership/crash boundaries and verification scope.
+
+Native home/workspace paths and plaintext credentials remain Connector-local.
+The Server stores declarative model settings and encrypted credential envelopes;
+the browser necessarily handles a key while the operator enters it. A public
+encryption key, never the private key, is advertised with runtime capabilities.
+Conversation text and
 tool outputs **do** travel through AgentBridge for display/replay and to the
 configured provider as part of normal model use. They are not a general-purpose
 secret-redaction channel: do not ask a tool to print credential files.
@@ -237,10 +312,16 @@ secret-redaction channel: do not ask a tool to print credential files.
   immediately denies a final `REVIEW` verdict that would require human
   confirmation. Existing `DENY` decisions remain denied; ordinary permitted
   actions can run without a prompt.
-- Managed defaults use `standard`, not the standalone `minimal` preset. At
-  runtime, the host also strengthens `minimal` to `standard` and changes `full`
-  approval mode (or implicit full mode under minimal) to `allowlist`. “No
-  interactive approvals” does not mean unrestricted permission.
+- **Native security defaults to `minimal` for all profile modes.** Explicit
+  security configuration is respected by the unmodified native `SecurityManager`;
+  the embedded runtime does not force `standard` or `allowlist`. Existing files
+  are not proactively rewritten, but existing managed and bound profiles using
+  `minimal` now also receive that policy at runtime, not the former embedded floor.
+  There is no security migration, new-profile-only opt-in, creation marker, extra
+  Connector flag or separately versioned security-default API. `NonInteractivePolicy`
+  still rejects final `REVIEW`/`DENY` and unsupported background/autonomous tools.
+  Binding and exclusive ownership requirements are unchanged. See
+  [security scope](deeporca-existing-profiles.md#security-policy-for-all-profiles).
 - Autonomous work, schedules/goals, background command sessions, subagents and
   live skill-catalog mutation are not supported in this host. Background command
   requests are denied. An SDK approval event is treated as a contract error,

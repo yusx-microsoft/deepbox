@@ -28,12 +28,31 @@ class DeepOrcaPolicy(RuntimePolicy):
     def create_config(self, body: dict) -> dict:
         return desired.create_config(body)
 
+    def validate_create_capabilities(self, config: dict, capabilities: object) -> None:
+        if config["profile"]["mode"] != "bind":
+            return
+        runtimes = (capabilities if isinstance(capabilities, list) else
+                    capabilities.get("runtimes", []) if isinstance(capabilities, dict) else [])
+        if not isinstance(runtimes, list):
+            runtimes = []
+        descriptor = next((r for r in runtimes if isinstance(r, dict)
+                           and r.get("runtime", r.get("id")) == "deeporca"), {})
+        options = descriptor.get("agent_config")
+        options = options if isinstance(options, dict) else {}
+        modes = options.get("profile_modes", [])
+        if not isinstance(modes, list) or "bind" not in modes:
+            raise HTTPException(422, "Connector does not advertise existing DeepOrca profile binding; update and reconnect it")
+        profiles = options.get("existing_profiles", [])
+        if not isinstance(profiles, list) or not any(
+                isinstance(p, dict) and p.get("id") == config["profile"]["profile_ref"] for p in profiles):
+            raise HTTPException(422, "Existing DeepOrca profile is not in this Connector's inventory; reconnect to refresh it")
+
     def initialize_agent(self, agent: Agent) -> None:
         agent.runtime_status = desired.pending_status(agent)
 
-    def validate_agent_update(self, agent: Agent, body: dict) -> None:
-        desired.validate_identity_update(agent, body, self.identity_fields)
+    def validate_agent_update(self, agent: Agent, body: dict) -> dict | None:
         self.validate_update_fields(body)
+        return desired.validate_identity_update(agent, body, self.identity_fields)
 
     def require_retry(self) -> None:
         pass

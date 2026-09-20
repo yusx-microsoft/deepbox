@@ -1,0 +1,46 @@
+/* Scoped to the DeepOrca Agent dialog; no other runtime's form is restyled. */
+.modal.do-agent-modal{max-width:650px;scroll-padding:24px;color:var(--text)}
+.do-agent-modal .modal-head{padding-bottom:14px;border-bottom:1px solid var(--line)}
+.do-agent-modal .modal-head h3{font-size:17px;font-weight:600;letter-spacing:-.02em}
+.do-agent-modal .modal-head p{max-width:58ch}
+.do-agent-modal .modal-body{padding-top:18px}
+.do-agent-modal .field label{font-size:12px;font-weight:500;color:var(--text)}
+.do-agent-modal .field input,.do-agent-modal .field select{min-height:38px;min-width:0}
+.do-agent-modal .field .hint{font-size:11px;line-height:1.55;margin-bottom:0;color:var(--muted);overflow-wrap:anywhere}
+.do-agent-modal code{font-size:10px;overflow-wrap:anywhere}
+.do-agent-group{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin:20px 0 0;padding:16px;border:1px solid var(--line);border-radius:9px;min-width:0;background:var(--bg)}
+.do-agent-group legend{padding:0 7px;margin-left:-3px;font-size:12px;font-weight:600;letter-spacing:.015em}
+.do-agent-group .field{min-width:0;margin:0}
+.do-agent-group:first-of-type .field:nth-of-type(1),.do-agent-group:first-of-type .field:nth-of-type(2){grid-column:1 / -1}
+.do-agent-group[hidden],.do-agent-modal [hidden]{display:none!important}
+.do-agent-modal .do-key-warning{color:var(--bad)}
+.do-agent-modal .do-key-warning:empty{display:none}
+.do-agent-profile{margin:15px 0 20px}
+.do-agent-advanced{font-size:11px;color:var(--muted);line-height:1.65}
+.do-agent-advanced summary{cursor:pointer;font-weight:500}
+.do-agent-advanced p{margin:8px 0 0}
+.do-agent-readiness{border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:18px 0 10px;overflow-wrap:anywhere}
+.do-agent-readiness p{font-size:11px;line-height:1.6;margin:7px 0}
+.do-agent-readiness .hint{color:var(--muted)}
+.do-agent-status .pill{font-size:11px}
+.do-agent-runtime-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.do-agent-runtime-actions button{font-size:11px}
+.do-agent-modal .local-action-guide{font-size:11px}
+.do-agent-modal .modal-actions{position:sticky;bottom:0;z-index:1;padding-top:12px;background:var(--panel);border-top:1px solid var(--line)}
+.do-agent-modal .modal-err{line-height:1.6;padding-top:10px;padding-bottom:10px}
+.do-agent-modal .do-security-default{font-size:11px;line-height:1.6;color:var(--muted)}
+.do-native-profile{margin:18px 0 20px;padding:16px;min-width:0;border:1px solid var(--line);border-radius:9px;background:var(--bg)}
+.do-native-profile legend{padding:0 7px;font-size:12px;font-weight:600}
+.do-native-details,.do-native-profile>.hint{font-size:12px;line-height:1.65;color:var(--muted);overflow-wrap:anywhere}
+.do-native-details p{margin:0 0 12px}
+.do-native-profile .field{margin:16px 0 0}
+.do-agent-modal .do-native-consent{display:grid;grid-template-columns:20px minmax(0,1fr);align-items:start;gap:10px}
+.do-agent-modal .do-native-consent label{grid-column:2;grid-row:1;line-height:1.65;margin:0;cursor:pointer}
+.do-agent-modal .do-native-consent input[type=checkbox]{grid-column:1;grid-row:1;width:17px;height:17px;min-height:0;margin:2px 0 0;accent-color:var(--accent)}
+.do-native-summary{margin:12px 0;border-top:1px solid var(--line);padding-top:5px}
+@media(max-width:560px){
+  .do-agent-group{grid-template-columns:minmax(0,1fr);padding:13px;gap:15px}
+  .do-agent-modal .modal-head h3{font-size:16px}
+  .do-agent-modal .field input,.do-agent-modal .field select{font-size:16px}
+  .do-agent-modal .modal-actions{padding-bottom:14px}
+}

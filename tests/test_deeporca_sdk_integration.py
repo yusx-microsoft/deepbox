@@ -47,6 +47,17 @@ READ = "Exercise a workspace read."
 DENY = "Exercise a read requiring approval."
 
 
+@pytest.fixture(autouse=True)
+def isolate_connector_key_state(tmp_path, monkeypatch):
+    # The real SDK now advertises web-configuration support. Its descriptor
+    # provisions a sealing key, which must never touch the developer Connector.
+    for name in ("LOCALAPPDATA", "XDG_STATE_HOME", "XDG_DATA_HOME"):
+        monkeypatch.setenv(name, str(tmp_path / "machine-state"))
+    # Discovery must never enumerate the developer's native profiles.
+    monkeypatch.setenv("AGENTBRIDGE_DEEPORCA_HOME", str(tmp_path / "catalog-home"))
+    monkeypatch.setenv("DEEPORCA_HOME", str(tmp_path / "catalog-home"))
+
+
 # PYTHONPATH makes this execute in the real multiprocessing spawn interpreter
 # and in the real availability probe. It never imports or replaces SDK modules.
 _SITECUSTOMIZE = r'''
@@ -233,7 +244,7 @@ def _supervisor(env):
     store = DeepOrcaStore(env.root / "deeporca.sqlite3", native_root=env.root / "native")
     spool = DiskSpool(str(env.root / "spool.sqlite3"))
     agent = {"id": "hermetic-agent", "name": "Hermetic SDK", "runtime": "deeporca",
-             "local_project_id": project.id, "runtime_config": {}, "enabled": True}
+             "local_project_id": project.id, "runtime_config": getattr(env, "runtime_config", {}), "enabled": True}
     sup = SessionSupervisor({agent["id"]: agent}, local_store=local,
                             deeporca_store=store, spool=spool)
     sup.set_enrollment("http://127.0.0.1", "hermetic-machine")
@@ -324,6 +335,49 @@ async def test_real_sdk_ready_turn_persistence_and_restart(hermetic_sdk):
         assert any(m["role"] == "user" and m["content"] == SECOND for m in messages)
     finally:
         await _close(sup, local, store, spool)
+
+
+@pytest.mark.asyncio
+async def test_real_sdk_sealed_web_configuration_and_restart(hermetic_sdk):
+    from connector.integrations.deeporca.credentials import public_key_info
+    from test_deeporca_configuration import seal
+    env = hermetic_sdk
+    url = f"http://127.0.0.1:{env.provider.server.server_port}/v1"
+    public = public_key_info(env.root / "projects.sqlite3")
+    env.runtime_config = {
+        "llm": {"provider": "openai", "base_url": url, "model": MODEL,
+                "context_window": 32768, "reasoning_effort": "low"},
+        "credential": seal(public, secret=KEY, base_url=url),
+    }
+    # No usable model/key is available in the template. The web configuration
+    # must be applied by the real SDK, not just accepted by a worker mock.
+    template = Path(os.environ["AGENTBRIDGE_DEEPORCA_TEMPLATE_DIR"])
+    (template / ".env").unlink()
+    import yaml
+    template_config = yaml.safe_load((template / "config.yaml").read_text())
+    template_config["llm"] = {"provider": "openai", "model": "", "base_url": "", "api_key": ""}
+    (template / "config.yaml").write_text(yaml.safe_dump(template_config, sort_keys=False))
+    initial_profile = None
+    for attempt, prompt in enumerate((FIRST, SECOND)):
+        if attempt:
+            env.runtime_config["llm"] = {**env.runtime_config["llm"],
+                                         "context_window": 65536, "reasoning_effort": "high"}
+        sup, local, store, spool = _supervisor(env)
+        try:
+            await _ready(sup, env)
+            binding = store.get_binding("hermetic-agent")
+            profile = (binding["home"], binding["profile_name"])
+            if initial_profile is not None:
+                assert profile == initial_profile
+            initial_profile = profile
+            await _turn(sup, store, prompt, "web-config-" + str(attempt))
+            assert KEY not in json.dumps(list(sup.pending))
+            assert KEY not in json.dumps(store.worker_binding("hermetic-agent"))
+            assert public_key_info(local.path) == public
+        finally:
+            await _close(sup, local, store, spool)
+    assert any(m["role"] == "user" and m["content"] == FIRST
+               for m in env.provider.requests[-1]["messages"])
 
 
 @pytest.mark.asyncio

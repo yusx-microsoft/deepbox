@@ -6,22 +6,30 @@
 
 **Naming:** This document uses **DeepBox** for the host product and repository. The current command-line package and user-facing commands use **`agentbridge`**; the integration does not introduce another rename.
 
+**Configuration extension:** [Web profile configuration](deeporca-profile-configuration.md)
+supersedes the original template-only onboarding sections below. Add Agent and
+Agent settings now configure endpoint/model/context window/reasoning effort.
+The browser seals API keys to a Connector public key; only ciphertext is stored
+on the Server. Plaintext credentials and native configuration writes remain on
+the Connector. Profile/project/template identity stays immutable; LLM settings
+have separately revisioned, idle-only updates.
+
 **Reviewed baseline:** DeepBox `50699fa` and DeepOrca `dd6670d`, including the local working trees. The baseline analysis and examples explicitly marked *proposed* describe the design phase; the implementation map below identifies the shipped branch interfaces.
 
 ### Implementation reconciliation
 
 - The public SDK is `deeporca.embedded`, with `EMBEDDED_API_VERSION = 1`, `ensure_profile(...)`, and `EmbeddedRuntime`. The Connector probes it in a disposable interpreter and hosts each Agent in its own spawned process; it does not start the native CLI or WebServer.
-- Browser provisioning is **create-managed-profile only**. Existing-profile binding remains deliberately gated off until standalone native entrypoints cooperate with exclusive ownership. The only current template reference is `connector-default`; its directory is chosen on the Connector, never by the browser.
-- Add agent, persistent **Agent settings** (name, readiness, refresh/retry), and opening a conversation are separate actions. Runtime/project/profile/template identity is immutable. The Server tracks desired/observed revisions; initialization and native data stay local.
+- Browser provisioning supports managed creation and [existing-profile binding](deeporca-existing-profiles.md) through Connector-advertised references. The latter explicitly requires native writers to be manually stopped; it does not claim a shared standalone/embedded lease. The only managed-create template reference is `connector-default`, resolved locally.
+- Add agent, persistent **Agent settings** (name, model settings, readiness, refresh/retry), and opening a conversation are separate actions. Runtime/project/profile/template identity is immutable. The Server tracks desired/observed revisions; initialization and native data stay local.
 - `connector/integrations/deeporca/` owns the probe, adapter, store, supervisor extension, worker, session and event projection. It implements enrollment isolation, durable admission/receipts, native session mapping, lifecycle, and canonical newline-terminated event records. A private per-spool ownership pin refuses unsafe enrollment changes while old output/controls/work remain. The inherited default spool filename still includes the token; token rotation preserves native identity but is not automatic spool migration. A forced stop or crash is uncertain, not an exactly-once execution or rollback guarantee.
 - Output admission stops at 64 MiB / 10,000 pending frames, with bounded failure-record headroom. Affected native turns settle as uncertain rather than continuing with unrecorded success. Existing frames are not discarded. Full-disk failure can also prevent an emergency record; this is not a SQLite/WAL disk-quota guarantee.
 - Compatible incremental text/thinking is coalesced within a 12ms / 16KiB window. Native identity and ordering are preserved, boundaries flush first, original-event bytes still count toward the turn budget, and the owned deadline task is joined before terminal results. A cancelled or failed callback, including cancellation while waiting for the writer lock, cannot silently become successful settlement.
 - Inactive native conversations have an explicit operator-only **Continue native conversation** history action. Replay and layout restore never persist or imply continuation consent. The SDK's private context manifest rejects unrecoverable missing native context instead of silently creating an empty conversation; native history, not UI history, is the recovery source.
 - `web/integrations/deeporca/` owns the pane-local renderer and runtime UI selected by `deeporca-chat-v1`. It uses the existing reducer, socket, recording and restore paths. Tools are correlated by turn plus provider tool ID; incomplete outcomes and truncated display previews are labeled. Other runtimes retain their existing renderer and approval behavior.
 - Unknown renderer IDs produce a visible generic-fallback notice, never a descriptor-supplied script load. Inactive/replayed unfinished tools are labeled as having no recorded result rather than still running.
-- The embedded security floor is intentionally stricter than native permissive presets: managed defaults use `standard`; runtime `minimal`/`full` bypass behavior is normalized to `standard`/`allowlist` before delegating checks. This is an explicit host restriction, not an auto-approval mechanism. Final `REVIEW` becomes immediate `DENY`; ordinary denials and path/argument checks remain in force. Unsupported background/autonomous tools are unavailable.
+- Native DeepOrca defaults to `minimal`; `ensure_profile()` copies native defaults or trusted template security unchanged, and explicit profile security is respected. Embedded execution delegates to the unmodified native `SecurityManager` with no forced `standard`/`allowlist` floor for any profile mode. Existing files are not proactively rewritten, but existing `minimal` profiles are also honored at runtime. There is no security migration, creation opt-in/marker, extra Connector flag or separately versioned security-default API. Final `REVIEW` and `DENY` are refused, and unsupported background/autonomous tools stay unavailable. Binding and exclusivity requirements are unchanged. See [the exact security scope](deeporca-existing-profiles.md#security-policy-for-all-profiles).
 - The SDK owns a minimal bootstrap built from native model/configuration, tool, skill, memory and persona components, plus `SessionManager`, `TurnEngine`, and `SessionRunCoordinator`; it does not initialize the standalone gateway or autonomous services. Provider failure events now settle as errors rather than successful completed turns. Embedded registries wait for synchronous-thread cleanup on cancellation, bounded externally by worker retirement; standalone defaults are unchanged. No model request is sent merely to advertise readiness.
-- Verification includes real SDK + local fake OpenAI/SSE provider tests, real Server/Connector/WebSocket/recording integration, native-context recovery after worker restart, and Chromium workbench checks. Browser fixture tests and the offline HTML prototype are not real-provider or deployment evidence. External provider authentication, production deployment, existing-profile adoption, uploads, and autonomous execution remain outside this verification.
+- Verification includes real SDK + local fake OpenAI/SSE provider tests, real Server/Connector/WebSocket/recording integration, explicitly paused existing-profile binding, native-context recovery after worker restart, and Chromium workbench checks. Browser fixtures are not real-provider or deployment evidence. External provider authentication, production deployment, concurrent standalone/embedded writers, uploads, and autonomous execution remain outside this verification.
 
 Implementation and test entry points: [operations and test commands](deeporca.md), `tests/test_deeporca_sdk_integration.py`, `tests/test_deeporca_e2e.py`, `tests/test_deeporca_browser.py`, and the Connector/Server unit and regression suites. The optional SDK/E2E tests require a local source checkout and use temporary profiles and loopback-only fake providers.
 
@@ -40,7 +48,7 @@ Run DeepOrca as a Python library on the user's Connector machine. Keep DeepBox r
 The main integration components are:
 
 1. A **DeepOrca runtime capability** advertised by the Connector.
-2. An extension to **Add agent** that creates a managed native DeepOrca profile; external binding stays gated.
+2. An extension to **Add agent** for managed creation or explicitly paused native-profile binding.
 3. A Connector-side **library session backend**, using an isolated Python worker.
 4. An **event adapter** that preserves DeepOrca semantics within DeepBox's existing structured output channel.
 5. An embeddable **DeepOrca-style chat renderer**, driven by the existing DeepBox transport.
@@ -57,8 +65,8 @@ The implementation must not invoke the DeepOrca CLI to run conversations, requir
 | Isolation | One library worker per independent Agent binding |
 | Chat surface | Existing `structured` surface |
 | Renderer | `deeporca-chat-v1`, selected from a local allowlist |
-| Agent configuration | Create a managed profile; existing-profile binding is gated off in this implementation |
-| Model configuration | Connector-local configuration/template reference; no API key in the browser form |
+| Agent configuration | Create a managed profile or bind an advertised existing profile with native writers paused |
+| Model configuration | DeepOrca-only browser form; sealed credentials, Connector-local SDK writes under profile ownership; optional local template defaults |
 | Interactive approval | Out of scope; approval-required calls fail immediately |
 | Concurrency | One active human turn per Agent worker in v1; other sessions may be viewed concurrently |
 | Browser disconnect | Detach the viewer; do not automatically cancel or resubmit the turn |
@@ -182,6 +190,12 @@ Isolation is fixed to the library worker in v1. A same-process option may be int
 
 ### 4.3 Create versus bind
 
+**Extension note:** the original shared-lock requirement below remains a stronger
+future ownership model, not a claim about current standalone entrypoints. The
+implemented [limited binding workflow](deeporca-existing-profiles.md) instead
+requires an explicit native-paused operational precondition. It uses SDK existing
+mode, preserves configuration and does not import old native chats.
+
 **Create new** is the default:
 
 - Generate an internal profile identifier from the binding identity, not the editable display name.
@@ -196,7 +210,7 @@ Isolation is fixed to the library worker in v1. A same-process option may be int
 - Do not overwrite persona, memory, credentials, security configuration, or existing chats.
 - Reject a conflicting live binding in v1. The same mutable profile must not silently be driven by two independent workers or an unrelated standalone process.
 
-Existing-profile binding requires a cooperative exclusive profile-ownership lock honored by the supported DeepOrca entry points as well as the embedded worker. Connector bookkeeping alone cannot detect an unrelated process reliably. Until that contract is available for a package version, advertise create-managed-profile support only and keep existing-profile binding unavailable.
+Existing-profile binding uses an explicit manual exclusivity contract: the operator stops native writers and keeps them stopped while the Connector owns the profile. Embedded workers use the SDK profile lock, and the SDK refuses a known live native PID. Connector bookkeeping cannot fence all unrelated native writers; a shared native/embedded lease or automatic takeover is not claimed or required for this MVP.
 
 ### 4.4 Success and failure states
 
@@ -425,7 +439,7 @@ DeepOrca currently evaluates tool operations as `ALLOW`, `REVIEW`, or `DENY`. v1
 
 An allowed command may run without a per-command browser prompt. Therefore workspace operators must be trusted to exercise the locally allowed tool capabilities. "No approval UI" does not mean all commands are allowed or that the project directory is a sandbox.
 
-Selecting a project does not itself authorize arbitrary filesystem access. The machine-local configuration template must explicitly permit the intended project operations. Some writes or commands may therefore remain unavailable under the existing local policy; do not weaken that policy or claim all tools are executable merely because the Agent is ready.
+Selecting a project is not a filesystem sandbox. Native DeepOrca defaults to the broader `minimal` policy; explicit native/template/profile security configuration is respected. Existing files are not proactively rewritten, but bound and older profiles configured as `minimal` now also use that policy at runtime without an embedded `standard`/`allowlist` floor. There is no migration or versioned security opt-in. Configured native policy and the non-interactive host's unsupported-tool restrictions can still block writes or commands; readiness is not proof that every tool is executable.
 
 ### 8.1 Enforcement point
 
@@ -445,7 +459,7 @@ original SecurityManager.check_tool(name, args)
 
 Map the **final** verdict returned by `SecurityManager.check_tool()`, not only the result of `ApprovalManager.check()`. The security manager can escalate an initial allowed verdict to `REVIEW` after additional checks.
 
-Apart from the explicit embedded `standard`/`allowlist` security floor described above, security behavior delegates to the native manager, including argument/path checks and configured denials. It must never weaken those checks. The SDK constructs that manager from local configuration and installs the delegating wrapper through `ToolRegistry.set_security()` before tool registration/snapshots; it does not duplicate the policy evaluator or change standalone entrypoint defaults.
+Security behavior delegates to the unmodified native `SecurityManager` for every profile, honoring its configured level and approval mode. The embedded runtime does not promote `minimal` to `standard`, force `allowlist`, or branch on profile age or a creation marker. `NonInteractivePolicy` preserves final denials, refuses final review and rejects unsupported background/autonomous tools; it does not override a denied call to make it succeed. The SDK installs this wrapper through `ToolRegistry.set_security()` before tool registration/snapshots; it does not duplicate the policy evaluator or change standalone entrypoint defaults.
 
 Install the wrapper before snapshots, filtered registries, or subagent registries are created. These currently share the security object, making that object the appropriate policy boundary rather than a registry subclass that cloning might discard.
 
@@ -459,7 +473,7 @@ Represent this as a failed/blocked tool result, not an approval card. Use a stab
 
 Do not:
 
-- Select DeepOrca's permissive/development `full` mode merely to remove approval prompts.
+- Rewrite a profile's security configuration or override the native manager's final verdict merely to eliminate a `REVIEW`. Honoring native `minimal` for new and existing profiles is not per-call auto-approval.
 - Automatically answer every approval with `true`.
 - Emit an approval request and then ignore it or wait for its timeout.
 - Assume that returning `false` from a callback prevents an already-emitted approval event.

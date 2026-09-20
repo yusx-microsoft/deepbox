@@ -8,6 +8,7 @@ Set DEEPORCA_BROWSER_ARTIFACTS to retain screenshots outside the repository.
 from __future__ import annotations
 
 import json
+import copy
 import os
 import threading
 from functools import partial
@@ -86,7 +87,7 @@ def browser_workbench():
     thread.start()
     origin = f"http://127.0.0.1:{server.server_port}"
     machine = {"id": "m", "workspace_id": "w", "name": "Fixture Machine", "online": True,
-        "capabilities": {"runtimes": [NATIVE, CLI]}, "projects": [dict(PROJECT)], "agents": [
+        "capabilities": {"runtimes": [copy.deepcopy(NATIVE), copy.deepcopy(CLI)]}, "projects": [dict(PROJECT)], "agents": [
             {"id": "native", "handle": "orca", "display_name": "DeepOrca fixture", "runtime": "deeporca", "presence": "idle"},
             {"id": "cli", "handle": "cli", "display_name": "CLI fixture", "runtime": "cli", "presence": "idle"}]}
     state = {"machine": machine, "requests": [], "external": [], "errors": [], "sessions": {}}
@@ -114,6 +115,9 @@ def browser_workbench():
             result = [machine]
         elif path == "/api/devboxes/m/agents" and request.method == "POST":
             # Deliberately enforce the real DeepOrca server contract in the fixture.
+            if state.get("create_error"):
+                request_route.fulfill(status=409, json={"detail": state["create_error"]})
+                return
             if payload["runtime"] == "deeporca" and payload["local_project_id"] not in {p["id"] for p in machine["projects"]}:
                 request_route.fulfill(status=400, json={"detail": "registered local project required"})
                 return
@@ -124,8 +128,14 @@ def browser_workbench():
             result = machine["agents"][-1]
             result["runtime_status"] = {"state":"pending", "code":"retry_requested"}
         elif path == "/api/agents/created-agent" and request.method == "PATCH":
+            if state.get("patch_error"):
+                request_route.fulfill(status=409, json={"detail": state["patch_error"]})
+                return
             result = machine["agents"][-1]
             result["display_name"] = request.post_data_json["display_name"]
+            if "runtime_config" in payload:
+                previous = result.get("runtime_config", {})
+                result["runtime_config"] = {**previous, **payload["runtime_config"]}
         elif path.startswith("/api/agents/") and path.endswith("/sessions"):
             agent = path.split("/")[3]
             if request.method == "POST":
@@ -199,6 +209,11 @@ def test_real_workbench_add_agent_project_and_status(browser_workbench):
     project = form.locator('[data-field="local_project_id"]')
     handle = form.locator('[data-field="handle"]')
     handle.fill("Browser helper")
+    form.get_by_label('Endpoint', exact=True).fill('http://localhost:11434/v1')
+    form.get_by_label('Model', exact=True).fill('provider/model-name')
+    form.get_by_label('Context window · tokens').fill('32768')
+    form.get_by_label('Authentication', exact=True).select_option('none')
+    assert form.get_by_label('Reasoning effort', exact=True).input_value() == ''
     assert project.evaluate("el=>el.required")
     assert "DeepOrca requires a registered local project" in form.inner_text()
     form.get_by_role("button", name="Add agent", exact=True).click()
@@ -206,9 +221,11 @@ def test_real_workbench_add_agent_project_and_status(browser_workbench):
     assert not [r for r in h["requests"] if r[0] == "POST"]
     runtime = form.locator('[data-field="runtime"]')
     runtime.select_option("cli")
+    assert not form.get_by_role('group', name='Model connection').is_visible()
     assert not project.evaluate("el=>el.required")
     assert "No project (runtime default)" in project.inner_text()
     runtime.select_option("deeporca")
+    assert form.get_by_label('Model', exact=True).input_value() == 'provider/model-name'
     form.locator('.local-action-guide > summary').click()
     machine["projects"] = [dict(PROJECT)]
     form.get_by_role("button", name="Refresh projects").click()
@@ -228,26 +245,30 @@ def test_real_workbench_add_agent_project_and_status(browser_workbench):
     form.get_by_role("button", name="Add agent", exact=True).click()
     status = page.get_by_role("dialog", name="Agent settings", exact=True)
     status.wait_for()
-    assert "Readiness: needs configuration" in status.inner_text()
+    assert "Needs configuration" in status.inner_text()
     posts = [r for r in h["requests"] if r[0] == "POST"]
     assert len(posts) == 1
     assert posts[0][2] == {"handle": "Browser helper", "display_name": "Browser helper", "runtime": "deeporca",
         "local_project_id": PROJECT["id"], "runtime_config": {"integration_version": 1,
-        "profile": {"mode": "create", "configuration_template_ref": "connector-default"}}}
+        "profile": {"mode": "create", "configuration_template_ref": "connector-default"},
+        "llm": {"provider": "openai", "base_url": "http://localhost:11434/v1", "model": "provider/model-name",
+                "context_window": 32768, "reasoning_effort": ""}, "credential": {"mode": "none"}}}
     status.get_by_role("button", name="Retry initialization", exact=True).click()
-    page.wait_for_function("document.querySelector('[data-runtime-status]')?.textContent.includes('Readiness: pending')")
+    page.wait_for_function("document.querySelector('[data-runtime-status]')?.textContent.includes('Pending')")
     retries = [r for r in h["requests"] if r[0] == "POST" and r[1].endswith('/runtime/retry')]
     assert len(retries) == 1 and retries[0][2] is None
     machine["agents"][-1]["runtime_status"] = {"state": "ready"}
     status.get_by_role("button", name="Refresh status").click()
-    page.wait_for_function("document.querySelector('[data-runtime-status]')?.textContent.includes('Readiness: ready')")
+    page.wait_for_function("document.querySelector('[data-runtime-status]')?.textContent.includes('Ready')")
     assert "not been verified" in status.inner_text()
     assert len([r for r in h["requests"] if r[0] == "POST" and r[1].endswith('/agents')]) == 1
     status.get_by_role('textbox', name='Agent name', exact=True).fill('Renamed native Agent')
-    status.get_by_role('button', name='Save name', exact=True).click()
+    status.get_by_role('button', name='Save settings', exact=True).click()
     status.get_by_role('button', name='Saved', exact=True).wait_for()
     assert machine['agents'][-1]['display_name'] == 'Renamed native Agent'
-    assert [r[2] for r in h['requests'] if r[0] == 'PATCH'] == [{'display_name':'Renamed native Agent'}]
+    expected = copy.deepcopy(posts[0][2]['runtime_config'])
+    expected.pop('credential')
+    assert [r[2] for r in h['requests'] if r[0] == 'PATCH'] == [{'display_name':'Renamed native Agent', 'runtime_config':expected}]
     screenshot(page, "deeporca-add-agent-ready.png")
     page.keyboard.press("Escape")
     status.wait_for(state="detached")
@@ -255,6 +276,234 @@ def test_real_workbench_add_agent_project_and_status(browser_workbench):
     page.get_by_role('menuitem', name='Agent settings', exact=True).click()
     page.get_by_role('dialog', name='Agent settings', exact=True).wait_for()
     assert page.get_by_role('textbox', name='Agent name', exact=True).input_value() == 'Renamed native Agent'
+
+
+@pytest.mark.parametrize('viewport', [{'width': 1440, 'height': 1000}, {'width': 390, 'height': 844}], ids=['desktop', 'mobile'])
+def test_real_workbench_bind_existing_profile(browser_workbench, viewport):
+    """Native binding uses inventory + explicit consent, never model/credential/CLI fields."""
+    h = browser_workbench
+    page, machine = h['page'], h['machine']
+    profile_ref = 'native-' + 'a' * 32
+    capability = machine['capabilities']['runtimes'][0]['agent_config']
+    capability.update(profile_modes=['create', 'bind'], existing_profiles=[{'id': profile_ref, 'label': 'Research native profile'}])
+    page.locator('[data-machine-menu="m"]').click()
+    page.get_by_role('menuitem', name='Add agent', exact=True).click()
+    form = page.get_by_role('dialog', name='Add agent', exact=True)
+    page.set_viewport_size(viewport)
+    form.get_by_label('Handle', exact=True).fill('Native research helper')
+    form.get_by_label('Local project', exact=True).select_option(PROJECT['id'])
+    mode = form.get_by_label('Profile', exact=True)
+    assert mode.input_value() == 'create'
+    assert 'minimal security: broad tools, no approvals' in form.inner_text()
+    assert 'trusted Connector template may override' in form.inner_text()
+    form.get_by_label('Endpoint', exact=True).fill('http://localhost:11434/v1')
+    form.get_by_label('Model', exact=True).fill('draft/local-model')
+    form.get_by_label('Context window · tokens').fill('32768')
+    # A live input can retain a draft, but it is never a hidden HTML value or request value.
+    form.locator('[data-field="api_key"]').evaluate("el=>{el.value='private-unsent-draft'}")
+    mode.select_option('bind')
+    profile = form.get_by_label('Existing native profile', exact=True)
+    consent = form.get_by_role('checkbox', name='I have stopped native DeepOrca for this profile and will keep it stopped until the Connector stops', exact=True)
+    assert profile.input_value() == ''
+    assert not consent.is_checked()
+    assert profile.evaluate('el=>el.required') and consent.evaluate('el=>el.required')
+    for name in ['base_url', 'model', 'auth_mode', 'api_key', 'context_window', 'reasoning_effort']:
+        assert form.locator(f'[data-field="{name}"]').is_disabled()
+        assert not form.locator(f'[data-field="{name}"]').is_visible()
+    for absent in ['permission_mode', 'working_dir', 'cwd', 'cli_args', 'model_flags']:
+        assert form.locator(f'[data-field="{absent}"]').count() == 0
+    assert form.locator('input[type=hidden]').count() == 0
+    assert 'private-unsent-draft' not in form.evaluate('el=>el.outerHTML')
+    assert 'model, security, persona, memory, skills and MCP' in form.inner_text()
+    assert 'does not edit or copy' in form.inner_text()
+    assert 'Old native chats are not imported as DeepBox chats' in form.inner_text()
+    assert 'not tool approval' in form.inner_text()
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    assert profile.evaluate('el=>el.validity.valueMissing')
+    profile.select_option(profile_ref)
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    assert consent.evaluate('el=>el.validity.valueMissing')
+    assert not [r for r in h['requests'] if r[0] == 'POST']
+    consent.check()
+    mode.select_option('create')
+    assert form.get_by_label('Model', exact=True).input_value() == 'draft/local-model'
+    assert form.locator('[data-field="api_key"]').input_value() == 'private-unsent-draft'
+    mode.select_option('bind')
+    assert profile.input_value() == profile_ref and consent.is_checked()
+    form.locator('[data-field="runtime"]').select_option('cli')
+    assert not mode.is_visible() and not consent.is_visible()
+    form.locator('[data-field="runtime"]').select_option('deeporca')
+    assert profile.input_value() == profile_ref and consent.is_checked()
+    assert form.evaluate('el=>el.scrollWidth<=el.clientWidth+1')
+    assert page.evaluate('document.documentElement.scrollWidth<=innerWidth')
+    suffix = 'mobile' if viewport['width'] < 600 else 'desktop'
+    consent.scroll_into_view_if_needed()
+    screenshot(page, f'deeporca-bind-existing-{suffix}.png')
+    # A rejected request preserves the selected ref, consent, and unsubmitted model draft.
+    h['create_error'] = 'Native profile is busy. Stop native DeepOrca and retry.'
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    page.wait_for_function("document.querySelector('[data-error]')?.textContent.includes('Native profile is busy')")
+    assert profile.input_value() == profile_ref and consent.is_checked()
+    assert form.locator('[data-field="api_key"]').input_value() == 'private-unsent-draft'
+    h.pop('create_error')
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    settings = page.get_by_role('dialog', name='Agent settings', exact=True)
+    settings.wait_for()
+    posts = [r for r in h['requests'] if r[0] == 'POST' and r[1].endswith('/agents')]
+    expected = {'handle': 'Native research helper', 'display_name': 'Native research helper', 'runtime': 'deeporca',
+        'local_project_id': PROJECT['id'], 'runtime_config': {'integration_version': 1,
+        'profile': {'mode': 'bind', 'profile_ref': profile_ref, 'native_stopped': True}}}
+    assert len(posts) == 2 and all(r[2] == expected for r in posts)
+    assert 'private-unsent-draft' not in json.dumps(h['requests'])
+    assert 'Research native profile' in settings.inner_text() and profile_ref in settings.inner_text()
+    assert 'Only the Agent name can be changed here' in settings.inner_text()
+    assert settings.locator('[data-field]').count() == 1
+    for name in ['base_url', 'model', 'auth_mode', 'api_key', 'context_window', 'reasoning_effort', 'profile_ref', 'profile_mode']:
+        assert settings.locator(f'[data-field="{name}"]').count() == 0
+    assert settings.evaluate('el=>el.scrollWidth<=el.clientWidth+1')
+    settings.get_by_label('Agent name', exact=True).fill('Renamed bound helper')
+    settings.get_by_role('button', name='Save settings', exact=True).click()
+    settings.get_by_role('button', name='Saved', exact=True).wait_for()
+    assert [r[2] for r in h['requests'] if r[0] == 'PATCH'] == [{'display_name': 'Renamed bound helper'}]
+    machine['agents'][-1]['runtime_status'] = {'state': 'error', 'code': 'configuration_busy', 'message': 'C:/private/native/home'}
+    settings.get_by_role('button', name='Refresh status').click()
+    page.wait_for_function("document.querySelector('[data-runtime-status]')?.textContent.includes('profile is busy')")
+    assert 'C:/private/native/home' not in settings.inner_text()
+    screenshot(page, f'deeporca-bound-settings-{suffix}.png')
+    settings.get_by_role('button', name='Retry initialization', exact=True).click()
+    page.wait_for_function("document.querySelector('[data-runtime-status]')?.textContent.includes('Pending')")
+    assert [r[2] for r in h['requests'] if r[1].endswith('/runtime/retry')] == [None]
+    assert not h['external']
+
+
+def test_real_workbench_encrypted_model_settings_and_mobile(browser_workbench):
+    """Real browser WebCrypto -> independent Python RSA-OAEP/AES-GCM decryption."""
+    pytest.importorskip('cryptography')
+    import base64
+    import hashlib
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    h = browser_workbench
+    page, machine = h['page'], h['machine']
+    private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public = private.public_key()
+    key_id = hashlib.sha256(public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)).hexdigest()
+
+    def number(value):
+        return base64.urlsafe_b64encode(value.to_bytes((value.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode()
+
+    machine['capabilities']['runtimes'][0]['agent_config']['credential_key'] = {
+        'version': 1, 'algorithm': 'RSA-OAEP-256+A256GCM', 'key_id': key_id,
+        'public_key': {'kty': 'RSA', 'n': number(public.public_numbers().n), 'e': number(public.public_numbers().e)}}
+    console = []
+    page.on('console', lambda message: console.append(message.text))
+    page.locator('[data-machine-menu="m"]').click()
+    page.get_by_role('menuitem', name='Add agent', exact=True).click()
+    form = page.get_by_role('dialog', name='Add agent', exact=True)
+    form.get_by_label('Handle', exact=True).fill('Research assistant')
+    form.get_by_label('Local project', exact=True).select_option(PROJECT['id'])
+    assert form.get_by_label('Endpoint', exact=True).input_value() == ''
+    assert form.get_by_label('Model', exact=True).input_value() == ''
+    assert form.get_by_label('Context window · tokens').input_value() == ''
+    assert form.get_by_label('Reasoning effort').input_value() == ''
+    assert form.locator('[data-field="template"]').count() == 0
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    assert 'Endpoint is required' in form.locator('[data-error]').inner_text()
+    form.get_by_label('Endpoint', exact=True).fill('https://gateway.example.test/v1')
+    form.get_by_label('Model', exact=True).fill('provider/research-model')
+    form.get_by_label('Context window · tokens').fill('1.5')
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    assert 'whole token count' in form.locator('[data-error]').inner_text()
+    form.get_by_label('Context window · tokens').fill('131072')
+    form.get_by_label('Reasoning effort').select_option('max')
+    form.get_by_label('API key', exact=True).fill(' invalid-fixture-key ')
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    assert 'whitespace' in form.locator('[data-error]').inner_text()
+    assert not any(r[0] == 'POST' and r[1].endswith('/agents') for r in h['requests'])
+    secret = 'browser-fixture-only-key'
+    form.get_by_label('API key', exact=True).fill(secret)
+    assert form.get_by_label('API key', exact=True).get_attribute('autocomplete') == 'new-password'
+    form.get_by_label('Runtime adapter', exact=True).select_option('cli')
+    assert not form.get_by_role('group', name='Model connection').is_visible()
+    form.get_by_label('Runtime adapter', exact=True).select_option('deeporca')
+    assert form.get_by_label('API key', exact=True).input_value() == secret
+    page.set_viewport_size({'width': 1440, 'height': 1280})
+    form.evaluate('el=>el.scrollTop=0')
+    screenshot(page, 'deeporca-add-agent-model-connection.png')
+    form.get_by_role('button', name='Add agent', exact=True).click()
+    settings = page.get_by_role('dialog', name='Agent settings', exact=True)
+    settings.wait_for()
+    post = next(r[2] for r in h['requests'] if r[0] == 'POST' and r[1].endswith('/agents'))
+    assert post['runtime_config']['llm'] == {
+        'provider': 'openai', 'base_url': 'https://gateway.example.test/v1', 'model': 'provider/research-model',
+        'context_window': 131072, 'reasoning_effort': 'max'}
+    assert set(post['runtime_config']) == {'integration_version', 'profile', 'llm', 'credential'}
+
+    def unseal(config):
+        envelope = config['credential']
+        assert set(envelope) == {'mode', 'key_id', 'wrapped_key', 'iv', 'ciphertext'}
+        assert envelope['mode'] == 'sealed' and envelope['key_id'] == key_id
+        raw = private.decrypt(base64.b64decode(envelope['wrapped_key'], validate=True),
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+        iv = base64.b64decode(envelope['iv'], validate=True)
+        assert len(raw) == 32 and len(iv) == 12
+        aad = ('agentbridge/deeporca/credential/v1\0' + key_id + '\0' + config['llm']['base_url']).encode()
+        return AESGCM(raw).decrypt(iv, base64.b64decode(envelope['ciphertext'], validate=True), aad).decode()
+
+    assert unseal(post['runtime_config']) == secret
+    assert settings.get_by_label('New API key', exact=True).input_value() == ''
+    assert settings.get_by_label('Authentication', exact=True).input_value() == 'keep'
+    assert settings.get_by_label('Endpoint', exact=True).input_value() == post['runtime_config']['llm']['base_url']
+    h['patch_error'] = 'End active conversations before changing model settings.'
+    settings.get_by_label('Model', exact=True).fill('provider/research-model-v2')
+    settings.get_by_role('button', name='Save settings', exact=True).click()
+    settings.get_by_text(h['patch_error'], exact=True).wait_for()
+    assert settings.get_by_label('Model', exact=True).input_value() == 'provider/research-model-v2'
+    patches = [r[2] for r in h['requests'] if r[0] == 'PATCH']
+    assert len(patches) == 1 and 'credential' not in patches[0]['runtime_config']
+    settings.get_by_label('Endpoint', exact=True).fill('https://replacement.example.test/v1')
+    settings.get_by_role('button', name='Save settings', exact=True).click()
+    assert 'Endpoint changed' in settings.locator('[data-error]').inner_text()
+    assert len([r for r in h['requests'] if r[0] == 'PATCH']) == 1
+    settings.get_by_label('Authentication', exact=True).select_option('api_key')
+    replacement = 'replacement-fixture-only-key'
+    settings.get_by_label('New API key', exact=True).fill(replacement)
+    settings.get_by_role('button', name='Save settings', exact=True).click()
+    settings.get_by_text(h['patch_error'], exact=True).wait_for()
+    assert settings.get_by_label('New API key', exact=True).input_value() == replacement
+    settings.get_by_role('button', name='Refresh status', exact=True).click()
+    page.wait_for_function("!document.querySelector('[data-refresh-status]').disabled")
+    assert settings.get_by_label('New API key', exact=True).input_value() == replacement
+    settings.get_by_role('button', name='Retry initialization', exact=True).click()
+    page.wait_for_function("document.querySelector('[data-runtime-status]').textContent.includes('Pending')")
+    assert settings.get_by_label('Model', exact=True).input_value() == 'provider/research-model-v2'
+    assert settings.get_by_label('New API key', exact=True).input_value() == replacement
+    h.pop('patch_error')
+    settings.get_by_role('button', name='Save settings', exact=True).click()
+    settings.get_by_role('button', name='Saved', exact=True).wait_for()
+    patch = [r[2] for r in h['requests'] if r[0] == 'PATCH'][-1]
+    assert set(patch) == {'display_name', 'runtime_config'}
+    assert unseal(patch['runtime_config']) == replacement
+    assert settings.get_by_label('New API key', exact=True).input_value() == ''
+    assert settings.get_by_label('Authentication', exact=True).input_value() == 'keep'
+    settings.evaluate('el=>el.scrollTop=0')
+    screenshot(page, 'deeporca-agent-settings-model.png')
+    page.set_viewport_size({'width': 390, 'height': 844})
+    assert settings.evaluate('el=>el.scrollWidth <= el.clientWidth + 1')
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1')
+    settings.get_by_label('Context window · tokens').scroll_into_view_if_needed()
+    assert settings.get_by_label('Context window · tokens').is_visible()
+    settings.get_by_role('button', name='Saved', exact=True).scroll_into_view_if_needed()
+    assert settings.get_by_role('button', name='Saved', exact=True).is_visible()
+    screenshot(page, 'deeporca-agent-settings-mobile.png')
+    requests = json.dumps(h['requests'], ensure_ascii=False)
+    storage = page.evaluate('JSON.stringify(localStorage)')
+    for value in (secret, replacement):
+        assert value not in requests and value not in storage and value not in '\n'.join(console)
+        assert value not in settings.inner_text()
+    assert not h['external'] and not h['errors']
 
 
 def test_real_workbench_renderer_panes_and_mobile(browser_workbench):

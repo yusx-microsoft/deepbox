@@ -134,6 +134,8 @@ class DeepOrcaSupervisorMixin:
                  "binding_identity_conflict", "local_project_unavailable",
                  "invalid_local_runtime_configuration", "embedded_api_unavailable",
                  "runtime_unavailable", "worker_lost", "startup_failed",
+                 "credential_unavailable", "configuration_api_unavailable", "configuration_busy",
+                 "existing_profile_api_unavailable", "existing_profile_unavailable",
                  "native_context_unavailable", "enrollment_identity_conflict", "output_unavailable"}
         value = str(exc) if isinstance(exc, BindingError) else getattr(exc, "code", None)
         return value if value in known else "startup_failed"
@@ -143,6 +145,12 @@ class DeepOrcaSupervisorMixin:
         info = self.agents.get(agent_id)
         if not info or self._stopped:
             return
+        from agentbridge.integrations.deeporca.contract import binding_revision
+        desired_revision = binding_revision(agent_id, info.get("local_project_id"),
+                                            info.get("runtime_config"))
+        binding = store.get_binding(agent_id)
+        if state == "ready" and binding is not None and binding["revision"] != desired_revision:
+            state, code = "pending", "configuration_busy"
         if store.get_binding(agent_id) is not None:
             store.set_status(agent_id, state, code)
             frame = store.public_status(agent_id)
@@ -154,6 +162,9 @@ class DeepOrcaSupervisorMixin:
                                                       info.get("runtime_config")),
                          **({"code": code} if code else {})}}
         if frame:
+            # Report the desired revision even when the old binding is retained
+            # while a turn settles. Never advertise its worker as the new one.
+            frame["runtime_status"]["revision"] = desired_revision
             self.emit(frame)
 
     async def _ensure_library_worker(self, agent_id):
@@ -165,35 +176,91 @@ class DeepOrcaSupervisorMixin:
             store = self._library_store()
             worker = None
             try:
-                store.ensure_binding({**info, "id": agent_id})
                 existing = self._deeporca_workers.get(agent_id)
+                from agentbridge.integrations.deeporca.contract import validate_runtime_config
+                try:
+                    desired_config = validate_runtime_config(info.get("runtime_config"))
+                except ValueError:
+                    raise BindingError("invalid_local_runtime_configuration") from None
+                profile = desired_config.get("profile", {})
+                resolved_profile = None
+                if profile.get("mode") == "bind":
+                    from .profiles import resolve_existing_profile
+                    resolved_profile = await asyncio.to_thread(
+                        resolve_existing_profile, profile.get("profile_ref"))
+                    if self._stopped or not self._same_library_binding(agent_id, info):
+                        raise BindingError("runtime_unavailable")
+                try:
+                    store.ensure_binding({**info, "id": agent_id}, allow_update=False,
+                                         resolved_profile=resolved_profile)
+                except BindingError as exc:
+                    if str(exc) != "configuration_busy":
+                        raise
+                    # Validate identity before retiring anything. Active turns
+                    # (including detached ones) and session leases must settle
+                    # or close first. Retaining the old revision is deliberate.
+                    if (existing is not None and existing.is_alive() and not existing.can_accept_turn()
+                            or any(aid == agent_id and self._is_library_session(session)
+                                   and session.is_alive() for (aid, _), session in self.ptys.items())):
+                        raise BindingError("configuration_busy") from None
+                    if existing is not None:
+                        await existing.close()
+                        if hasattr(existing, "is_retired") and not existing.is_retired():
+                            raise BindingError("configuration_busy")
+                        self._deeporca_workers.pop(agent_id, None)
+                        existing = None
+                    if self._stopped or not self._same_library_binding(agent_id, info):
+                        raise BindingError("runtime_unavailable")
+                    store.ensure_binding({**info, "id": agent_id}, resolved_profile=resolved_profile)
                 if existing is not None and existing.is_alive():
                     self._library_status(agent_id, "ready")
                     return existing
                 if existing is not None:
                     await existing.close()
+                    if hasattr(existing, "is_retired") and not existing.is_retired():
+                        raise BindingError("stop_uncertain")
                     self._deeporca_workers.pop(agent_id, None)
                 self._library_status(agent_id, "provisioning")
                 binding = store.worker_binding(agent_id)
-                result = await self._new_library_worker(binding).provision()
-                if result.get("configured") is not True:
-                    raise BindingError("configuration_required")
+                # Configuration is applied under runtime.start()'s SDK profile
+                # lock. Avoid applying it in a throwaway provisioner and then
+                # repeating a full runtime startup just to launch the worker.
+                if (profile.get("mode") != "bind"
+                        and "llm" not in desired_config and "credential" not in desired_config):
+                    worker = self._new_library_worker(binding)
+                    self._deeporca_workers[agent_id] = worker
+                    result = await worker.provision()
+                    if hasattr(worker, "is_retired") and not worker.is_retired():
+                        raise BindingError("stop_uncertain")
+                    self._deeporca_workers.pop(agent_id, None)
+                    worker = None
+                    if result.get("configured") is not True:
+                        raise BindingError("configuration_required")
                 if self._stopped or not self._same_library_binding(agent_id, info):
                     raise BindingError("runtime_unavailable")
                 worker = self._new_library_worker(binding)
+                # Ownership begins before startup completes: cancellation must
+                # not lose a process whose exit cannot yet be confirmed.
+                self._deeporca_workers[agent_id] = worker
                 await worker.start()
                 if self._stopped or not self._same_library_binding(agent_id, info):
                     raise BindingError("runtime_unavailable")
-                self._deeporca_workers[agent_id] = worker
                 self._library_status(agent_id, "ready")
                 return worker
             except BaseException as exc:
                 if worker is not None:
-                    await worker.close()
+                    try:
+                        await worker.close()
+                    finally:
+                        if (not hasattr(worker, "is_retired") or worker.is_retired()):
+                            if self._deeporca_workers.get(agent_id) is worker:
+                                self._deeporca_workers.pop(agent_id, None)
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 code = self._library_error(exc)
-                self._library_status(agent_id, "needs_configuration" if code == "configuration_required" else "error", code)
+                state = ("needs_configuration" if code == "configuration_required" else
+                         "pending" if code == "configuration_busy" else "error")
+                self._library_status(agent_id, state, code)
                 raise BindingError(code) from None
 
     def _same_library_binding(self, agent_id, previous):
@@ -204,15 +271,25 @@ class DeepOrcaSupervisorMixin:
             "runtime", "local_project_id", "cwd", "runtime_config"))
 
     def _schedule_runtime_reconciliation(self):
-        if self._stopped:
+        # The generic directory hook also runs during platform construction,
+        # before this extension has initialized its owned task set.
+        if not hasattr(self, "_deeporca_tasks") or self._stopped:
             return
         async def reconcile(aid):
+            previous = self.agents.get(aid)
             try:
                 await self._ensure_library_worker(aid)
             except (BindingError, ValueError):
                 pass
             except Exception:
                 self._library_status(aid, "error", "startup_failed")
+            finally:
+                # replace_agents may run while SDK startup is awaiting IPC.
+                # Reconcile the newer desired value after this task releases
+                # its lock rather than losing that update or publishing ready.
+                if (not self._stopped and aid in self.agents
+                        and not self._same_library_binding(aid, previous or {})):
+                    asyncio.get_running_loop().call_soon(self._schedule_runtime_reconciliation)
         for aid, info in self.agents.items():
             if info.get("runtime") != "deeporca":
                 continue
@@ -220,14 +297,27 @@ class DeepOrcaSupervisorMixin:
             if task is None or task.done():
                 self._deeporca_tasks[aid] = asyncio.create_task(reconcile(aid))
 
+    def _runtime_bound_agent_ids(self):
+        # Called only for a validated, authoritative directory frame. Bootstrap
+        # may have already replaced the in-memory directory, and an Agent may
+        # have been deleted while this Connector was stopped. Include durable
+        # reservations without creating a database for CLI-only Connectors.
+        ids = set(self._deeporca_workers) | set(self._deeporca_tasks)
+        if self._deeporca_store is not None:
+            ids.update(self._deeporca_store.active_agent_ids())
+        return ids
+
     async def _retire_runtime_agent(self, agent_id):
         task = self._deeporca_tasks.pop(agent_id, None)
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        worker = self._deeporca_workers.pop(agent_id, None)
+        worker = self._deeporca_workers.get(agent_id)
         if worker is not None:
             await worker.close()
+            if hasattr(worker, "is_retired") and not worker.is_retired():
+                raise BindingError("stop_uncertain")
+            self._deeporca_workers.pop(agent_id, None)
         if self._deeporca_store is not None:
             self._deeporca_store.retire(agent_id)
 
@@ -262,6 +352,7 @@ class DeepOrcaSupervisorMixin:
                 self.ptys.pop(key, None)
                 self.pty_instances.pop(key, None)
                 self.pty_surfaces.pop(key, None)
+            self._schedule_runtime_reconciliation()
             return True
         return False
 
@@ -365,6 +456,7 @@ class DeepOrcaSupervisorMixin:
         async def settled(input_id, status):
             store.settle_input(agent_id, session_id, input_id,
                                "uncertain" if input_id == failed_input else status)
+            asyncio.get_running_loop().call_soon(self._schedule_runtime_reconciliation)
 
         session = DeepOrcaSession(worker, native_id, durable_output, on_exit,
                                   on_turn_settled=settled)
@@ -397,6 +489,13 @@ class DeepOrcaSupervisorMixin:
         if session is None or not session.is_alive():
             return {**ack, "reason": "session_not_ready"}
         info = self.agents.get(aid, {})
+        from agentbridge.integrations.deeporca.contract import binding_revision
+        binding = store.get_binding(aid)
+        if (binding is None or binding["revision"] != binding_revision(
+                aid, info.get("local_project_id"), info.get("runtime_config"))):
+            # No new work can sneak onto an old worker between replace_agents
+            # and the asynchronous reconciliation task acquiring its lock.
+            return {**ack, "reason": "configuration_busy"}
         options = dict(frame.get("options") or {}) if isinstance(frame.get("options"), (dict, type(None))) else frame["options"]
         if isinstance(options, dict) and "model" not in options:
             model = (info.get("runtime_config") or {}).get("model")

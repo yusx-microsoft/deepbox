@@ -38,13 +38,24 @@ class RuntimePolicy:
     def create_config(self, body: dict) -> dict:
         return body.get("runtime_config") or {}
 
+    def validate_create_capabilities(self, config: dict, capabilities: object) -> None:
+        """Validate runtime-owned references against this Machine's inventory."""
+        pass
+
     def initialize_agent(self, agent: Agent) -> None:
         pass
 
-    def validate_agent_update(self, agent: Agent, body: dict) -> None:
+    def validate_agent_update(self, agent: Agent, body: dict) -> dict | None:
+        """Validate without mutation; return changed desired config, or None.
+
+        The platform checks active conversations before applying a returned
+        config and calls initialize_agent only when the desired revision changes.
+        Ordinary runtimes retain their display-only update behavior.
+        """
         if self.identity_fields & body.keys():
             raise HTTPException(422, "this endpoint only supports display renames")
         self.validate_update_fields(body)
+        return None
 
     def validate_update_fields(self, body: dict) -> None:
         if body.keys() - self.identity_fields - {"display_name"}:

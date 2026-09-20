@@ -35,6 +35,8 @@ INTERRUPT_TIMEOUT = 10.0
 STARTUP_TIMEOUT = 30.0
 _PROFILE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}\Z")
 _SAFE_CODES = frozenset({"sdk_missing", "sdk_incompatible", "configuration_required",
+    "credential_unavailable", "configuration_api_unavailable", "configuration_busy",
+    "existing_profile_api_unavailable", "existing_profile_unavailable",
     "profile_unavailable", "startup_failed", "runtime_error", "worker_lost",
     "invalid_protocol", "output_limit", "approval_contract_violation", "missing_tool_id",
     "interrupt_timeout", "output_unavailable", "worker_closed", "native_context_unavailable"})
@@ -80,20 +82,32 @@ def _binding(value):
     if not isinstance(value, dict):
         raise IntegrationError("invalid_binding")
     required = {"agent_id", "profile_name", "home", "workspace"}
-    if not required <= value.keys() or value.keys() - required - {"source_path", "template_dir"}:
+    if not required <= value.keys() or value.keys() - required - {
+            "source_path", "template_dir", "config", "credential_key_path"}:
         raise IntegrationError("invalid_binding")
     result = dict(value)
     validate_id(result["agent_id"], "invalid_binding")
-    name = result["profile_name"]
-    if not isinstance(name, str) or not _PROFILE.fullmatch(name) or ".." in name:
-        raise IntegrationError("invalid_binding")
-    for key in ("home", "workspace", "source_path", "template_dir"):
+    for key in ("home", "workspace", "source_path", "template_dir", "credential_key_path"):
         path = result.get(key)
-        if key in ("source_path", "template_dir") and path is None:
+        if key in ("source_path", "template_dir", "credential_key_path") and path is None:
             result.pop(key, None)
             continue
         if not isinstance(path, str) or not path or "\x00" in path or not Path(path).is_absolute():
             raise IntegrationError("invalid_binding")
+    if "config" in result:
+        from agentbridge.integrations.deeporca.contract import validate_runtime_config
+        try:
+            result["config"] = validate_runtime_config(result["config"])
+        except ValueError:
+            raise IntegrationError("invalid_binding") from None
+    name = result["profile_name"]
+    if result.get("config", {}).get("profile", {}).get("mode") == "bind":
+        from .profiles import safe_existing_name
+        valid_name = safe_existing_name(name)
+    else:
+        valid_name = isinstance(name, str) and _PROFILE.fullmatch(name) and ".." not in name
+    if not valid_name:
+        raise IntegrationError("invalid_binding")
     return result
 
 
@@ -276,6 +290,13 @@ class SpawnTransport:
 
     def is_alive(self):
         return not self._closed and self._process.is_alive()
+
+    def has_exited(self):
+        # Unlike is_alive(), this checks OS termination even after IPC closes.
+        try:
+            return not self._process.is_alive()
+        except ValueError:  # multiprocessing handle already joined and closed
+            return True
 
     async def close(self, force=False):
         if self._closed:
@@ -552,6 +573,13 @@ class DeepOrcaWorker:
                 pass
             await self._retire("worker_closed", force=False)
 
+    def is_retired(self):
+        if self._transport is None:
+            return True
+        if hasattr(self._transport, "has_exited"):
+            return self._transport.has_exited()
+        return not self._transport.is_alive()
+
 
 async def _child_loop(conn):
     send_lock = asyncio.Lock()
@@ -588,22 +616,58 @@ async def _child_loop(conn):
             raise IntegrationError("sdk_missing") from None
         if type(getattr(sdk, "EMBEDDED_API_VERSION", None)) is not int or sdk.EMBEDDED_API_VERSION != 1:
             raise IntegrationError("sdk_incompatible")
-        profile = sdk.ensure_profile(binding["profile_name"], home=binding["home"],
-                                     template_dir=binding.get("template_dir"))
-        if not isinstance(profile, dict) or any(type(profile.get(k)) is not bool
-                                               for k in ("created", "configured")):
-            raise IntegrationError("invalid_protocol")
-        info = {"profile": binding["profile_name"], "created": profile["created"],
-                "configured": profile["configured"], "embedded_api_version": 1,
-                "status": "ready" if profile["configured"] else "configuration_required"}
-        if initial.get("provision_only"):
-            await send({"kind": "ready", "info": info})
-            return
-        if not profile["configured"]:
-            raise IntegrationError("configuration_required")
-        runtime = sdk.EmbeddedRuntime(binding["profile_name"], binding["workspace"], home=binding["home"])
-        await runtime.start()
+        config = binding.get("config", {})
+        is_existing = config.get("profile", {}).get("mode") == "bind"
+        has_configuration = "llm" in config or "credential" in config
+        if has_configuration and (type(getattr(sdk, "PROFILE_CONFIGURATION_API_VERSION", None)) is not int
+                                  or sdk.PROFILE_CONFIGURATION_API_VERSION != 1):
+            raise IntegrationError("configuration_api_unavailable")
+        if is_existing:
+            from .profiles import existing_profile_api
+            if not existing_profile_api(sdk):
+                raise IntegrationError("existing_profile_api_unavailable")
+            # Native owns acquisition and validates busy/invalid local state.
+            # Never run ensure_profile or pass configuration for a binding.
+            try:
+                runtime = sdk.EmbeddedRuntime(binding["profile_name"], binding["workspace"],
+                                              home=binding["home"], profile_mode="existing")
+                readiness = await runtime.start()
+                if isinstance(readiness, dict) and readiness.get("configured") is False:
+                    raise IntegrationError("existing_profile_unavailable")
+            except Exception:
+                raise IntegrationError("existing_profile_unavailable") from None
+            info = {"profile": binding["profile_name"], "created": False, "configured": True,
+                    "embedded_api_version": 1, "status": "ready"}
+        else:
+            # Neither the Connector parent nor the server see the plaintext.
+            from .credentials import runtime_configuration
+            configuration = runtime_configuration(config,
+                private_key_path=binding.get("credential_key_path"))
+            profile = sdk.ensure_profile(binding["profile_name"], home=binding["home"],
+                                         template_dir=binding.get("template_dir"))
+            if not isinstance(profile, dict) or any(type(profile.get(k)) is not bool
+                                                   for k in ("created", "configured")):
+                raise IntegrationError("invalid_protocol")
+            info = {"profile": binding["profile_name"], "created": profile["created"],
+                    "configured": profile["configured"], "embedded_api_version": 1,
+                    "status": "ready" if profile["configured"] else "configuration_required"}
+            if initial.get("provision_only") and not has_configuration:
+                await send({"kind": "ready", "info": info})
+                return
+            if not profile["configured"] and not has_configuration:
+                raise IntegrationError("configuration_required")
+            runtime = sdk.EmbeddedRuntime(binding["profile_name"], binding["workspace"], home=binding["home"])
+            if has_configuration:
+                readiness = await runtime.start(configuration=configuration)
+                if isinstance(readiness, dict) and readiness.get("configured") is False:
+                    raise IntegrationError("configuration_required")
+                info.update(configured=True, status="ready")
+                configuration = None
+            else:
+                await runtime.start()
         await send({"kind": "ready", "info": info})
+        if initial.get("provision_only"):
+            return
 
         executing = False
 

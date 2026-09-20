@@ -163,8 +163,9 @@ class DeepOrcaStore:
         result["config"] = json.loads(result["config"])
         return result
 
-    def ensure_binding(self, agent: dict) -> dict:
-        from agentbridge.integrations.deeporca.contract import binding_revision, validate_runtime_config
+    def ensure_binding(self, agent: dict, *, allow_update=True, resolved_profile=None) -> dict:
+        from agentbridge.integrations.deeporca.contract import (
+            binding_identity_revision, binding_revision, validate_runtime_config)
         aid = _key(agent["id"])
         project = _key(agent.get("local_project_id"))
         config = validate_runtime_config(agent.get("runtime_config", {}))
@@ -172,21 +173,51 @@ class DeepOrcaStore:
         if not isinstance(workspace, str) or not Path(workspace).is_dir():
             raise BindingError("local_project_unavailable")
         workspace = str(Path(workspace).resolve())
-        if self.native_root is None:
-            raise BindingError("native_storage_unavailable")
         revision = binding_revision(aid, project, config)
-        # Native state uses only opaque identities, never display names or raw
-        # request paths. Namespace values are hashed again before path joining.
-        ns = hashlib.sha256(self.namespace.encode()).hexdigest()[:24]
-        profile = "dbx-" + hashlib.sha256((self.namespace + "\0" + aid).encode()).hexdigest()[:24]
-        home = str(self.native_root / ns)
+        identity = binding_identity_revision(aid, project, config)
+        existing_profile = config["profile"]["mode"] == "bind"
+        if existing_profile:
+            from .profiles import selected_profile
+            selected = selected_profile(resolved_profile, config["profile"]["profile_ref"])
+            if selected is None:
+                raise BindingError("existing_profile_unavailable")
+            profile, home = selected["profile_name"], selected["home"]
+        else:
+            if self.native_root is None:
+                raise BindingError("native_storage_unavailable")
+            # Managed paths use only opaque identities. Browser requests never
+            # choose home/name; existing selections come from local discovery.
+            ns = hashlib.sha256(self.namespace.encode()).hexdigest()[:24]
+            profile = "dbx-" + hashlib.sha256((self.namespace + "\0" + aid).encode()).hexdigest()[:24]
+            home = str(self.native_root / ns)
         with self._write() as conn:
             row = conn.execute("SELECT * FROM bindings WHERE namespace=? AND agent_id=?",
                                (self.namespace, aid)).fetchone()
             if row is not None:
                 if (row["project_id"] != project or row["workspace"] != workspace
-                        or row["revision"] != revision or row["retired"]):
+                        or binding_identity_revision(aid, row["project_id"],
+                            json.loads(row["config"])) != identity or row["retired"]
+                        or (existing_profile and (
+                            os.path.normcase(row["home"]) != os.path.normcase(home)
+                            or os.path.normcase(row["profile_name"]) != os.path.normcase(profile)))):
                     raise BindingError("binding_identity_conflict")
+            if existing_profile:
+                # SQLite transaction serializes local reservations. This is not
+                # a standalone/native lock; the SDK fences actual acquisition.
+                target = os.path.normcase(str(Path(home) / "agents" / profile))
+                for other in conn.execute("SELECT home,profile_name FROM bindings "
+                                          "WHERE namespace=? AND agent_id<>? AND retired=0",
+                                          (self.namespace, aid)):
+                    if os.path.normcase(str(Path(other["home"]) / "agents" / other["profile_name"])) == target:
+                        raise BindingError("existing_profile_unavailable")
+            if row is not None:
+                if row["revision"] != revision:
+                    if not allow_update or conn.execute("SELECT 1 FROM inputs WHERE namespace=? AND agent_id=? "
+                                    "AND state='running' LIMIT 1", (self.namespace, aid)).fetchone():
+                        raise BindingError("configuration_busy")
+                    conn.execute("UPDATE bindings SET config=?,revision=?,state='pending',code=NULL "
+                                 "WHERE namespace=? AND agent_id=?",
+                                 (json.dumps(config, sort_keys=True), revision, self.namespace, aid))
             else:
                 conn.execute(
                     "INSERT INTO bindings(namespace,agent_id,project_id,revision,profile_name,home,workspace,config) "
@@ -200,6 +231,10 @@ class DeepOrcaStore:
         if binding is None or binding["retired"]:
             raise BindingError("binding_not_found")
         result = {k: binding[k] for k in ("agent_id", "profile_name", "home", "workspace")}
+        result["config"] = binding["config"]
+        if self.path != ":memory:":
+            from .credentials import key_path
+            result["credential_key_path"] = str(key_path(self.path))
         result.update(local_worker_settings())
         return result
 
@@ -221,6 +256,12 @@ class DeepOrcaStore:
         if row["code"]:
             status["code"] = row["code"]
         return {"type": "agent.runtime_status", "agent_id": agent_id, "runtime_status": status}
+
+    def active_agent_ids(self) -> set[str]:
+        with self._lock:
+            return {row[0] for row in self._conn.execute(
+                "SELECT agent_id FROM bindings WHERE namespace=? AND retired=0",
+                (self.namespace,))}
 
     def retire(self, agent_id: str):
         # The native profile and all history remain on disk by design.
