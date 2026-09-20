@@ -364,7 +364,8 @@ class StructuredAgentSession:
                  control_timeout: float = 10.0,
                  context_started: Callable[[], Awaitable[None]] | None = None,
                  context_preparing: Callable[[], None] | None = None,
-                 writer_lease_factory=None):
+                 writer_lease_factory=None,
+                 require_existing_context: bool = False):
         self.cmd = cmd
         self.cwd = cwd or None
         self.on_output = on_output
@@ -389,6 +390,9 @@ class StructuredAgentSession:
         self._control_timeout = max(0.1, float(control_timeout))
         self._context_started = context_started
         self._context_preparing = context_preparing
+        # A resume may tighten an existing lazy session, never loosen it back
+        # into a create. The preparing hook enforces this at every spawn.
+        self.require_existing_context = require_existing_context
         self._writer_lease_factory = writer_lease_factory
         self._writer_lease = None
         self._writer_proc = None
@@ -534,14 +538,30 @@ class StructuredAgentSession:
                 self._launch_task = None
             self._release_writer()
 
-    async def _launch_process(self, options, paths=(), prompt=None):
+    def prepare_context(self):
+        """Acquire native ownership and validate context without spawning a CLI.
+
+        Retain a successful lease through the lazy wait for input. On failure,
+        release only idle ownership: a live/in-flight child still owns its guard.
+        This hook is deliberately re-run before every process launch.
+        """
         try:
+            if self._killed:
+                raise RuntimeError("Session is closed")
             if self._writer_lease is None and self._writer_lease_factory is not None:
                 lease = self._writer_lease_factory()
                 lease.acquire()
                 self._writer_lease = lease
             if self._context_preparing is not None:
                 self._context_preparing()
+        except BaseException:
+            if self._writer_proc is None and self._launch_task is None:
+                self._release_writer()
+            raise
+
+    async def _launch_process(self, options, paths=(), prompt=None):
+        try:
+            self.prepare_context()
             argv = self._command(options, paths)
             if self._per_turn:
                 argv += self._prompt_argv + [prompt]

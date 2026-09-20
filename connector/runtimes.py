@@ -201,6 +201,7 @@ class ContextControl:
             "continuity": "native_resume",
             "available": installed,
             "resume_scope": self.resume_scope,
+            "explicit_resume": True,
         }
 
 
@@ -330,6 +331,7 @@ class RuntimeAdapter:
             # Deliberately omit the connector-local executable path. The
             # server/browser need capabilities, not workstation filesystem data.
             "features": {
+                "session_lifecycle": 1,
                 "models": list(self.models),
                 "permission_modes": sorted(self.permission_modes),
                 "structured": self.structured,

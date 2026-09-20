@@ -43,11 +43,19 @@ Model intelligence and API keys never leave the connector machine. The server
 stores terminal bytes / canonical event JSON and non-secret metadata only; it
 never holds model credentials.
 
-`sessions.surface` is an additive nullable column. New explicit choices are stored;
+`session.surface` is an additive nullable column. New explicit choices are stored;
 validated ready/snapshot frames establish the resolved `terminal` or `structured`
 surface. Existing rows are not guessed from runtime names. Attaching or reconnecting
 does not silently switch a known surface, and the browser never reuses an unknown
 legacy session for an explicit Terminal choice.
+
+`Session.title` is display metadata only: Rename uses an expected-title
+compare-and-swap and never changes the session/agent/native ID or local marker.
+New session IDs are canonical UUID strings; existing IDs stay unchanged.
+`Session.launch_id` is one durable, opaque lifecycle token, not a native-context
+handle or a process-reaping receipt. It fences controls/ready/exit/snapshots across
+initial launch, explicit Resume, and logical End; stale snapshot entries cannot
+downgrade a newer active generation. See [the lifecycle contract](design.md#55-restore-and-reconnect).
 
 ## 3. Connector-side persistence
 
@@ -123,6 +131,14 @@ and DB are created `0700`/`0600` where possible.
   retained when agents disappear from an inventory; omission is not deletion of
   native history. `BEGIN IMMEDIATE` makes reservation conflicts atomic.
 
+Explicit Resume requires this existing marker under native-writer ownership,
+before logical ready and again before each spawn. The `attempted`/`established`
+states and runtime/cwd bindings are unchanged. A marker is not proof that the
+provider's transcript still exists: a lazy/per-turn resume may discover its loss
+only on the next real message. Server recordings restore a view, never reconstruct
+a provider prompt/history or authorize a replacement conversation. Missing or
+unreadable markers fail visibly with safe guidance, without local path/error text.
+
 ### 3.3 Native conversation writer ownership (`connector/native_writer.py`)
 
 The shared user-state `native-writers/` directory contains one stable hashed lock
@@ -191,9 +207,11 @@ Durable recording lives in two tables:
 Persistence is split into a pure in-memory `classify_output()` (reads the ledger
 and returns NEW / DUPLICATE / GAP / CONFLICT / INVALID, building an uncommitted
 `RecordingFrame` for NEW) and a durable `commit_new()` (`db.add` + `db.commit`,
-which is the ACK boundary). This lets the server broadcast a NEW frame to
-browsers before the disk commit completes, then commit and only then ACK the
-connector.
+which is the ACK boundary). This lets the server broadcast a current NEW frame
+to browsers before the disk commit completes, then commit and only then ACK the
+connector. For generation-fenced structured sessions, delayed old-instance output
+is still committed/ACKed but is not fanned into the new live conversation. The
+launch token does not replace the durable stream identity or reset its ledger.
 
 Structured re-attach uses `LiveRegistry.event_restore()`, which selects the most
 recent complete `kind="event"` rows up to 4 MiB, reconstructs original order into
@@ -202,13 +220,16 @@ row is isolated and does not swallow later valid events.
 
 ### 4.3 Migrations (`_migrate()`)
 
-Migrations are additive only. `_migrate()` runs idempotent `ALTER TABLE ... ADD
+Schema migrations are additive. `_migrate()` runs idempotent `ALTER TABLE ... ADD
 COLUMN` statements for new nullable columns, separately creates tables/unique
 indexes that SQLite cannot add via `ALTER`, and calls `_backfill_workspaces()` to
 give existing users a personal workspace, backfill `Devbox.workspace_id` /
 `Session.workspace_id`, and guarantee an owner membership. Nullable
-`workspace_id` columns exist only to make that backfill lossless. Migrations
-never rewrite the recording ledger or the connector spool. Two example columns
+`workspace_id` columns exist only to make that backfill lossless. When adding
+`session.launch_id`, existing rows are backfilled with `'legacy'` so History does
+not mistake them for never-started sessions. New rows start with a null token.
+Existing session IDs are not rewritten; migrations never rewrite the recording
+ledger, connector spool, or native-context bindings. Two other example columns
 added this way: `session.retention` and `recording_frame.redacted_at`.
 
 ## 5. Delivery guarantees (end to end)
@@ -218,9 +239,9 @@ Output moves through three durability points, each strictly ordered:
 1. **Spool first, then send.** The supervisor commits a frame to the connector
    spool before it can be sent.
 2. **Persist, then ACK.** The server durably commits (`commit_new`) before it
-   ACKs the connector. Live broadcast to browsers happens before the disk commit,
-   so on-screen echo never waits on a network-disk fsync, but the ACK itself
-   means "server has persisted".
+   ACKs the connector. Eligible current frames are live-broadcast before the disk
+   commit, so on-screen echo never waits on a network-disk fsync, but the ACK
+   itself means "server has persisted", not "this frame belongs to the live run".
 3. **ACK, then drop.** The connector removes a spooled frame only after a precise
    `seq` ACK for that stream.
 
@@ -242,6 +263,11 @@ Because each hop is durable and idempotent, a transport crash before ACK, a
 WebSocket drop after persist but before ACK, or a full machine restart all leave
 the spool rows in place; on reconnect they replay by `ord` and the server
 de-duplicates precisely.
+
+Transport reattachment preserves surviving providers and does not request native
+resume. Nonlive History remains read-only until explicit, capability-gated Resume;
+already-live attach does not send a duplicate CLI open. End is logical; only local
+confirmed reap can clear an active native-writer journal.
 
 ## 6. Retention and secure erase
 

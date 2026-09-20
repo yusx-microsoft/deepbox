@@ -78,7 +78,8 @@ def test_attach_uses_persisted_surface_and_rejects_switch(app_client):
     client, main = app_client
     _, agent_id = make_agent(client)
     sid = client.post(f"/api/agents/{agent_id}/sessions", json={"surface": "terminal"}).json()["id"]
-    with patch.object(main.hub, "to_devbox", new_callable=AsyncMock, return_value=True) as send:
+    with patch.object(main.hub, "to_devbox", new_callable=AsyncMock, return_value=True) as send, \
+            patch.object(main.hub, "is_agent_online", return_value=True):
         with client.websocket_connect("/ws/term", headers={"origin": "http://testserver"}) as ws:
             attach(ws, sid)
             assert send.call_args.args[1]["surface"] == "terminal"
@@ -235,8 +236,15 @@ def test_structured_controllers_share_input_without_leases(app_client, role):
             send.reset_mock()
             for kind in ("input", "stdin", "permission", "interrupt", "terminate"):
                 ws.send_json({"type": kind, "session_id": sid, "data": "hello", "decision": "allow"})
+                if kind == "terminate":
+                    ended = ws.receive_json()
+                    assert ended["type"] == "status" and ended["state"] == "ended"
                 ws.send_json({"type": "input", "session_id": sid, "client_input_id": "invalid"})
-                assert ws.receive_json()["message"] == "invalid client_input_id"
+                rejected = ws.receive_json()
+                if kind == "terminate":
+                    assert rejected["code"] == "session_changed"
+                else:
+                    assert rejected["message"] == "invalid client_input_id"
                 assert send.call_args.args[1]["type"] == kind
             assert send.call_count == 5
             with main.models.SessionLocal() as db:

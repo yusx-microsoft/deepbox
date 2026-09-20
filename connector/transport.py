@@ -92,6 +92,10 @@ class TransportSession:
             if frame_type in {"ack", "resend", "error", "fence"}:
                 await self._server_events.put(frame)
                 continue
+            # Lifecycle controls (open/resume/terminate) use the reliable,
+            # awaited IPC path, preserving the opaque launch_id verbatim.
+            # In particular, never translate resume to open: an older sessiond
+            # must ignore the unknown control rather than create a new context.
             await self.channel.send(frame)
 
     @staticmethod

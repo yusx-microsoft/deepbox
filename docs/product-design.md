@@ -155,7 +155,7 @@ connector may retain the process and replay spooled output after reconnect.
 | New session / New chat | Create a durable session and start a fresh local process on attach |
 | Open agent | Resume a live session matching the chosen surface; create one when none matches |
 | Detach | Close this viewer only; keep the local process running |
-| Terminate | Explicitly kill the process; requires the keyboard holder or workspace Admin/Owner |
+| Terminate | Explicitly request process shutdown; terminal requires the keyboard holder, structured requires current Operator/Admin/Owner access |
 | Replay | Read a durable recording without starting a process |
 
 A WebSocket close is not process death. Multiple viewers may attach. A terminal has
@@ -173,8 +173,8 @@ opens a native chat before the first frame instead of scraping ANSI text.
 
 - **Structured runtimes** (headless / JSON) drive the native chat UI. The connector's
   runtime adapter runs a `StructuredAgentSession`, emits a canonical event stream, and maps
-  per-turn options to native control requests. Capability blobs stay opaque to the server;
-  the browser renders only their generic feature and control schema.
+  per-turn options to native control requests. The server checks only generic lifecycle/
+  context features for Resume; the browser renders the generic feature/control schema.
 - **Legacy / TUI runtimes** fall back to `xterm.js` rendering raw PTY bytes, with resize,
   reconnect, and replay behavior unchanged.
 
@@ -198,12 +198,26 @@ start a new session. Native-writer ownership prevents two cooperating connectors
 from writing that conversation concurrently. Uncertain crash recovery requires
 explicit local confirmation, not an automatic lease timeout.
 
-**Current status:** history selection and read-only replay exist. Renaming a
-historical session and explicitly resuming it from the browser are not implemented
-yet. The intended contract is an editable AgentBridge display title, with unchanged
-AgentBridge session ID/native resume ID. Replay and resume must be distinct
-operations with current Workspace authorization; selecting history must not spawn
-a CLI, and unsupported/missing native history must not become a new conversation.
+**Current local changes:** Rename and explicit Resume are implemented separately
+from replay; this is not new live Workspace/real-CLI acceptance or a deployment claim.
+
+- **Rename** changes only the display title, from a live header or History/replay.
+  Current Operator/Admin/Owner access is required. Titles are trimmed, single-line,
+  1–120 characters; a concurrent title change returns a conflict rather than
+  overwriting it, and the dialog retains the draft for refresh/retry. Session,
+  agent, native conversation ID, recordings, and local context markers do not change.
+- **View history** is read-only for a nonlive session and never starts a CLI.
+  **Attach live** watches the existing run without a duplicate open. **Resume** is
+  an explicit, generation-checked continuation of the same session on the same
+  agent, requiring current Operator/Admin/Owner access, not a new-session shortcut;
+  stale views must refresh before retrying.
+- Resume is enabled only by installed generic structured native-resume capability
+  plus lifecycle support. Unsupported/terminal historical restart is refused with
+  a reason; the user can explicitly choose **New session** instead.
+- **Ready** means logical readiness, not confirmed restoration of native history.
+  Preparation explains that the next real message resumes the CLI; a lazy/per-turn
+  runtime may discover a missing provider transcript only then. Failures stay
+  visible with safe guidance, never raw local marker errors or silent recreation.
 
 ### 5.3 Structured chat controls
 
@@ -222,10 +236,12 @@ a CLI, and unsupported/missing native history must not become a new conversation
 - Operator/Admin/Owner may send chat messages without acquiring the terminal keyboard.
   Viewer remains read-only. New invitation forms explicitly select Operator; the API
   default is still Viewer, and existing Viewer grants are never automatically promoted.
-- **End session** is a separate confirmed action. The keyboard holder or an Admin/Owner
-  can terminate a structured runtime; shared chat access alone does not grant termination
-  rights. Terminal input, resize, and termination are holder-only, including for an
+- **End session** is a separate confirmed action. Current Operator/Admin/Owner access
+  permits structured termination without a keyboard lease; Viewer cannot terminate.
+  Terminal input, resize, and termination are holder-only, including for an
   Admin/Owner. Closing a pane only detaches; New chat preserves the old shared session.
+  End is a logical state change, not confirmation that the local CLI was reaped;
+  native-writer safety checks still apply to a later Resume.
 - Membership role changes require explicit **Save**. Management dialogs capture their
   user/workspace context and reject stale asynchronous results; no automatic grants.
 
@@ -278,14 +294,25 @@ Open an agent
 → browser shows native chat or the live terminal
 ```
 
-### 6.4 Resume a session
+### 6.4 Attach live or explicitly resume
 
 ```text
 Open an agent with a live session
 → viewer attaches to the same session ID
-→ connector restores buffered structured events or terminal output
+→ server restores structured events or terminal output; no duplicate CLI open
 → live output resumes
 ```
+
+```text
+Open History for a nonlive session → read-only history
+→ choose Resume (current role, capability and observed launch token checked)
+→ connector validates the existing local context and prepares the same native ID
+→ logical ready; the next real message may perform the provider's native resume
+```
+
+Neither lost transport nor reconnect requests Resume. Transport reattachment
+preserves surviving providers; failed historical resume never creates a replacement
+session or reconstructs the provider's transcript from the displayed history.
 
 ### 6.5 Server restart
 
@@ -454,7 +481,8 @@ and label, family and surface, validated launch/model/permission metadata, probe
 generic control definitions, and skill roots. Adding a runtime must not require a
 runtime-specific server or web branch. Built-in adapters are `mock`, `claude-code`,
 `codex-cli`, `copilot-cli`, `claude-code-structured`, and `copilot-cli-structured`.
-Capability blobs stay opaque to the server; the web renders their generic schema.
+The server stores capability blobs and checks generic lifecycle/context keys for
+Resume; the web renders their generic schema, without runtime-name branches.
 
 ---
 
