@@ -39,8 +39,8 @@ not a claim that the removed opt-in machinery is still present.
 
 This extends DeepBox `8da1462` plus the preceding configuration work, and native
 SDK `3978d2f` plus the narrow new-profile security-default opt-in. These changes
-are uncommitted. See [existing-profile operations](deeporca-existing-profiles.md)
-and [fixture screenshots](prototypes/deeporca-bind-profile/README.md).
+are uncommitted. See [existing-profile operations](deeporca-existing-profiles.md).
+Fixture screenshots are local-only artifacts, not committed files.
 
 Evidence directory:
 `C:/Users/chec/.deeporca/agents/deepbox/tmp/existing-profile-evidence/`.
@@ -142,8 +142,9 @@ regenerated and these checks do not restart their Connector.
   recovery, symlink/reparse rejection and protected Windows DACLs established
   **before** private staged/published bytes are written.
 
-Fixture-only screenshots:
-[`prototypes/deeporca-agent-config/`](prototypes/deeporca-agent-config/README.md).
+Fixture-only screenshots are local artifacts, excluded from Git. To regenerate
+them, run `tests/test_deeporca_browser.py` with `DEEPORCA_BROWSER_ARTIFACTS`
+pointing to a local output directory.
 
 ### Retained intermediate failures and review fixes
 
@@ -331,12 +332,12 @@ artifacts are not committed fixtures or deployment evidence.
 
 ## Screenshots and limits
 
-These are the **real workbench renderer with test fixture data**, not external-model sessions:
+Local screenshots show the **real workbench renderer with test fixture data**,
+not external-model sessions: desktop conversation and existing CLI panes, Agent
+settings/readiness, and mobile workbench. They are not committed artifacts.
 
-- [Desktop conversation and existing CLI pane](prototypes/deeporca-workbench-v1.png)
-- [Agent settings and readiness](prototypes/deeporca-agent-settings-v1.png)
-- [Mobile workbench](prototypes/deeporca-workbench-mobile-v1.png)
-
-The separate [offline prototype](prototypes/deeporca.md) is illustrative and non-normative.
+The separate local-only offline prototype is illustrative and non-normative.
+Prototype directories and their standalone test are excluded from Git. Historical
+suite counts above predate this exclusion; production Workbench tests remain.
 
 Not verified here: real external-provider credentials/billing, remote deployment, binding a real user's live profile, autonomous/background execution, or arbitrary subprocess rollback. Existing-profile binding is verified with disposable native profiles and a loopback provider, not a shared native/embedded writer lease. No production deployment or restart for the binding extension was performed; the earlier model-configuration preview restart is a separate operational action. See [operational setup and limits](deeporca.md) and [the reconciled design](deeporca-integration-design.md) before enabling the runtime in a real Connector.

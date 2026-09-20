@@ -99,14 +99,12 @@ are deliberately not enabled.
 
 ## Visual and behavioral evidence
 
-The images below come from the actual workbench under Playwright with fixture
+Local-only screenshots come from the actual workbench under Playwright with fixture
 REST/WebSocket data. They demonstrate presentation, not model authentication or
-real tool execution; the SDK/Server/Connector tests are separate.
-
-- [Desktop](prototypes/deeporca-workbench-v2-desktop.png)
-- [Independent native and CLI panes](prototypes/deeporca-workbench-v2-split.png)
-- [Mobile conversation](prototypes/deeporca-workbench-v2-mobile.png)
-- [Mobile nested Markdown and tables](prototypes/deeporca-workbench-v2-mobile-markdown.png)
+real tool execution; the SDK/Server/Connector tests are separate. Prototype
+directories and screenshots are not committed. Production presentation checks
+remain in `tests/test_deeporca_browser.py`, covering desktop, independent native
+and CLI panes, mobile conversations, and nested Markdown/tables.
 
 See [validation](deeporca-validation.md) for test results and
 [acceptance mapping](deeporca-design-checklist.md) for the original v1 guarantees.

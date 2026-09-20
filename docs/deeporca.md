@@ -494,13 +494,9 @@ python -m pytest -q tests/test_deeporca_runtime.py tests/test_deeporca_routes.py
 They cover the shared contract/probe, desired/observed state, local bindings and
 receipts, worker lifecycle, session events and browser integration. The browser
 tests use Node.js and skip when it is unavailable; the browser-level test also
-needs Playwright and its locally installed Chromium, otherwise it skips. The
-historical UI prototype has a separate check; passing it does not validate the
-implemented runtime:
-
-```bat
-python -m pytest -q tests/test_deeporca_prototype.py
-```
+needs Playwright and its locally installed Chromium, otherwise it skips.
+Historical prototypes, their standalone test and screenshots are local-only
+artifacts, excluded from Git; they do not validate the implemented runtime.
 
 From the DeepOrca SDK checkout root, its real embedded-host regression file is:
 

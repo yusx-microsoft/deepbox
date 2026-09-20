@@ -613,7 +613,7 @@ Each pane owns its reducer and DOM state. Avoid global `currentChatId` variables
 
 ## 11. Prototype alignment
 
-The existing [interactive prototype](../web/prototypes/deeporca.html) and its [notes](prototypes/deeporca.md) demonstrate layout and event-driven interaction. They are not a normative v1 specification.
+The local-only interactive prototype and its notes demonstrate layout and event-driven interaction. They are not committed artifacts or a normative v1 specification.
 
 The next prototype revision should:
 
@@ -741,7 +741,6 @@ DeepBox paths are relative to this repository:
 - [Structured state reducer and generic renderer](../web/chat.js)
 - [Pane integration](../web/pane.js)
 - [Existing architecture](design.md)
-- [Prototype documentation](prototypes/deeporca.md)
 
 DeepOrca paths are relative to `C:/repos-gim/deeporca` in the reviewed checkout:
 
