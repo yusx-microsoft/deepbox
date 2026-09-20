@@ -31,7 +31,7 @@ have separately revisioned, idle-only updates.
 - The SDK owns a minimal bootstrap built from native model/configuration, tool, skill, memory and persona components, plus `SessionManager`, `TurnEngine`, and `SessionRunCoordinator`; it does not initialize the standalone gateway or autonomous services. Provider failure events now settle as errors rather than successful completed turns. Embedded registries wait for synchronous-thread cleanup on cancellation, bounded externally by worker retirement; standalone defaults are unchanged. No model request is sent merely to advertise readiness.
 - Verification includes real SDK + local fake OpenAI/SSE provider tests, real Server/Connector/WebSocket/recording integration, explicitly paused existing-profile binding, native-context recovery after worker restart, and Chromium workbench checks. Browser fixtures are not real-provider or deployment evidence. External provider authentication, production deployment, concurrent standalone/embedded writers, uploads, and autonomous execution remain outside this verification.
 
-Implementation and test entry points: [operations and test commands](deeporca.md), `tests/test_deeporca_sdk_integration.py`, `tests/test_deeporca_e2e.py`, `tests/test_deeporca_browser.py`, and the Connector/Server unit and regression suites. The optional SDK/E2E tests require a local source checkout and use temporary profiles and loopback-only fake providers.
+Implementation and test entry points: [operations and test commands](deeporca.md), `tests/test_deeporca_integration.py`, `tests/test_deeporca_browser.py`, and the consolidated Connector/Server unit and regression suites. The optional SDK/E2E tests require a local source checkout and use temporary profiles and loopback-only fake providers.
 
 See the [v1 acceptance checklist](#design-to-implementation-checklist) for requirement-to-code/test mapping and the [validation report](#validation-record) for actual run results, commands and verification limits.
 
@@ -1041,16 +1041,16 @@ regenerated and these checks do not restart their Connector.
 
 #### Acceptance evidence
 
-- `tests/test_deeporca_configuration_contract.py`: bounded declarative settings,
+- `tests/test_deeporca_server.py`: bounded declarative settings,
   native effort/window/model rules, invalid endpoint/plaintext-key rejection,
   envelope bounds, and mutable desired revision versus immutable identity.
-- `tests/test_deeporca_settings.py`: create/update authorization, immutable
+- `tests/test_deeporca_server.py`: create/update authorization, immutable
   project/profile fences, active-session conflict, retained sealed keys,
   endpoint-change safeguards, stale status and no-op/rename behavior.
 - `tests/test_deeporca_configuration.py`: public-key publication, private key
   persistence/recovery fencing, worker-only decoding, tamper/endpoint failure,
   old SDK errors, revision updates and busy-worker safety.
-- `tests/test_deeporca_profile_e2e.py`: actual browser-module WebCrypto in Node,
+- `tests/test_deeporca_integration.py`: actual browser-module WebCrypto in Node,
   real HTTP/WS Server, real Connector and spawned real native SDK, with **no model
   template**. A loopback scripted provider verifies dummy key, model and effort.
   The test updates the same profile, rejects changes with an active session,
@@ -1060,7 +1060,7 @@ regenerated and these checks do not restart their Connector.
 - `tests/test_deeporca_browser.py`: real Chromium fixture UI, encrypted creation
   independently decrypted in Python, settings retention/replacement, failed-save
   draft preservation, explicit no-auth, runtime toggling and mobile sizing.
-- `web/deeporca-agent-configuration.test.js` and `web/management.test.js`:
+- `web/deeporca.test.js` and `web/management.test.js`:
   native-compatible fields, randomized endpoint-bound encryption, runtime-agnostic
   delegation, legacy fixed models/rename-only behavior; deferred preparation
   cannot submit after permissions/context/dialog change.
@@ -1178,7 +1178,7 @@ From AgentBridge, with test dependencies already installed:
 python -m pytest tests -q
 python -c "import subprocess,pathlib,sys; sys.exit(subprocess.call(['node','--test',*[str(p) for p in pathlib.Path('web').rglob('*.test.js')]]))"
 python -m pytest tests/test_deeporca_browser.py -q
-python -m pytest tests/test_deeporca_coalescing.py tests/test_deeporca_worker.py tests/test_deeporca_session.py tests/test_deeporca_supervisor.py -q
+python -m pytest tests/test_deeporca_runtime.py -q
 ```
 
 Use an isolated test data directory/database when running the entire suite. During this verification `PYTHON_DOTENV_DISABLED=1`, `DEEPBOX_DATABASE_URL` and `DEEPBOX_DATA_DIR` were set command-locally to temporary test destinations, not the running preview's data.
@@ -1189,7 +1189,7 @@ The optional real-SDK group:
 
 ```bat
 set "AGENTBRIDGE_DEEPORCA_SOURCE=C:\repos-gim\deeporca"
-python -m pytest tests/test_deeporca_sdk_integration.py tests/test_deeporca_e2e.py tests/test_deeporca_supervisor.py -q
+python -m pytest tests/test_deeporca_integration.py tests/test_deeporca_runtime.py -q
 ```
 
 The source must contain compatible API v1 and its dependencies must be available to the Connector interpreter. The fixtures create their own fake provider/template, guard worker outbound networking, and use temporary managed profiles. Do not substitute a real user's profile or provider key into these tests.

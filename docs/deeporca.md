@@ -488,7 +488,7 @@ From the AgentBridge repository root, with its test dependencies already
 available in the selected Python environment, these are the actual test files:
 
 ```bat
-python -m pytest -q tests/test_deeporca_runtime.py tests/test_deeporca_routes.py tests/test_deeporca_supervisor.py tests/test_deeporca_worker.py tests/test_deeporca_session.py tests/test_deeporca_web.py
+python -m pytest -q tests/test_deeporca_runtime.py tests/test_deeporca_server.py tests/test_deeporca_configuration.py tests/test_deeporca_web.py
 ```
 
 They cover the shared contract/probe, desired/observed state, local bindings and
