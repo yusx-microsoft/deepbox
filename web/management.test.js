@@ -101,7 +101,8 @@ test('UMD and CommonJS export only the public management factory and methods', (
   assert.deepEqual(Object.keys(require('./management.js')), ['createManagement']);
   const h = harness();
   assert.deepEqual(Object.keys(h.management).sort(), ['createWorkspace','manageWorkspace','presentInvitation','admin',
-    'createMachine','rotateMachineToken','deleteMachine','createAgent','agentSettings','deleteAgent','showRuntimes','showSkills'].sort());
+    'createMachine','rotateMachineToken','deleteMachine','createAgent','agentSettings','hasAgentSettings',
+    'deleteAgent','showRuntimes','showSkills'].sort());
 });
 
 test('real workspace dialog preserves Viewer until an explicit role Save; invitations default Operator', async()=>{

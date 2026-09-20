@@ -605,13 +605,16 @@
       });
     }
 
+    // The shell asks the runtime contract, not a hardcoded runtime name.
+    const hasAgentSettings = agent=>!!Chat.runtimeContract(agent).agentUiModule;
+
     async function agentSettings(id){
       const snapshot = capture();
       const find = ()=>{
         if(!canManage(snapshot)) return null;
         for(const box of list(context().devboxes)){
           if(box.workspace_id !== snapshot.workspaceId) continue;
-          const agent = list(box.agents).find(item=>item.id === id && Chat.runtimeContract(item).agentUiModule);
+          const agent = list(box.agents).find(item=>item.id === id && hasAgentSettings(item));
           if(agent) return {box, agent};
         }
         return null;
@@ -795,7 +798,8 @@
     function showSkills(machineId){ return inventoryDialog(machineId, 'skills'); }
 
     return {createWorkspace, manageWorkspace, presentInvitation, admin, createMachine,
-      rotateMachineToken, deleteMachine, createAgent, agentSettings, deleteAgent, showRuntimes, showSkills};
+      rotateMachineToken, deleteMachine, createAgent, agentSettings, hasAgentSettings,
+      deleteAgent, showRuntimes, showSkills};
   }
 
   return {createManagement};

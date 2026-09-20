@@ -63,7 +63,7 @@ class RuntimePolicy:
             raise HTTPException(422, "unsupported Agent update field")
 
     def require_retry(self) -> None:
-        raise HTTPException(422, "runtime retry is only supported for DeepOrca")
+        raise HTTPException(422, "this runtime does not support provisioning retry")
 
     def retry_agent(self, agent: Agent, body: dict) -> None:
         self.require_retry()

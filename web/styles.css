@@ -1,5 +1,4 @@
 /* AgentBridge: quiet application chrome, clear type, generous content space. */
-@import url('./deeporca-chat.css?v=deeporca-1');
 :root{
   color-scheme:dark;
   --bg:#0e1219;--panel:#151b25;--surface:#111720;--hover:#1c2634;--selected:#22324a;
