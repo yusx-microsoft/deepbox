@@ -15,11 +15,6 @@ data/
 *.log
 pip/
 
-# Local-only prototypes and their standalone test
-prototype/
-prototypes/
-/tests/test_deeporca_prototype.py
-
 # OS / editor
 .DS_Store
 .vscode/
