@@ -199,10 +199,18 @@ will supply final results; do not run live setup or real agents automatically.
   themes, and default-off/opt-in shortcuts without weakening pane isolation or roles.
 - Verify canonical/legacy/empty environment precedence, old/custom root continuity,
   pane teardown/restore privacy, collaboration permissions, and dialog role Save.
-- **Final external rename is a separate approval step**: existing GitHub repo URLs,
-  checkout path, Azure resource/domain, Entra callbacks, cookies/tokens/IPC, and
-  installed data remain unchanged. Follow the [migration gates](agentbridge.md#migration-gates),
-  including continuity and rollback planning; local branding is not that migration.
+- **Canonical repository and installation source**:
+  [yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge).
+  `yusx-microsoft/AgentBridge` is a fork, not production upstream. Feature branches
+  and PRs target canonical `upstream/main`; no direct-main development. Verify the
+  actual repository rename and script/package publication separately from review.
+- **Compatibility and cloud boundaries**: fresh installs use `~/.agentbridge`;
+  existing `.deepbox` output is compatibility, not the fresh-install name. No
+  installation is moved automatically. The `C:\Code\deepbox` worktree, Azure
+  resources/domains, Entra callbacks, cookies/tokens/IPC and installed data remain
+  unchanged. Future cloud/domain or identity/data migrations need separate
+  approval and continuity/rollback planning; see the
+  [migration gates](agentbridge.md#migration-gates).
 
 ### Real multi-machine end-to-end
 

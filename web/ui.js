@@ -211,11 +211,11 @@
       && (!surface || session.surface === surface));
   }
 
-  // Installation and connection are separate. Product naming does not rename
-  // the source repository; these URLs remain valid until that external migration.
+  // Installation and connection are separate. Install/upgrade sources always
+  // use the canonical AgentBridge repository, never a development fork.
   // Fresh installs use ~/.agentbridge; existing legacy/custom roots are reused.
-  const INSTALL_PS1_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1';
-  const INSTALL_SH_URL = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh';
+  const INSTALL_PS1_URL = 'https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1';
+  const INSTALL_SH_URL = 'https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh';
   function windowsInstallCommand(){
     return 'irm ' + INSTALL_PS1_URL + ' | iex';
   }

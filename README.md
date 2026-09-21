@@ -15,13 +15,20 @@ cap is a view limit, not the intended size of the managed agent inventory; a rea
 > The server is a control plane, not an AI product. It never runs models and never
 > stores model API keys. Intelligence and credentials stay on your devbox.
 
-**The user has authorized release of this current workbench.** The separate static
-design candidates are not part of the application release or the product roadmap.
-The existing Azure app remains `deepbox-webdata-du`; source repository names,
-Azure identities and installed data are not being migrated. Verify rollout through
+**Release and deployment require their own verification and approval.** Approval
+of a previous workbench release does not publish later repository changes. The
+separate static design candidates are not part of the application release or roadmap.
+The existing Azure app remains `deepbox-webdata-du`; Azure identities and installed
+data are not being migrated. Verify rollout through
 the actual deployment status and `/api/version`, not a Git push alone. See the
 [rename contract](docs/agentbridge.md) and [review record](docs/review.md).
-External repository, Azure, and domain migration remains a separate pending step.
+
+**Canonical repository:** [yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge)
+is the only upstream and production installation source. `yusx-microsoft/AgentBridge`
+is a fork, not a production source. Repository and installer branding use
+**AgentBridge**; this does not rename Azure resources, server domains, or existing
+installation data. A repository rename or a feature-branch change does not prove
+that updated installers have been published to `main`.
 
 **Naming:** **AgentBridge** is the display name. `agentbridge` remains the lowercase
 CLI/package identifier and the basis for the `AGENTBRIDGE_*` environment prefix;
@@ -113,8 +120,8 @@ See [`docs/design.md`](docs/design.md) for how the durable recording pipeline
 
 - [`docs/review.md`](docs/review.md) — Local draft review and acceptance checklist;
   previous release approval does not apply to this work.
-- [`docs/agentbridge.md`](docs/agentbridge.md) — Phased rename, environment/home
-  compatibility, and the separately approved final external rename step.
+- [`docs/agentbridge.md`](docs/agentbridge.md) — Canonical repository and installer
+  naming, environment/home compatibility, and separate cloud/data migration gates.
 - [`docs/design.md`](docs/design.md) — Technical architecture and protocol.
 - [`docs/product-design.md`](docs/product-design.md) — Product positioning, users,
   object model, core flows, and design principles.
@@ -137,17 +144,34 @@ See [`docs/design.md`](docs/design.md) for how the durable recording pipeline
 ## Connecting a machine: install once, connect anytime
 
 Installation and connection are explicit user actions, not part of reviewing this
-draft. When you choose to connect a machine, follow [`docs/install.md`](docs/install.md),
-set `AGENTBRIDGE_SERVER_URL` and `AGENTBRIDGE_TOKEN` for your chosen server, then run:
+draft. When you choose to install, use the canonical scripts:
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1 | iex
+```
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh | bash
+```
+
+See [`docs/install.md`](docs/install.md) for publication checks and
+[`SOURCE_ZIP` HTTP 404 troubleshooting](docs/install.md#source_zip-http-404).
+Fresh installs use `~/.agentbridge`. Set `AGENTBRIDGE_SERVER_URL` and
+`AGENTBRIDGE_TOKEN` for your chosen server, then run:
 
 ```text
 agentbridge connect
 ```
 
-Upgrading is explicit: `agentbridge upgrade`. Routine connects do not install or
+Upgrading is explicit: `agentbridge upgrade` for a canonical-source shim. Older
+shims keep their embedded URL; follow the [direct-installer guidance](docs/install.md#what-the-one-time-installer-does)
+if setup reports an old upgrade source. Routine connects do not install or
 download anything. Legacy `deepbox` commands and existing `.deepbox` or custom
-install roots remain supported; nothing is moved automatically. Canonical
-environment variables win by **presence**, even if empty; see the
+install roots remain supported; nothing is moved automatically. Seeing `.deepbox`
+in an existing installation's output is compatibility, not the fresh-install name.
+Canonical environment variables win by **presence**, even if empty; see the
 [exact precedence rules](docs/agentbridge.md#environment-and-home-compatibility).
 
 ## LocalProjects and user skills
@@ -209,6 +233,13 @@ all browser test suites. The [review guide](docs/review.md) describes isolated
 mock/fake-connector acceptance checks. It does not authorize installation,
 connection to a live workspace, real model CLI execution, or deployment.
 The existing checkout path remains `C:\Code\deepbox`.
+
+Use `https://github.com/yusx-swapp/AgentBridge.git` for new clones. In an existing
+checkout, `upstream` must point to that canonical repository; a fork may remain
+`origin`. Fetch `upstream`, create a feature branch from `upstream/main`, and open
+the PR against **yusx-swapp/AgentBridge:main**. Do not develop directly on `main` or
+treat a fork's `main` as production upstream. The repository rename does not move
+the running worktree, merge a PR, or deploy an application.
 
 ## Web UI keyboard shortcuts
 

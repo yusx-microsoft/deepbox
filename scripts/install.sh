@@ -7,7 +7,7 @@
 # calls never download or replace installed files.
 #
 # Run once:
-#     curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash
+#     curl -fsSL https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh | bash
 #
 # Then set AGENTBRIDGE_SERVER_URL and AGENTBRIDGE_TOKEN and run:
 #     agentbridge connect
@@ -41,8 +41,8 @@ select_install_root() {
 }
 
 # --- Config ----------------------------------------------------------------
-# The public mirror remains deepbox; repository/domain migrations need approval.
-SOURCE_ZIP="$(product_env SOURCE_ZIP 'https://github.com/deeporc-ai/deepbox/archive/refs/heads/main.zip')"
+# Canonical public repository; forks are never the default install/upgrade source.
+SOURCE_ZIP="$(product_env SOURCE_ZIP 'https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip')"
 ROOT="$(select_install_root "$HOME")"
 [ -n "$SOURCE_ZIP" ] || { warn 'The selected SOURCE_ZIP setting is empty.'; exit 1; }
 [ -n "$ROOT" ] || { warn 'The selected HOME setting is empty; set AGENTBRIDGE_HOME or unset it.'; exit 1; }
@@ -157,7 +157,7 @@ export DEEPBOX_HOME="$ROOT"
 if [ "${1:-}" = "upgrade" ]; then
   export AGENTBRIDGE_INSTALL_ONLY=1
   export DEEPBOX_INSTALL_ONLY=1
-  URL="https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh"
+  URL="https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$URL" | bash
   elif command -v wget >/dev/null 2>&1; then
@@ -178,6 +178,9 @@ EOF
 elif ! grep -Fq 'agentbridge-stable-shim-v1' "$COMMAND"; then
   warn "Refusing to replace an unrecognized command at ${COMMAND}."
   exit 1
+elif ! grep -Fq 'https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh' "$COMMAND"; then
+  warn "The existing stable command keeps its original upgrade source; it was not rewritten."
+  warn "For future upgrades, run the canonical installer directly: curl -fsSL https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh | bash"
 fi
 chmod +x "$COMMAND"
 ok "Command installed: ${COMMAND}"

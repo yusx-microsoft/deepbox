@@ -302,7 +302,7 @@ test('compact token dialog scopes OS and Copy, keeps installer collapsed and nev
   assert.match(code.textContent, /\$env:AGENTBRIDGE_TOKEN = "test-machine-secret"/);
   assert.match(code.textContent, /agentbridge connect/); assert.doesNotMatch(code.textContent, /install|github/);
   assert.equal(root.querySelector('details').hasAttribute('open'), false);
-  assert.match(install.textContent, /githubusercontent\.com\/yusx-microsoft\/deepbox\/main\/scripts\/install\.ps1/);
+  assert.match(install.textContent, /githubusercontent\.com\/yusx-swapp\/AgentBridge\/main\/scripts\/install\.ps1/);
   assert.equal(root.querySelectorAll('[data-connect-code]').length, 1); assert.equal(h.copied.length, 0);
   copy.click(); await flush(); assert.equal(h.copied[0], code.textContent);
   change(os, 'unix'); assert.match(code.textContent, /export AGENTBRIDGE_TOKEN=/); assert.match(install.textContent, /install\.sh/);

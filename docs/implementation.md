@@ -16,7 +16,13 @@ Integration results belong in the [review record](review.md).
 FastAPI title. `NAME = "agentbridge"` remains the lowercase CLI/package and
 service/logger identifier, with `AGENTBRIDGE_*` environment keys. `LEGACY_NAME`
 and auth/cookie/hash/IPC/storage identities remain unchanged. This is not a migration.
-External repository, Azure, and domain changes still need separate approval.
+The canonical repository and production installation source is
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge);
+`yusx-microsoft/AgentBridge` is only a fork. Develop on feature branches from
+canonical `upstream/main` and target PRs there, never directly on `main`.
+Repository/installer branding does not migrate Azure resources/domains, Entra
+identities, installed data or the `C:\Code\deepbox` worktree. See
+[the rename contract](agentbridge.md) for publication and compatibility boundaries.
 
 ## 1. Architecture at a glance
 
@@ -40,6 +46,8 @@ Three cooperating parts:
 `agentbridge/product.py` centralizes product naming, `AGENTBRIDGE_*`/`DEEPBOX_*`
 lookup, and install-home compatibility. Canonical variables win by presence,
 including explicit empties; existing `.deepbox` and custom roots are not moved.
+Fresh installs use `~/.agentbridge`; `.deepbox` in existing-install output is
+compatibility, not the fresh-install name.
 See [the exact compatibility contract](agentbridge.md#environment-and-home-compatibility).
 This is not a server micro-framework rewrite: the FastAPI routes, Hub, leases,
 durability pipeline, and provider registry remain.
@@ -235,7 +243,7 @@ exception/stderr text; no replacement session is created.
 - **`skills.py`** — parses `SKILL.md` frontmatter, validates the tree
   (regular files only; no traversal/symlink; 256 files / 10 MiB caps), and does
   atomic staged install/rollback/drift/GC. Scripts are surfaced
-  (`contains_scripts=true`) but never executed by DeepBox.
+  (`contains_scripts=true`) but never executed by AgentBridge.
 - **`diagnostics.py`** — shared server URL validation and `run_doctor()`
   URL/TLS/DNS/protocol checks. Unknown connection failures expose the exception
   class, not raw exception text that may contain URLs or credentials.
@@ -370,18 +378,23 @@ checks the database and recording data directory). See
 Server, connector, security, and persistence suites live in `tests/` and run with
 pytest; pure helpers and actual app orchestration run with `node --test`.
 
-```bat
-:: Python suites
-cd /d C:\Code\deepbox && .venv\Scripts\python -m pytest -q
-:: A single suite
-cd /d C:\Code\deepbox && .venv\Scripts\python -m pytest tests\test_server_recording.py -q
+**Do not run Python tests from the working checkout with default configuration.**
+Importing the server initializes SQLite before fixtures can replace it. Launch a
+disposable subprocess with a temporary cwd, database, data directory, HOME and
+user-state roots; clear inherited `AGENTBRIDGE_*`/`DEEPBOX_*` settings and disable
+dotenv before importing the app. Set both database/data aliases to those isolated
+paths, put the checkout on `PYTHONPATH`, and pass an absolute test path to pytest
+(`C:\Code\deepbox\tests`, or a selected test file). Disable bytecode/cache writes;
+if plugin autoload is disabled, explicitly load `pytest_asyncio.plugin` for the
+async integration tests. Install the connector/test dependencies, including
+`cryptography` and `pytest-asyncio`, in the intended test environment. Verify the
+original database and sidecar hashes have not changed; remove only owned test data.
 
-:: Browser (node:test) suites
-cd /d C:\Code\deepbox && node --test web/*.test.js
+```bat
+:: All browser suites, including runtime integration subdirectories
+cd /d C:\Code\deepbox && cd web && node --test
 ```
 
-The installed Node supports this glob in CMD. On older versions, enumerate all
-`web/*.test.js` files, including tmux, pane, dialog and workbench tests, explicitly.
 Use isolated fixtures, not live setup or real model agents. Final integrated
 evidence and user acceptance for this polish pass remain pending in [`review.md`](review.md);
 the earlier tmux iteration's counts are historical, not validation for this pass.

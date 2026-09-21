@@ -1,13 +1,18 @@
 # Session Persistence
 
-This document describes how DeepBox keeps agent sessions alive across disconnects,
+This document describes how AgentBridge keeps agent sessions alive across disconnects,
 how it records them for replay, and where every piece of state actually lives.
 It reflects the current implementation; see
 [`implementation.md`](implementation.md) for the wider architecture.
 
+The repository/installer rename does not rename state, authentication, database,
+spool or IPC identifiers. Fresh installation homes use `~/.agentbridge`; existing
+`.deepbox` installations are reused for compatibility without automatic migration.
+See [the repository/installation contract](agentbridge.md).
+
 ## 1. What persistence buys us
 
-A local terminal session dies with its window. DeepBox separates the session's
+A local terminal session dies with its window. AgentBridge separates the session's
 *execution*, its *durable record*, and its *viewers* so that:
 
 - The agent process lives on the connector (the user's own machine) and keeps

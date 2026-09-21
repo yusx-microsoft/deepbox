@@ -1,24 +1,29 @@
-# Install once, connect anytime
+# Install AgentBridge once, connect anytime
 
-Install agentbridge once as a local command. Daily connections use `agentbridge connect`;
+Install AgentBridge once as the local `agentbridge` command. Daily connections use `agentbridge connect`;
 they do **not** download code, rebuild the virtualenv, or replace
 `<install-root>/app`. The old `deepbox` command remains supported.
 
 For the optional local DeepOrca library runtime, see [DeepOrca integration](deeporca.md).
 
-**Local-review phase:** these are instructions for a later, explicitly authorized
-installation, not actions performed by the rename review. No machine needs to be
-re-enrolled and no credential or state migration is required. Publishing scripts,
-upgrading machines, and deploying Azure are separate approval gates.
+**Canonical source:** [yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge)
+is the only upstream and production installation source. `yusx-microsoft/AgentBridge`
+is a fork, not a production source or required mirror. The commands below use the
+canonical repository's `main`; a feature-branch edit or GitHub rename alone does
+not publish updated scripts there. See [publication checks](#hosting-the-installer-scripts).
+
+Installation and upgrades are explicit user actions, not actions performed by
+reading or reviewing this guide. No machine needs to be re-enrolled and no
+credential or state migration is required. Cloud deployment is separate.
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1 | iex
 ```
 
 ```bash
 # macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh | bash
 ```
 
 The Windows installer makes `agentbridge` and its `deepbox` alias available in the current PowerShell
@@ -60,7 +65,7 @@ their canonical counterparts are absent.
 ## What the one-time installer does
 
 1. Finds a Python 3.10+ interpreter (and prints install guidance if missing).
-2. Downloads the source ZIP from the public `deeporc-ai/deepbox` mirror,
+2. Downloads `https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip`,
    anonymously and without Git credentials. It validates and copies **both**
    `agentbridge/` (the entrypoint/configuration boundary) and `connector/`.
    An archive without either package or the entrypoint is rejected before the
@@ -69,8 +74,8 @@ their canonical counterparts are absent.
    this installation's virtualenv and stops their connector-owned process trees
    before replacing the source directory.
 4. Refreshes `<install-root>/app`, creates or reuses `<install-root>/venv`, installs
-   the connector dependencies (`httpx`, `websockets`, and `pywinpty` on
-   Windows), and records the app location in the venv's `deepbox-app.pth`.
+   the connector dependencies (`httpx`, `websockets`, `cryptography`, and
+   `pywinpty` on Windows), and records the app location in the venv's `deepbox-app.pth`.
 5. Installs a stable command at `<install-root>/bin/agentbridge.cmd` on Windows or
    `<install-root>/bin/agentbridge` on macOS/Linux. The shim starts `python -I -u -m agentbridge`,
    so the caller's working directory and `PYTHONPATH` cannot replace the
@@ -86,6 +91,15 @@ If both selected `SERVER_URL` and `TOKEN` settings are already set, the installe
 runs diagnostics and connects after setup. Otherwise it installs only and tells
 the user to run `agentbridge connect`. Set `AGENTBRIDGE_INSTALL_ONLY=1` to prevent
 automatic diagnostics/connection; explicit `agentbridge upgrade` always sets it.
+
+Existing recognized **AgentBridge** shims are also left byte-for-byte intact;
+an executing Windows batch file must not be rewritten underneath its caller.
+If one still embeds an earlier upgrade URL, setup warns and prints the canonical
+installer command. Reinstalling refreshes the app, **not that old embedded URL**.
+Use the canonical installer directly for subsequent upgrades of that installation
+(with its HOME selected and `AGENTBRIDGE_INSTALL_ONLY=1`), rather than relying on
+the old shim's `upgrade` subcommand. Fresh shims embed the canonical URL. No
+automatic shim, identity, state or home migration is attempted.
 
 ### Installation roots and configuration compatibility
 
@@ -113,12 +127,77 @@ prints guidance to invoke the installed command by absolute path.
 Nothing copies, moves or deletes credentials, machine identity, local databases,
 project registrations or spools. Independent legacy state paths below remain intact.
 
+**Fresh installation name: `~/.agentbridge`.** If setup or an existing command
+prints `~/.deepbox`, it is reusing a compatible existing installation (or an
+explicitly selected root), not choosing the old name for a fresh install. Legacy
+state/DB/spool paths can still contain `deepbox` even with a fresh canonical
+install home; those independent compatibility identifiers are not renamed.
+
 All product configuration uses one presence-based compatibility boundary:
 `AGENTBRIDGE_<name>` wins over `DEEPBOX_<name>`, including an **explicitly empty**
 canonical value. An empty canonical token must never revive a legacy token.
-`AGENTBRIDGE_SOURCE_ZIP` (legacy `DEEPBOX_SOURCE_ZIP`) selects a fork, pinned
-branch or commit; the selected archive must contain both packages. Neither
-environment prefix implies a GitHub repository or Azure resource rename.
+`AGENTBRIDGE_SOURCE_ZIP` (legacy `DEEPBOX_SOURCE_ZIP`) selects a reviewed archive,
+such as a pinned canonical branch or commit; it must contain both packages. An override
+is an explicit trust decision, not a production fallback to a fork. The approved
+repository/installer naming is separate from Azure resources, authentication,
+state and the existing `C:\Code\deepbox` worktree, which remain unchanged.
+
+### SOURCE_ZIP HTTP 404
+
+The installer script and the connector source ZIP are separate downloads. A
+`SOURCE_ZIP` HTTP 404 means the selected **archive** is missing or inaccessible
+anonymously; it does not mean Python is missing or the installation directory has
+the wrong name. A private repository can also return 404 without authentication.
+
+1. Confirm the canonical repository is reachable and its published `main`
+   contains both `agentbridge/` and `connector/`. The default archive is
+   `https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip`.
+   A local branch, unmerged PR, or a rename alone is not publication evidence.
+2. Check whether `AGENTBRIDGE_SOURCE_ZIP` or `DEEPBOX_SOURCE_ZIP` is set in the
+   shell running setup. A stale override can still select an old repository or
+   deleted branch. The canonical variable wins **by presence**; setting it to an
+   empty string is an error, not a reset. Remove unwanted overrides instead:
+
+   ```powershell
+   Remove-Item Env:AGENTBRIDGE_SOURCE_ZIP, Env:DEEPBOX_SOURCE_ZIP -ErrorAction SilentlyContinue
+   ```
+
+   ```bash
+   unset AGENTBRIDGE_SOURCE_ZIP DEEPBOX_SOURCE_ZIP
+   ```
+
+   Also remove any unwanted persistent/profile setting so a new shell does not
+   restore it. Do not delete `.deepbox`, move state, or rotate a token to fix 404.
+3. Use the canonical installer URL at the top of this guide. An old downloaded
+   script or installed upgrade shim may still request an old URL. If necessary,
+   explicitly rerun the canonical installer with `AGENTBRIDGE_HOME` set to the
+   existing installation and `AGENTBRIDGE_INSTALL_ONLY=1`; schedule this like any
+   upgrade because it can stop that installation's Windows connector.
+4. If the **raw script itself** returns 404, a `SOURCE_ZIP` override cannot fix
+   that earlier download. Verify repository access, the `main` ref and the script
+   path, and wait for verified publication rather than switching to a fork.
+
+**Optional reviewed archive override:** for an explicitly requested pinned build,
+replace `<reviewed-commit-sha>` with an actual commit in the canonical repository:
+
+```powershell
+$env:AGENTBRIDGE_SOURCE_ZIP = 'https://github.com/yusx-swapp/AgentBridge/archive/<reviewed-commit-sha>.zip'
+$env:AGENTBRIDGE_INSTALL_ONLY = '1'
+# Then run the canonical PowerShell installer above when ready to install/upgrade.
+```
+
+```bash
+export AGENTBRIDGE_SOURCE_ZIP='https://github.com/yusx-swapp/AgentBridge/archive/<reviewed-commit-sha>.zip'
+export AGENTBRIDGE_INSTALL_ONLY=1
+# Then run the canonical shell installer above when ready to install/upgrade.
+```
+
+Export the Unix variable before the pipeline so the installer, not only `curl`,
+inherits it. The override changes the payload only, not the script URL, installed
+identity or future default source; it applies only where that environment is set.
+Remove it after the intended use. An explicitly selected development fork is not
+an alternate production upstream; never silently fall back to
+`yusx-microsoft/AgentBridge`. Do not put credentials into download URLs.
 
 ## Reconnect and local commands
 
@@ -315,32 +394,37 @@ If a separate shell has manually changed its working directory to
 The browser and examples use these anonymous GitHub Raw endpoints on `main`:
 
 ```text
-https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1
-https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh
+https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1
+https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh
 ```
 
-**Deliberate external boundary:** the source repository is still
-`yusx-microsoft/deepbox`, with the `deeporc-ai/deepbox` public mirror. There is no
-assumed `agentbridge` repository or new domain. These URLs, Azure resources,
-existing server hostnames and authentication callbacks stay unchanged until a
-separately approved migration.
+The source archive, raw scripts, browser commands and upgrade URLs must all refer
+to **yusx-swapp/AgentBridge**, not a mirror or fork. Keep the reviewed packages,
+scripts and entrypoint in sync; there is no separate Blob upload step. Repository
+branding does not rename `deepbox-webdata-du`, other Azure resources, server
+hostnames, Entra callbacks, the local worktree, or installed data.
 
-Publishing is **not** part of the local rename/review phase. After explicit
-approval, publish the same reviewed packages and both installer scripts to the
-public mirror; there is no separate Blob upload step. Keep the UI command,
-downloaded source and entrypoint in sync. Do not stage, commit, push or deploy as
-part of merely reviewing the rename.
+Develop on feature branches based on canonical `upstream/main`; submit PRs to
+**yusx-swapp/AgentBridge:main**, never develop directly on `main`. Only changes
+actually merged and published there can be fetched by these default URLs. This
+guide does not assert that the GitHub rename, a PR merge, script publication or
+cloud deployment has been verified.
 
-Only after publishing is approved, verify both endpoints anonymously (network
-checks are not part of the local review):
+Before recommending the one-liners, verify the canonical repository, both raw
+scripts and the source ZIP anonymously. Check returned content, not only status,
+to ensure the scripts select the canonical archive and it contains both packages:
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | Select-Object StatusCode
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1 | Select-Object StatusCode
 ```
 
 ```bash
-curl -I https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh
+curl -I https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh
+curl -IL https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip
 ```
 
-Both should return HTTP `200`. GitHub Raw may cache briefly after a push; pin a
-commit SHA in the URL when an immutable installer is required.
+The scripts and the ZIP's final response should return HTTP `200`; an archive
+redirect is normal. GitHub Raw may cache briefly after a push. For an immutable
+install, pin a reviewed commit in both the raw-script URL and `SOURCE_ZIP`; pinning
+only the script does not pin its default `main` payload. Do not run an installer
+merely to check publication, and do not claim rollout from a repository rename.

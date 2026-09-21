@@ -5,11 +5,16 @@
 The user has explicitly authorized deploying this current AgentBridge workbench
 to the existing Azure app `deepbox-webdata-du`. This authorization is for the
 implemented workbench, not for any of the 100 separate static design candidates
-and not for external repository, resource or domain migration. Actual rollout
-must be verified through deployment status, readiness, version and source bytes.
+and not for Azure resource or domain migration. Repository and installer branding
+follow the separately requested canonical
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge);
+`yusx-microsoft/AgentBridge` is only a fork. Actual repository/installer publication
+must be verified separately from deployment status, readiness, version and source
+bytes. Develop on feature branches from canonical `upstream/main`; target PRs to
+**yusx-swapp/AgentBridge:main**, with no direct-main development.
 
 The completed `1fab322` maintenance release is historical context. Its
-[review is preserved at that revision](https://github.com/yusx-microsoft/deepbox/blob/1fab322/docs/review.md);
+[review is preserved at that revision](https://github.com/yusx-swapp/AgentBridge/blob/1fab322/docs/review.md);
 do not apply its pass counts to this redesign. [Planning](planning.md#3-validation-status)
 separates the baseline from current work. Deployment does not authorize setting up,
 connecting or upgrading real user machines or agents during validation.
@@ -141,8 +146,11 @@ acceptance before deciding whether to publish or release. On-hardware supervisor
 soak, network-churn collaboration, and production rollout checks remain separate
 manual work; old simulation or release results do not certify this cut.
 
-**Final external rename is a separate approval step:** the existing GitHub repo
-URLs, `C:\Code\deepbox` path, Azure resource/domain, Entra callbacks, and installed
-data/identities are deliberately unchanged. See the [migration gates](agentbridge.md#migration-gates)
-for the required continuity/rollback plan. Local UI/name acceptance does not
-authorize repository/resource/domain migration, deployment, or live setup.
+Repository and installer branding follow the canonical AgentBridge URLs in
+[the rename contract](agentbridge.md). A feature branch or repository rename does
+not establish that those scripts and packages have reached upstream `main`; use
+the [publication checklist](install.md#hosting-the-installer-scripts). The
+`C:\Code\deepbox` worktree, Azure resources/domains, Entra callbacks and installed
+data/identities remain unchanged. Any future cloud/domain or identity/data
+migration requires a separate continuity/rollback plan and approval. Install or
+upgrade is an explicit user action, not part of review.

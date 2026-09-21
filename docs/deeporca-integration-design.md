@@ -1,10 +1,18 @@
-# DeepOrca Library Integration for DeepBox
+# DeepOrca Library Integration for AgentBridge
 
-**Status:** v1 implemented on `feat/deeporca-library-integration` (DeepBox) and `feat/deepbox-library-host` (DeepOrca). This is the architectural design, not a production deployment claim. See [operational setup](deeporca.md) and the implementation reconciliation below.
+**Status:** v1 implemented on `feat/deeporca-library-integration` (AgentBridge) and `feat/deepbox-library-host` (DeepOrca). This is the architectural design, not a production deployment claim. See [operational setup](deeporca.md) and the implementation reconciliation below.
 
 **Scope decision:** Interactive tool approval is **not implemented in v1**. This includes approval prompts, approval buttons, approval request/response transport, and approval waiting states for the DeepOrca backend. Existing approval behavior for other runtimes is unchanged.
 
-**Naming:** This document uses **DeepBox** for the host product and repository. The current command-line package and user-facing commands use **`agentbridge`**; the integration does not introduce another rename.
+**Naming:** The host product and canonical repository are **AgentBridge**, with
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge) as the only upstream
+and production installation source; `yusx-microsoft/AgentBridge` is only a fork.
+The CLI/package is **`agentbridge`** and fresh installs use `~/.agentbridge`.
+Existing `.deepbox` installations and state/auth/DB/IPC identifiers remain compatible,
+without automatic migration; the current worktree stays `C:\Code\deepbox`.
+Historical branch names, commit IDs and validation artifact filenames below are
+unchanged. See [the repository/installation contract](agentbridge.md) for canonical
+installer URLs, upstream feature-branch PR workflow and publication checks.
 
 **Configuration extension:** [Web profile configuration](deeporca.md#web-profile-configuration)
 supersedes the original template-only onboarding sections below. Add Agent and
@@ -14,7 +22,7 @@ on the Server. Plaintext credentials and native configuration writes remain on
 the Connector. Profile/project/template identity stays immutable; LLM settings
 have separately revisioned, idle-only updates.
 
-**Reviewed baseline:** DeepBox `50699fa` and DeepOrca `dd6670d`, including the local working trees. The baseline analysis and examples explicitly marked *proposed* describe the design phase; the implementation map below identifies the shipped branch interfaces.
+**Reviewed baseline:** AgentBridge `50699fa` and DeepOrca `dd6670d`, including the local working trees. The baseline analysis and examples explicitly marked *proposed* describe the design phase; the implementation map below identifies the shipped branch interfaces.
 
 ### Implementation reconciliation
 
@@ -43,17 +51,17 @@ visual evidence. It preserves the v1 wire, persistence and security boundaries.
 
 ## 1. Summary
 
-Run DeepOrca as a Python library on the user's Connector machine. Keep DeepBox responsible for identity, workspaces, machine enrollment, session routing, durable display events, and browser delivery. Render DeepOrca conversations inside the existing DeepBox workspace rather than embedding a second web application.
+Run DeepOrca as a Python library on the user's Connector machine. Keep AgentBridge responsible for identity, workspaces, machine enrollment, session routing, durable display events, and browser delivery. Render DeepOrca conversations inside the existing AgentBridge workspace rather than embedding a second web application.
 
 The main integration components are:
 
 1. A **DeepOrca runtime capability** advertised by the Connector.
 2. An extension to **Add agent** for managed creation or explicitly paused native-profile binding.
 3. A Connector-side **library session backend**, using an isolated Python worker.
-4. An **event adapter** that preserves DeepOrca semantics within DeepBox's existing structured output channel.
-5. An embeddable **DeepOrca-style chat renderer**, driven by the existing DeepBox transport.
+4. An **event adapter** that preserves DeepOrca semantics within AgentBridge's existing structured output channel.
+5. An embeddable **DeepOrca-style chat renderer**, driven by the existing AgentBridge transport.
 
-The implementation must not invoke the DeepOrca CLI to run conversations, require a DeepOrca WebServer, place model credentials on the DeepBox Server, or reinterpret a display transcript as native model context.
+The implementation must not invoke the DeepOrca CLI to run conversations, require a DeepOrca WebServer, place model credentials on the AgentBridge Server, or reinterpret a display transcript as native model context.
 
 ### 1.1 Decisions at a glance
 
@@ -70,7 +78,7 @@ The implementation must not invoke the DeepOrca CLI to run conversations, requir
 | Interactive approval | Out of scope; approval-required calls fail immediately |
 | Concurrency | One active human turn per Agent worker in v1; other sessions may be viewed concurrently |
 | Browser disconnect | Detach the viewer; do not automatically cancel or resubmit the turn |
-| Display recovery | DeepBox event log |
+| Display recovery | AgentBridge event log |
 | Model context recovery | DeepOrca `SessionManager` |
 | Installation | Explicit local setup; creating an Agent never installs packages automatically |
 
@@ -78,9 +86,9 @@ The implementation must not invoke the DeepOrca CLI to run conversations, requir
 
 ### Goals
 
-- Let a user create a usable DeepOrca Agent from the existing DeepBox management flow.
+- Let a user create a usable DeepOrca Agent from the existing AgentBridge management flow.
 - Support persistent conversations, streamed text, exposed thinking/status events, local tools, and locally configured skills and memory.
-- Preserve DeepBox's workspace and session authorization rules.
+- Preserve AgentBridge's workspace and session authorization rules.
 - Support stop/cancel, page refresh, viewer reattachment, and Connector transport reconnect.
 - Make runtime readiness, policy refusals, and initialization failures understandable.
 - Reuse DeepOrca's chat appearance and interactions without importing its page-level networking or global state.
@@ -99,13 +107,13 @@ The implementation must not invoke the DeepOrca CLI to run conversations, requir
 
 ## 3. Existing capabilities and gaps
 
-### 3.1 DeepBox
+### 3.1 AgentBridge
 
 The current path is:
 
 ```text
 Browser
-  → DeepBox Server
+  → AgentBridge Server
   → Connector transport
   → Supervisor
   → PTY or StructuredAgentSession
@@ -200,7 +208,7 @@ mode, preserves configuration and does not import old native chats.
 
 - Generate an internal profile identifier from the binding identity, not the editable display name.
 - Initialize separate persona, memory, skills, configuration, and native chat storage.
-- Apply a locally registered configuration template. A template may reference local secrets; its contents and secrets do not pass through DeepBox.
+- Apply a locally registered configuration template. A template may reference local secrets; its contents and secrets do not pass through AgentBridge.
 - If no usable template is available, create the profile in `needs_configuration` and explain the local setup step.
 
 **Bind existing** is explicit:
@@ -237,12 +245,12 @@ Creating another conversation creates a native **session**, not another Agent pr
 ## 5. Architecture and responsibility boundaries
 
 ```text
-DeepBox browser
+AgentBridge browser
   Management UI       DeepOrcaChatRenderer
        │                 │ input / interrupt
        └────────┬────────┘
                 ▼
-DeepBox Server
+AgentBridge Server
   Authorization · Agent desired state · Session routing · Event recording
                 │ existing authenticated Connector connection
                 ▼
@@ -358,7 +366,7 @@ Duplicate directory delivery must not create duplicate profiles or overwrite an 
 
 Provisioning should be retryable. A partial initialization must not be mistaken for a ready profile. Extract a public initializer from `_create_agent()` that reports typed results, validates names, writes a completion marker last, and never overwrites an unrelated directory. Do not call the CLI's private exit-based function from the Supervisor.
 
-Changing project/profile identity is not a casual in-place edit in v1; create a new binding or explicitly retire the old one first. Deleting the DeepBox Agent stops its worker and removes its binding projection, but does **not** silently delete native persona, memory, or chat files. Destructive native cleanup is a separate explicit operation.
+Changing project/profile identity is not a casual in-place edit in v1; create a new binding or explicitly retire the old one first. Deleting the AgentBridge Agent stops its worker and removes its binding projection, but does **not** silently delete native persona, memory, or chat files. Destructive native cleanup is a separate explicit operation.
 
 ## 7. Runtime initialization and turn execution
 
@@ -478,7 +486,7 @@ Do not:
 - Emit an approval request and then ignore it or wait for its timeout.
 - Assume that returning `false` from a callback prevents an already-emitted approval event.
 - Advertise interactive approval capability or render DeepOrca approval controls.
-- Remove or change existing CLI-runtime approval behavior in DeepBox.
+- Remove or change existing CLI-runtime approval behavior in AgentBridge.
 
 Any unexpected approval request reaching the DeepOrca sink is an integration-contract failure. Fail the affected operation promptly and surface a diagnostic instead of leaving a turn stuck in a waiting state. Tests must prove that the normal `REVIEW` path never reaches this fallback.
 
@@ -506,13 +514,13 @@ Example **proposed** payload inside the existing output envelope:
 }
 ```
 
-Agent/session/stream identity remains in the authoritative outer envelope. Turn-local sequence numbers do not replace DeepBox output sequence numbers or byte offsets. Assign stable event identity so duplicate delivery can be ignored.
+Agent/session/stream identity remains in the authoritative outer envelope. Turn-local sequence numbers do not replace AgentBridge output sequence numbers or byte offsets. Assign stable event identity so duplicate delivery can be ignored.
 
 The canonical projection supports a basic generic renderer; the native extension preserves richer DeepOrca behavior. Emit one durable record per display event, not two independent events that can duplicate visible text.
 
 ### 9.2 Mapping
 
-| DeepOrca source | DeepBox projection |
+| DeepOrca source | AgentBridge projection |
 | --- | --- |
 | Accepted human input | `user.echo`, correlated by `client_input_id` |
 | `TextEvent` / wire `text.content` | `message.delta`; content is incremental, not the full final answer |
@@ -545,10 +553,10 @@ Proposed execution journal states are `accepted`, `running`, and `settled`, with
 
 | Store | Owner | Purpose |
 | --- | --- | --- |
-| Event spool and recorded structured output | DeepBox transport/Server | Rebuild the user's display and resume output delivery |
+| Event spool and recorded structured output | AgentBridge transport/Server | Rebuild the user's display and resume output delivery |
 | Native sessions, persona, memory, compaction-related state | DeepOrca on Connector | Continue model execution with the correct native context |
 
-Use a stable native `SessionRef` per DeepBox conversation within the bound profile. Persist that mapping; do not generate a new native session just because a viewer reloads or the Connector reconnects.
+Use a stable native `SessionRef` per AgentBridge conversation within the bound profile. Persist that mapping; do not generate a new native session just because a viewer reloads or the Connector reconnects.
 
 If the display log exists but native context is missing, show a context-unavailable state. Do not synthesize model history from rendered bubbles. Conversely, a missing display log must not cause native tool execution to repeat.
 
@@ -563,7 +571,7 @@ Server retention settings and native profile retention are separate. A "no recor
 - On storage failure or exhausted spool capacity, stop accepting turns and settle/cancel affected work explicitly rather than continuing with unrecorded "successful" output.
 - Browser reconnect must use output cursors and the same reducer as live delivery; it must not resubmit user input.
 
-## 10. DeepOrca-style rendering in DeepBox
+## 10. DeepOrca-style rendering in AgentBridge
 
 ### 10.1 Extract a view, not a page
 
@@ -586,11 +594,11 @@ view.setAccess({ canSend, canInterrupt, readOnly });
 view.destroy();
 ```
 
-There is no `approve` callback in v1. File resolution/upload can be added later through authenticated DeepBox capabilities, not raw local URLs.
+There is no `approve` callback in v1. File resolution/upload can be added later through authenticated AgentBridge capabilities, not raw local URLs.
 
 ### 10.2 Presentation scope
 
-Retain the DeepBox workspace, machine/Agent tree, pane tabs, connection state, role boundaries, and session management. Replace only the conversation interior with DeepOrca-style elements:
+Retain the AgentBridge workspace, machine/Agent tree, pane tabs, connection state, role boundaries, and session management. Replace only the conversation interior with DeepOrca-style elements:
 
 - User and assistant messages.
 - Streaming Markdown and code blocks, with safe rendering and copy actions.
@@ -629,7 +637,7 @@ The old prototype's "all simulated" labeling remains necessary until its mock tr
 
 ## 12. Implementation work breakdown
 
-### DeepBox changes
+### AgentBridge changes
 
 | Area | Change |
 | --- | --- |
@@ -652,7 +660,7 @@ The old prototype's "all simulated" labeling remains necessary until its mock tr
 - Add a cooperative profile-ownership lock for supported embedded and standalone entry points before enabling existing-profile binding.
 - Preserve stable tool invocation/parent identity and structured failure classification through native events and typed translation; do not infer tool identity or security outcomes by parsing human-readable result text.
 - Define orderly close and task ownership for the embedded runtime; do not assume a single MCP close call settles all resources.
-- If a reusable frontend package is introduced, have the original WebUI and DeepBox consume the same network-independent conversation components.
+- If a reusable frontend package is introduced, have the original WebUI and AgentBridge consume the same network-independent conversation components.
 
 DeepOrca remains optional for a Connector that only runs other runtimes. A missing package must disable/report that runtime, not prevent the Connector or unrelated agents from starting. Pin and test a supported package/adapter combination; do not automatically install the latest version during Agent creation.
 
@@ -729,7 +737,7 @@ Interactive approval is **not a hidden dependency or an automatic next milestone
 
 ## 15. Source references
 
-DeepBox paths are relative to this repository:
+AgentBridge paths are relative to this repository:
 
 - [Agent management UI](../web/management.js)
 - [Agent creation, authorization and session forwarding](../server/app/main.py)
@@ -964,7 +972,7 @@ not a claim that the removed opt-in machinery is still present.
 
 ### Existing-profile binding and minimal-security extension (preceding round)
 
-This extends DeepBox `8da1462` plus the preceding configuration work, and native
+This extends AgentBridge `8da1462` plus the preceding configuration work, and native
 SDK `3978d2f` plus the narrow new-profile security-default opt-in. These changes
 are uncommitted. See [existing-profile operations](deeporca.md#existing-profile-binding).
 Fixture screenshots are local-only artifacts, not committed files.
@@ -974,8 +982,8 @@ Evidence directory:
 
 | Group | Result | Artifact / scope |
 |---|---:|---|
-| Complete DeepBox suite before final startup-retirement hardening | **1112 passed, 13 skipped, 20 subtests passed** | `deepbox-release.xml`; 548.65s |
-| Complete DeepBox suite including final hardening | **1113 passed, 1 failed, 13 skipped, 20 subtests passed** | `deepbox-final.xml`; 583.46s; Windows PTY reader-shutdown failure described below |
+| Complete AgentBridge suite before final startup-retirement hardening | **1112 passed, 13 skipped, 20 subtests passed** | `deepbox-release.xml`; 548.65s |
+| Complete AgentBridge suite including final hardening | **1113 passed, 1 failed, 13 skipped, 20 subtests passed** | `deepbox-final.xml`; 583.46s; Windows PTY reader-shutdown failure described below |
 | PTY file and repeated failing case | **10 passed, 1 skipped**, then **1 passed** | `pty-confirm.xml`, `pty-reader-confirm.xml`; 20.88s / 3.50s |
 | Actual SDK / Server–Connector E2E / existing binding / supervisor | **52 passed, 1 skipped** | `sdk-e2e-final.xml`; 182.48s; real SDK, disposable profiles and scripted loopback provider |
 | Native focused regression | **597 passed, 6 skipped** | `native.xml`; 90.26s; existing mode, security default, configuration, turn/tool/security suites |
@@ -1008,7 +1016,7 @@ or prove provider authentication outside the scripted provider.
 Authoritative directory reconciliation retires offline-deleted Agent reservations
 only in the current enrollment. Startup/provisioning workers remain owned through
 cancellation, and an unconfirmed exit retains the worker and reservation. New
-DeepBox-managed profiles use real native minimal policy, not merely a YAML label;
+AgentBridge-managed profiles use real native minimal policy, not merely a YAML label;
 trusted template levels win, retries/older/bound profiles are not migrated, and
 final review/denial plus unsupported autonomous-tool restrictions remain intact.
 
@@ -1018,7 +1026,7 @@ contacted, and this extension did not restart the preview Server or Connector.
 
 ### Web profile configuration extension (preceding round)
 
-This extends DeepBox `8da1462` (the squash of the original three integration
+This extends AgentBridge `8da1462` (the squash of the original three integration
 commits) and native SDK `9206c0b`; it does not change their historical results
 below. Scope: [complete browser profile setup/editing](deeporca.md#web-profile-configuration),
 DeepOrca-only fields, sealed keys, authorized idle-only updates, profile
@@ -1029,7 +1037,7 @@ Evidence directory:
 
 | Final group | Result | Artifact / scope |
 |---|---:|---|
-| Complete DeepBox Python suite | **1058 passed, 11 skipped, 20 subtests passed** | `deepbox-release.xml`; 379.42s, Chromium cache located outside isolated LOCALAPPDATA; six SDK opt-ins separately executed, three POSIX guards, two unavailable symlink privileges |
+| Complete AgentBridge Python suite | **1058 passed, 11 skipped, 20 subtests passed** | `deepbox-release.xml`; 379.42s, Chromium cache located outside isolated LOCALAPPDATA; six SDK opt-ins separately executed, three POSIX guards, two unavailable symlink privileges |
 | SDK integration + Server/Connector E2E + configuration/lifecycle | **51 passed, 1 skipped** | `sdk-e2e-final.xml`; all six SDK opt-in scenarios executed; skip is unavailable Windows symlink privilege |
 | Recursive Node suites | **321 passed** | `node-final.log`; async permission/dialog invalidation, runtime-contract delegation and crypto/form regressions |
 | Chromium / web / import-boundary group | **21 passed** | `browser-release.xml`; 44.68s, ten Chromium scenarios, nine web tests, two boundary tests |

@@ -10,7 +10,7 @@
 
   Run once:
 
-      irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
+      irm https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1 | iex
 
   Then set AGENTBRIDGE_SERVER_URL and AGENTBRIDGE_TOKEN and run:
 
@@ -259,10 +259,10 @@ function Add-UserPathEntry {
 }
 
 # --- Config ----------------------------------------------------------------
-# Public source of the connector code (anonymous download; no repo access
-# needed). Repository/domain migrations are NOT part of the product rename.
+# Canonical public repository (anonymous download; no repo access needed).
+# Forks are development copies, never the default install or upgrade source.
 # Override AGENTBRIDGE_SOURCE_ZIP (or legacy DEEPBOX_SOURCE_ZIP) to pin a branch.
-$SourceZip = Get-ProductEnvironment -Stem 'SOURCE_ZIP' -Default 'https://github.com/deeporc-ai/deepbox/archive/refs/heads/main.zip'
+$SourceZip = Get-ProductEnvironment -Stem 'SOURCE_ZIP' -Default 'https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip'
 if ([string]::IsNullOrWhiteSpace($SourceZip)) { throw 'The selected SOURCE_ZIP setting is empty.' }
 $Home2   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $Root    = Get-InstallRoot -HomeDirectory $Home2
@@ -273,7 +273,7 @@ $Bin     = Join-Path $Root 'bin'
 $Command = Join-Path $Bin 'agentbridge.cmd'
 $LegacyCommand = Join-Path $Bin 'deepbox.cmd'
 $Launcher = Join-Path $Root 'deepbox-connect.cmd'  # legacy compatibility
-$InstallScriptUrl = 'https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1'
+$InstallScriptUrl = 'https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1'
 
 Write-Step "Installing into $Root"
 New-Item -ItemType Directory -Force -Path $Root | Out-Null
@@ -389,6 +389,9 @@ if (-not (Test-Path -LiteralPath $Command)) {
     Set-Content -LiteralPath $Command -Value $commandBody -Encoding ASCII
 } elseif (-not ([IO.File]::ReadAllText($Command).Contains('agentbridge-stable-shim-v1'))) {
     throw "Refusing to replace an unrecognized command at '$Command'. Move it, then re-run the installer."
+} elseif (-not ([IO.File]::ReadAllText($Command).Contains($InstallScriptUrl))) {
+    Write-Warn2 'The existing stable command keeps its original upgrade source; it was not rewritten.'
+    Write-Warn2 "For future upgrades, run the canonical installer directly: irm $InstallScriptUrl | iex"
 }
 
 $aliasBody = @"
