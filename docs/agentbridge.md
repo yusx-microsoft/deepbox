@@ -1,13 +1,42 @@
-# AgentBridge: local redesign and phased rename
+# AgentBridge: repository, installation and compatibility contract
 
-**Status: the user has authorized shipping this current implementation.** Release
-verification is separate from ongoing visual exploration. Deployment targets the
-existing `deepbox-webdata-du` app; no repository/resource/domain or installed-data
-migration is included. See the deployment status and `/api/version` for what is live.
+**Scope: repository and installer naming; no cloud deployment is implied.**
+Release verification is separate from ongoing visual exploration. Any authorized
+deployment targets the existing `deepbox-webdata-du` app. Repository and installer branding use AgentBridge;
+Azure resources/domains and installed data are not migrated. See the deployment
+status and `/api/version` for what is live; neither a repository rename nor an
+unmerged PR establishes publication or deployment.
 
 This guide owns the rename contract. See [implementation](implementation.md#5-web-web)
 for the current module map, [product design](product-design.md) for interaction
 intent, and [review](review.md) for checks and release evidence.
+
+## Canonical repository and installer source
+
+- **Only upstream / production source:**
+  [yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge).
+  GitHub display/case is `AgentBridge`; CLI and package names remain `agentbridge`.
+- **Fork only:** `yusx-microsoft/AgentBridge` is not the main repository, an
+  installer mirror, or a production fallback.
+- **Windows installer:**
+  `https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1`.
+- **macOS/Linux installer:**
+  `https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh`.
+- **Default payload:**
+  `https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip`.
+
+Point `upstream` at `https://github.com/yusx-swapp/AgentBridge.git`. Develop on a
+feature branch created from canonical `upstream/main`, and submit its PR to
+**yusx-swapp/AgentBridge:main**; do not develop directly on `main`. A fork can remain
+`origin`, but it is not the production source. Keep the currently running worktree
+at `C:\Code\deepbox`; a remote rename does not require moving local files.
+
+The canonical URLs describe the requested repository/installation contract, not
+proof that the remote rename, PR merge or new scripts are already published.
+Verify the repository route, raw script contents and source archive on `main`
+before recommending fresh installs. See [publication checks](install.md#hosting-the-installer-scripts)
+and [`SOURCE_ZIP` 404 troubleshooting](install.md#source_zip-http-404), including an
+explicit reviewed archive override. No cloud or authentication rename is implied.
 
 ## Product boundary
 
@@ -115,15 +144,18 @@ copying anything:
    wins; use an explicit HOME override to choose the other.
 
 Existing legacy/custom installs remain supported; no automatic directory move,
-copy, or re-enrollment is implied. Persistent state/spool and IPC defaults keep
+copy, or re-enrollment is implied. A `.deepbox` path in existing-install output
+indicates compatibility/reuse, not the fresh-install name: fresh installs use
+`~/.agentbridge`. Persistent state/spool and IPC defaults keep
 their independent legacy roots for identity continuity; changing install HOME is
 not a data migration. See [install](install.md) for explicit, user-controlled
 installation/upgrade instructions, not an instruction to execute live setup now.
 
 ## Deliberately unchanged identities
 
-- Checkout path `C:\Code\deepbox`, existing GitHub `deepbox` repository URLs,
-  Azure resources/domains, and Entra callback configuration.
+- Checkout path `C:\Code\deepbox`, Azure resources/domains (including
+  `deepbox-webdata-du`), and Entra callback configuration. GitHub repository and
+  installer URLs **do change** to the canonical AgentBridge paths above.
 - Existing `deepbox.db` default and database schema: the table is **`session`**,
   not `sessions`. `/api/devboxes` and the Devbox domain model are not brand strings.
 - Installed registrations/device IDs, local state/spool roots, recording offsets,
@@ -150,7 +182,10 @@ explicit migration plan if they ever change.
 - [ ] **Separate release decision:** only after user approval decide on a commit,
   publication, staged installation, or deployment. Nothing here authorizes those
   actions or a live connector/model run.
-- [ ] **Final external rename — separately approved:** plan GitHub repository/URL,
-  Azure resource/domain, and Entra callback changes together with redirects,
-  installer/update URLs, rollback, and identity/data continuity. Local branding
-  approval is not approval for this final step; it has not happened.
+- [ ] **Repository and installer publication:** use the approved canonical
+  `yusx-swapp/AgentBridge` naming; verify the actual remote, reviewed PR merge to
+  upstream `main`, both raw scripts and their matching archive. A fork or local
+  edit is not publication evidence. Do not infer completion from this checklist.
+- [ ] **Cloud/domain or identity migration:** Azure resource identities, domains,
+  authentication, data and IPC remain unchanged. Any future change needs its own
+  explicit migration plan and approval; it is not part of the repository rename.

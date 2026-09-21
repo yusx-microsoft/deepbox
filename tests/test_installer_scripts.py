@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,35 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install.ps1"
 INSTALLER_SH = ROOT / "scripts" / "install.sh"
 POWERSHELL = shutil.which("powershell.exe")
+SOURCE_ZIP = "https://github.com/yusx-swapp/AgentBridge/archive/refs/heads/main.zip"
+INSTALL_PS1_URL = "https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1"
+INSTALL_SH_URL = "https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh"
+PINNED_SOURCE_ZIP = "https://example.invalid/fork/AgentBridge-feature.zip?ref=pinned&version=2"
+LEGACY_SOURCE_ZIP = "https://example.invalid/fork/deepbox-main.zip?ref=legacy&version=1"
+SOURCE_ZIP_CASES = [
+    pytest.param(None, None, SOURCE_ZIP, id="default-canonical-repository"),
+    pytest.param(None, LEGACY_SOURCE_ZIP, LEGACY_SOURCE_ZIP, id="legacy-override"),
+    pytest.param(PINNED_SOURCE_ZIP, None, PINNED_SOURCE_ZIP, id="canonical-override"),
+    pytest.param(PINNED_SOURCE_ZIP, LEGACY_SOURCE_ZIP, PINNED_SOURCE_ZIP, id="canonical-wins"),
+    pytest.param(PINNED_SOURCE_ZIP, "", PINNED_SOURCE_ZIP, id="canonical-beats-empty-legacy"),
+    pytest.param("", LEGACY_SOURCE_ZIP, None, id="empty-canonical-blocks-legacy"),
+    pytest.param("", None, None, id="empty-canonical-blocks-default"),
+    pytest.param(None, "", None, id="empty-legacy-blocks-default"),
+    pytest.param("", "", None, id="both-empty"),
+]
+ARCHIVE_CASES = [
+    (folder, None) for folder in (
+        "AgentBridge-main", "AgentBridge-feature-rename", "deepbox-main",
+        "deepbox-feature-rename", "deepbox-pinned-branch", "arbitrary-source-root",
+    )
+] + [
+    (folder, missing)
+    for folder in ("AgentBridge-main", "deepbox-main")
+    for missing in (
+        "agentbridge/__init__.py", "agentbridge/__main__.py",
+        "connector/__init__.py", "requirements-connector.txt",
+    )
+]
 
 
 def _helper_prefix() -> str:
@@ -366,6 +396,32 @@ def test_windows_environment_boundary_preserves_empty_canonical_values(tmp_path)
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is unavailable")
+@pytest.mark.parametrize("canonical,legacy,expected", SOURCE_ZIP_CASES)
+def test_windows_source_zip_precedence_and_empty_validation(tmp_path, canonical, legacy, expected):
+    # Extract only the actual SOURCE_ZIP assignment/guard and pure helpers, not
+    # the installer body: no downloads, process discovery, home changes, or CLI.
+    lines = INSTALLER.read_text(encoding="utf-8").splitlines()
+    assignment = next(line for line in lines if line.startswith("$SourceZip = "))
+    validation = next(line for line in lines if line.startswith("if ([string]::IsNullOrWhiteSpace($SourceZip))"))
+    env = _test_env()
+    if canonical is not None:
+        env["AGENTBRIDGE_SOURCE_ZIP"] = canonical
+    if legacy is not None:
+        env["DEEPBOX_SOURCE_ZIP"] = legacy
+    result = _run_powershell(
+        _helper_prefix() + f"\n{assignment}\n{validation}\n"
+        + "ConvertTo-Json -Compress -InputObject $SourceZip\n",
+        tmp_path, env=env,
+    )
+    if expected is None:
+        assert result.returncode != 0
+        assert "SOURCE_ZIP setting is empty" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout.strip()) == expected
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is unavailable")
 @pytest.mark.parametrize("layout,setting,expected", [
     ("fresh", "none", ".agentbridge"),
     ("legacy", "none", ".deepbox"),
@@ -436,15 +492,7 @@ def _archive_fixture(tmp_path: Path, folder: str, missing: str | None) -> tuple[
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is unavailable")
-@pytest.mark.parametrize("folder,missing", [
-    ("deepbox-main", None),
-    ("deepbox-feature-rename", None),
-    ("arbitrary-source-root", None),
-    ("deepbox-main", "agentbridge/__init__.py"),
-    ("deepbox-main", "agentbridge/__main__.py"),
-    ("deepbox-main", "connector/__init__.py"),
-    ("deepbox-main", "requirements-connector.txt"),
-])
+@pytest.mark.parametrize("folder,missing", ARCHIVE_CASES)
 def test_windows_archive_requires_both_packages_before_replacement(tmp_path, folder, missing):
     extract, source = _archive_fixture(tmp_path, folder, missing)
     result = _run_powershell(
@@ -459,12 +507,12 @@ def test_windows_archive_requires_both_packages_before_replacement(tmp_path, fol
         assert Path(result.stdout.strip()) == source
 
 
-@pytest.mark.parametrize("missing", [None, "agentbridge/__init__.py", "agentbridge/__main__.py", "connector/__init__.py", "requirements-connector.txt"])
-def test_unix_archive_selection_uses_the_same_package_contract(tmp_path, monkeypatch, capsys, missing):
+@pytest.mark.parametrize("folder,missing", ARCHIVE_CASES)
+def test_unix_archive_selection_uses_the_same_package_contract(tmp_path, monkeypatch, capsys, folder, missing):
     # Execute only the archive-validation Python fragment, with synthetic files.
     text = INSTALLER_SH.read_text(encoding="utf-8")
     code = text.split('INNER="$("$PY" - "$EXTRACT" <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
-    extract, source = _archive_fixture(tmp_path, "deepbox-pinned-branch", missing)
+    extract, source = _archive_fixture(tmp_path, folder, missing)
     monkeypatch.setattr(sys, "argv", ["archive-fixture", str(extract)])
     if missing:
         with pytest.raises(SystemExit, match="existing installation was not replaced"):
@@ -474,14 +522,35 @@ def test_unix_archive_selection_uses_the_same_package_contract(tmp_path, monkeyp
         assert Path(capsys.readouterr().out.strip()) == source
 
 
-def test_installers_keep_source_urls_and_copy_only_selected_packages():
+@pytest.mark.parametrize("installer,install_url", [
+    (INSTALLER, INSTALL_PS1_URL), (INSTALLER_SH, INSTALL_SH_URL),
+])
+def test_installer_headers_downloads_and_upgrades_use_only_the_canonical_repository(installer, install_url):
+    text = installer.read_text(encoding="utf-8")
+    # Check every GitHub URL, not just the presence of one correct URL beside a
+    # stale fallback. The fork and old/nonexistent repositories are never defaults.
+    github_urls = set(re.findall(r"https?://(?:raw\.githubusercontent\.com|github\.com)/[^\s'\"`<>]+", text))
+    assert github_urls == {SOURCE_ZIP, install_url}
+    assert install_url in text.split("# --- Config", 1)[0]
+    if installer == INSTALLER:
+        assert f"$SourceZip = Get-ProductEnvironment -Stem 'SOURCE_ZIP' -Default '{SOURCE_ZIP}'" in text
+        assert "Invoke-WebRequest -Uri $SourceZip -OutFile $tmpZip" in text
+        assert f"$InstallScriptUrl = '{install_url}'" in text
+        upgrade = _powershell_template("commandBody").split(":upgrade\n", 1)[1]
+        assert "irm '$InstallScriptUrl' | iex" in upgrade
+    else:
+        assert f"SOURCE_ZIP=\"$(product_env SOURCE_ZIP '{SOURCE_ZIP}')\"" in text
+        assert 'curl -fsSL "$SOURCE_ZIP" -o "$ZIP"' in text
+        assert 'wget -qO "$ZIP" "$SOURCE_ZIP"' in text
+        upgrade = _shell_template("COMMAND").split('if [ "${1:-}" = "upgrade" ]; then', 1)[1]
+        assert f'URL="{install_url}"' in upgrade
+        assert 'curl -fsSL "$URL" | bash' in upgrade
+        assert 'wget -qO- "$URL" | bash' in upgrade
+
+
+def test_installers_copy_only_selected_packages_and_preserve_environment_boundary():
     windows = INSTALLER.read_text(encoding="utf-8")
     unix = INSTALLER_SH.read_text(encoding="utf-8")
-    for text in (windows, unix):
-        assert "https://github.com/deeporc-ai/deepbox/archive/refs/heads/main.zip" in text
-        assert "raw.githubusercontent.com/yusx-microsoft/deepbox/" in text
-        assert "github.com/deeporc-ai/agentbridge" not in text
-        assert "raw.githubusercontent.com/yusx-microsoft/agentbridge/" not in text
     assert "foreach ($package in @('agentbridge', 'connector'))" in windows
     assert windows.index("$archiveSource = Get-ArchiveSource") < windows.index("Remove-DirectoryWithRetry -Path $Src")
     assert "for package in agentbridge connector; do" in unix
@@ -671,6 +740,32 @@ def test_bash_environment_boundary_preserves_explicit_empty(tmp_path, canonical,
 
 
 @pytest.mark.skipif(BASH is None, reason="Native Bash is unavailable")
+@pytest.mark.parametrize("canonical,legacy,expected", SOURCE_ZIP_CASES)
+def test_bash_source_zip_precedence_and_empty_validation(tmp_path, canonical, legacy, expected):
+    # Execute only the helpers and SOURCE_ZIP configuration; no installer/CLI.
+    text = INSTALLER_SH.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assignment = next(line for line in lines if line.startswith("SOURCE_ZIP="))
+    validation = next(line for line in lines if line.startswith('[ -n "$SOURCE_ZIP" ]'))
+    env = _test_env()
+    if canonical is not None:
+        env["AGENTBRIDGE_SOURCE_ZIP"] = canonical
+    if legacy is not None:
+        env["DEEPBOX_SOURCE_ZIP"] = legacy
+    result = _run_bash_fragment(
+        text.split("# --- Config", 1)[0] + f"\n{assignment}\n{validation}\n"
+        + 'printf \'%s\' "$SOURCE_ZIP"\n',
+        tmp_path, env,
+    )
+    if expected is None:
+        assert result.returncode != 0
+        assert "SOURCE_ZIP setting is empty" in result.stdout + result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected
+
+
+@pytest.mark.skipif(BASH is None, reason="Native Bash is unavailable")
 @pytest.mark.parametrize("layout,setting,expected", [
     ("fresh", "none", ".agentbridge"), ("legacy", "none", ".deepbox"),
     ("both", "none", ".agentbridge"), ("legacy", "legacy", "custom root"),
@@ -767,3 +862,68 @@ def test_shell_scripts_parse_without_execution(tmp_path, source):
         env=_test_env(), capture_output=True, text=True, timeout=15,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="Windows PowerShell is unavailable")
+@pytest.mark.parametrize("kind", ["fresh", "old-source", "canonical", "unknown"])
+def test_windows_existing_command_is_preserved_and_old_source_is_explained(tmp_path, kind):
+    command = tmp_path / "agentbridge.cmd"
+    before = None
+    if kind != "fresh":
+        marker = "agentbridge-stable-shim-v1" if kind != "unknown" else "user-owned"
+        url = INSTALL_PS1_URL if kind == "canonical" else "https://example.invalid/old-install.ps1"
+        before = f"@echo off\r\nrem {marker}\r\nrem {url}\r\n".encode("ascii")
+        command.write_bytes(before)
+    text = INSTALLER.read_text(encoding="utf-8")
+    block = text[text.index('$commandBody = @"'):text.index('$aliasBody = @"')]
+    # Only command-file generation, never source refresh/process stop/pip/connect.
+    result = _run_powershell(
+        _helper_prefix() + '\n$Command = $env:INSTALLER_TEST_COMMAND\n'
+        + f"$InstallScriptUrl = '{INSTALL_PS1_URL}'\n" + block,
+        tmp_path, env=_test_env(INSTALLER_TEST_COMMAND=str(command)),
+    )
+    assert (result.returncode == 0) == (kind != "unknown"), result.stderr
+    if before is not None:
+        assert command.read_bytes() == before
+    else:
+        assert INSTALL_PS1_URL in command.read_text(encoding="ascii")
+    output = result.stdout + result.stderr
+    if kind == "old-source":
+        assert "keeps its original upgrade source" in output
+        assert f"irm {INSTALL_PS1_URL} | iex" in output
+    elif kind != "unknown":
+        assert "keeps its original upgrade source" not in output
+    else:
+        assert "unrecognized command" in output
+
+
+@pytest.mark.skipif(BASH is None, reason="Native Bash is unavailable")
+@pytest.mark.parametrize("kind", ["fresh", "old-source", "canonical", "unknown"])
+def test_unix_existing_command_is_preserved_and_old_source_is_explained(tmp_path, kind):
+    command = tmp_path / "agentbridge"
+    before = None
+    if kind != "fresh":
+        marker = "agentbridge-stable-shim-v1" if kind != "unknown" else "user-owned"
+        url = INSTALL_SH_URL if kind == "canonical" else "https://example.invalid/old-install.sh"
+        before = f"#!/usr/bin/env bash\n# {marker}\n# {url}\n".encode("ascii")
+        command.write_bytes(before)
+    text = INSTALLER_SH.read_text(encoding="utf-8")
+    block = text[text.index('if [ ! -e "$COMMAND" ]; then'):text.index('chmod +x "$COMMAND"')]
+    result = _run_bash_fragment(
+        text.split("# --- Config", 1)[0]
+        + '\nCOMMAND="$INSTALLER_TEST_COMMAND"\n' + block,
+        tmp_path, _test_env(INSTALLER_TEST_COMMAND=command.as_posix()),
+    )
+    assert (result.returncode == 0) == (kind != "unknown"), result.stderr
+    if before is not None:
+        assert command.read_bytes() == before
+    else:
+        assert INSTALL_SH_URL in command.read_text(encoding="ascii")
+    output = result.stdout + result.stderr
+    if kind == "old-source":
+        assert "keeps its original upgrade source" in output
+        assert f"curl -fsSL {INSTALL_SH_URL} | bash" in output
+    elif kind != "unknown":
+        assert "keeps its original upgrade source" not in output
+    else:
+        assert "unrecognized command" in output

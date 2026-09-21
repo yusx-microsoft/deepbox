@@ -1,9 +1,19 @@
-# Azure App Service (Linux) deployment
+# AgentBridge: Azure App Service (Linux) deployment
 
-This guide describes deploying the Deepbox **control-plane server** to Azure
+This guide describes deploying the AgentBridge **control-plane server** to Azure
 App Service on Linux. The **connector** and any live agents are NOT part of
 this deployment — they continue to run on your own machines and connect
 outbound to the server.
+
+The only canonical repository and production installation source is
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge);
+`yusx-microsoft/AgentBridge` is only a fork. Use feature branches based on canonical
+`upstream/main` and PRs targeting **yusx-swapp/AgentBridge:main**, with no direct-main
+development. Verify repository/installer publication separately from deployment.
+This rename does **not** rename `deepbox-webdata-du`, other Azure resources,
+domains, Entra callbacks, existing `/home/deepbox` data or the `C:\Code\deepbox`
+worktree. Existing `DEEPBOX_*` deployment settings remain compatible; no data or
+identity migration is automatic. Connector installs are covered in [install.md](install.md).
 
 > Nothing in this repo creates Azure resources automatically. Run the deploy
 > script yourself when ready.
@@ -39,20 +49,22 @@ outbound to the server.
 | `DEEPBOX_COOKIE_SAMESITE` | `lax` | survives top-level OAuth redirect |
 | `DEEPBOX_REGISTRATION_ENABLED` | `false` | fail-closed local sign-up |
 | `DEEPBOX_AUTH_MODE` | `local`, then `hybrid`, then `microsoft` | keep the local fallback until interactive sign-in is verified |
-| `DEEPBOX_SESSION_TTL_SECONDS` | `28800` | Deepbox cookie lifetime, minimum 300 |
+| `DEEPBOX_SESSION_TTL_SECONDS` | `28800` | AgentBridge cookie lifetime, minimum 300 |
 | `DEEPBOX_MICROSOFT_OWNER_EMAILS` | explicit email list | required in `microsoft` mode; keep narrow |
 | `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS` | explicit Entra tenant ID list | required whenever Microsoft auth is enabled in production |
 | `DEEPBOX_WORKSPACE_INVITATION_TTL_DAYS` | `7` | allowed range 1–30 |
-| `OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID` | user-assigned managed identity client ID (slot setting) | reserved Easy Auth FIC pointer; non-secret and never read by Deepbox |
+| `OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID` | user-assigned managed identity client ID (slot setting) | reserved Easy Auth FIC pointer; non-secret and never read by AgentBridge |
 
-Port precedence in code: `DEEPBOX_PORT` → `PORT` → `WEBSITES_PORT` → `8077`.
+Port precedence in code: `AGENTBRIDGE_PORT` (or `DEEPBOX_PORT` only when the
+canonical key is absent) → `PORT` → `WEBSITES_PORT` → `8077`. An explicitly empty
+canonical value suppresses the legacy alias before the remaining fallbacks.
 
 ## Microsoft account sign-in (Easy Auth v2)
 
 Keep `DEEPBOX_AUTH_MODE=local` until every item below is complete. Enabling the application mode without the platform identity boundary would trust spoofable client headers.
 
 1. For an employee-only deployment, create a **single-tenant** app registration (`signInAudience = AzureADMyOrg`) in the organization's Entra tenant. Broader organizational or personal-account audiences must be an explicit product decision, not the default. Tenants that enforce a Service Tree reference require `az ad app create --service-management-reference <service-tree-guid>`.
-2. Add the exact Web redirect URI `https://<app>.azurewebsites.net/.auth/login/aad/callback`. This is the Easy Auth provider callback; `/api/auth/microsoft/callback` is Deepbox's post-login route and is not registered with Entra. Retain both the public application/client ID and the app registration object ID.
+2. Add the exact Web redirect URI `https://<app>.azurewebsites.net/.auth/login/aad/callback`. This is the Easy Auth provider callback; `/api/auth/microsoft/callback` is AgentBridge's post-login route and is not registered with Entra. Retain both the public application/client ID and the app registration object ID.
 3. Configure the secretless Easy Auth identity and deploy `authsettingsV2`:
 
    ```powershell
@@ -67,13 +79,13 @@ Keep `DEEPBOX_AUTH_MODE=local` until every item below is complete. Enabling the 
 
    The helper enables ID-token issuance on the app registration because App Service Easy Auth requests an ID token as part of its hybrid login flow. It creates or reuses the app registration's home-tenant service principal (Enterprise Application); an app object alone cannot complete the authorization-code exchange. It then creates or reuses a user-assigned managed identity, assigns it to the web app, and creates an Entra federated identity credential with issuer `https://login.microsoftonline.com/<tenant-guid>/v2.0`, subject equal to the managed identity principal/object ID, and audience `api://AzureADTokenExchange`. It writes the identity's client ID to the sticky, reserved App Service setting `OVERRIDE_USE_MI_FIC_ASSERTION_CLIENTID`, then deploys `infra/microsoft-auth.bicep`. The Bicep template points `clientSecretSettingName` at that reserved setting; despite the schema property name, no client secret or certificate exists.
 
-   The template enables Easy Auth v2, uses the tenant-specific issuer, accepts only the app's audiences, requires HTTPS, disables the unused token store, and deliberately allows anonymous requests through to Deepbox's own route authorization. The helper validates the current tenant, single-tenant app registration with ID-token issuance, and enabled home-tenant service principal; it reuses an exact existing FIC, fails closed on a conflicting FIC, and **does not** change `DEEPBOX_AUTH_MODE`.
+   The template enables Easy Auth v2, uses the tenant-specific issuer, accepts only the app's audiences, requires HTTPS, disables the unused token store, and deliberately allows anonymous requests through to AgentBridge's own route authorization. The helper validates the current tenant, single-tenant app registration with ID-token issuance, and enabled home-tenant service principal; it reuses an exact existing FIC, fails closed on a conflicting FIC, and **does not** change `DEEPBOX_AUTH_MODE`.
 4. Set `DEEPBOX_MICROSOFT_ALLOWED_TENANT_IDS=<tenant-guid>` and a narrow normalized `DEEPBOX_MICROSOFT_OWNER_EMAILS` list. Keep `DEEPBOX_AUTH_MODE=local` while validating the platform redirect, then use `hybrid` for the first interactive sign-in so the password path remains a rollback route.
-5. Verify HTTPS-only, the exact redirect URI, ID-token issuance, issuer and audiences, enabled home-tenant service principal, UAMI assignment, reserved slot setting, FIC tuple, and that `/.auth/login/aad` redirects to the expected tenant and client ID. A completed sign-in must produce platform-injected `X-MS-CLIENT-PRINCIPAL*` headers. Test a different tenant and confirm Deepbox returns 403. Never expose the ASGI process directly in Microsoft mode.
-6. After sign-in, exercise at least one cookie-authenticated mutation such as creating a workspace or devbox. Deepbox emits `Referrer-Policy: same-origin` because Easy Auth uses the same-origin `Referer` for its cookie-request CSRF validation; `no-referrer` makes the platform reject these requests with HTTP `403.60` before they reach FastAPI.
+5. Verify HTTPS-only, the exact redirect URI, ID-token issuance, issuer and audiences, enabled home-tenant service principal, UAMI assignment, reserved slot setting, FIC tuple, and that `/.auth/login/aad` redirects to the expected tenant and client ID. A completed sign-in must produce platform-injected `X-MS-CLIENT-PRINCIPAL*` headers. Test a different tenant and confirm AgentBridge returns 403. Never expose the ASGI process directly in Microsoft mode.
+6. After sign-in, exercise at least one cookie-authenticated mutation such as creating a workspace or devbox. AgentBridge emits `Referrer-Policy: same-origin` because Easy Auth uses the same-origin `Referer` for its cookie-request CSRF validation; `no-referrer` makes the platform reject these requests with HTTP `403.60` before they reach FastAPI.
 7. After sign-in, logout, cookie expiry, owner linking, a mutation, and a workspace invitation pass end to end, change `DEEPBOX_AUTH_MODE=microsoft` to remove password login.
 
-Deepbox never receives or stores Microsoft access/refresh tokens, app credentials, or model credentials. It maps the Easy Auth tenant + subject to a user, applies its own tenant allowlist, and issues its own signed, time-limited cookie. An allow-listed identity may claim the sole unlinked local owner during migration; ordinary identities are deployment members and join shared workspaces through invitations.
+AgentBridge never receives or stores Microsoft access/refresh tokens, app credentials, or model credentials. It maps the Easy Auth tenant + subject to a user, applies its own tenant allowlist, and issues its own signed, time-limited cookie. An allow-listed identity may claim the sole unlinked local owner during migration; ordinary identities are deployment members and join shared workspaces through invitations.
 
 Official references:
 

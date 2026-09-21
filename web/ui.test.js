@@ -1,6 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const {readFileSync} = require('node:fs');
 const ui = require('./ui.js');
+
+const INSTALL_PS1_URL = 'https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1';
+const INSTALL_SH_URL = 'https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh';
 
 const fleet = [
   {id: 'b1', name: 'workstation', online: true, agents: [
@@ -95,16 +99,24 @@ test('agentApiPath safely addresses opaque agent IDs', () => {
     '/api/agents/agent%2Fwith%20spaces');
 });
 
-test('install commands are explicit one-time setup commands', () => {
+test('install commands use the canonical AgentBridge repository and retain legacy home compatibility', () => {
   assert.equal(
     ui.windowsInstallCommand(),
-    'irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex'
+    `irm ${INSTALL_PS1_URL} | iex`
   );
   assert.equal(
     ui.unixInstallCommand(),
-    'curl -fsSL https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.sh | bash && ' +
+    `curl -fsSL ${INSTALL_SH_URL} | bash && ` +
       'export PATH="${AGENTBRIDGE_HOME-${DEEPBOX_HOME-$HOME/.agentbridge}}/bin:$HOME/.deepbox/bin:$PATH"'
   );
+});
+
+test('all UI installer source URLs exclude forks and pre-rename repositories', () => {
+  // Check the source too: an unused stale link must not hide behind a correct
+  // command helper. This is local inspection only, never a network request.
+  const source = readFileSync(require.resolve('./ui.js'), 'utf8');
+  const urls = source.match(/https?:\/\/(?:raw\.githubusercontent\.com|github\.com)\/[^\s'"`<>]+/g) || [];
+  assert.deepEqual([...new Set(urls)].sort(), [INSTALL_PS1_URL, INSTALL_SH_URL].sort());
 });
 
 test('windowsConnectorCommand reconnects without invoking the installer', () => {

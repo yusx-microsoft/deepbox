@@ -1,6 +1,6 @@
 # Onboarding and account management
 
-agentbridge has two identity paths and two different invitation types:
+AgentBridge has two identity paths and two different invitation types:
 
 - **Local account invitation**: a deployment owner creates a new password account.
 - **Workspace invitation**: a workspace owner/admin grants an existing or future Microsoft identity access to one workspace.
@@ -26,13 +26,20 @@ the configured persistent data directory (including `/home/deepbox`), outside
 `wwwroot`, with one server worker. Cookie names, invitation formats and identity
 records remain compatible; this is not account re-enrollment.
 
-The source repository and installer URLs remain `yusx-microsoft/deepbox` (with
-the `deeporc-ai/deepbox` mirror), pending separate external-migration approval.
+The only canonical repository and production installation source is
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge).
+`yusx-microsoft/AgentBridge` is a fork, not an installer mirror. The canonical scripts
+are `https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1`
+and `https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.sh`.
+Verify actual `main` publication before recommending those commands; repository
+renaming does not merge a feature-branch PR or deploy the web UI.
 For local UI review, inspect sign-in labels, the token dialog and copied command
 text without executing an installation or connection command. New command text
 uses `agentbridge`; old `deepbox` and `deepbox-connect` shortcuts remain valid.
 See [install.md](install.md) for fresh `.agentbridge`, reused `.deepbox`, and
-explicit custom-root selection. No data is automatically moved or copied.
+explicit custom-root selection, plus [`SOURCE_ZIP` 404 troubleshooting](install.md#source_zip-http-404).
+Existing `.deepbox` output indicates compatibility, not the fresh-install name.
+No data is automatically moved or copied.
 
 ## 1. First deployment owner (local mode)
 

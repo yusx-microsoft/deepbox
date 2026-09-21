@@ -539,9 +539,9 @@ launch a standalone DeepOrca server.
    and explicitly confirm the native-stop condition.
 4. Add the Agent. Readiness follows normal pending/provisioning/ready/error
    reporting. Creation is not a guarantee that the profile is free or configured.
-5. Open a new DeepBox conversation. Existing persona, memory, skills, tools and
+5. Open a new AgentBridge conversation. Existing persona, memory, skills, tools and
    model configuration are reused. **Native chat history is not automatically
-   imported into DeepBox conversations.**
+   imported into AgentBridge conversations.**
 
 The Connector discovers direct profile directories in the SDK's local
 `get_deeporca_dir()/agents` location. A local operator can select another native

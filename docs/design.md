@@ -1,12 +1,20 @@
-# agentbridge — Design
+# AgentBridge — Design
 
 **Local draft, awaiting user visual/code review.** Production remains
 `deepbox-webdata-du` at `1fab322`; that release's approval does not cover this work.
 The protocol/domain design below is retained, not a server rewrite. For current
 module responsibilities see [implementation](implementation.md); for name/home
-compatibility and the separate final external rename see [agentbridge](agentbridge.md).
+compatibility, canonical repository/installer publication and separate cloud/data
+migration gates see [AgentBridge](agentbridge.md).
 
-> **In one line:** agentbridge is an "agent switchboard / control plane". Users connect
+The only upstream and production installation source is
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge).
+Repository/installer renaming does not change Azure resources, the `C:\Code\deepbox`
+worktree, installed state, auth identities, wire protocol, durable spool, or IPC.
+Fresh installs use `~/.agentbridge`; existing `.deepbox` installations remain
+compatible without automatic migration.
+
+> **In one line:** AgentBridge is an "agent switchboard / control plane". Users connect
 > the agent CLIs on their own devbox (Claude Code, GitHub Copilot CLI, Codex CLI,
 > and similar) to the server, sign in to the web UI, and interact with those agents
 > as if they were at the local terminal.

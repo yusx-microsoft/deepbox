@@ -2,8 +2,12 @@
 
 **The user has authorized release of the current workbench.** Visual exploration
 continues separately and is not a reason to deploy the static candidates. See
-[review](review.md) and the [phased rename contract](agentbridge.md); existing
-external and data identities remain unchanged until separately approved migration.
+[review](review.md) and the [repository/installation contract](agentbridge.md).
+The canonical repository and production installation source is
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge);
+`yusx-microsoft/AgentBridge` is only a fork. Repository/installer branding does not
+rename Azure resources, domains, authentication or installed data, or move the
+existing `C:\Code\deepbox` worktree. Publication and rollout require separate evidence.
 
 **AgentBridge** is the display name; `agentbridge` is the lowercase CLI/package
 identifier, with `AGENTBRIDGE_*` environment keys. Display polish changes no

@@ -1,12 +1,24 @@
-# Three-machine remote deployment over a Tailscale private network
+# AgentBridge: three-machine remote deployment over a Tailscale private network
 
-> Target topology: computer A opens the browser; computer B hosts the deepbox
+> Target topology: computer A opens the browser; computer B hosts the AgentBridge
 > server; computer C runs the connector and the real agents. The three
 > computers are not on the same LAN but join the same Tailscale tailnet.
 >
 > This guide targets the current private alpha. **Use Tailscale Serve, not
 > Tailscale Funnel, and never expose the Uvicorn port directly to the public
 > internet.**
+
+The only canonical repository and production installation source is
+[yusx-swapp/AgentBridge](https://github.com/yusx-swapp/AgentBridge);
+`yusx-microsoft/AgentBridge` is only a fork. Verify the reviewed scripts/packages
+are published to canonical `main` before using its installer URLs.
+
+Keep the existing worktree at `C:\Code\deepbox`; the rename does not move local
+files. Existing Azure resources, auth, database, spool and IPC identifiers remain
+unchanged. Fresh connector installations use `~/.agentbridge`; existing `.deepbox`
+or custom install roots remain compatible, without automatic migration. The legacy
+`DEEPBOX_*` server settings below are still supported; canonical `AGENTBRIDGE_*`
+settings take precedence by presence.
 
 ---
 
@@ -24,7 +36,7 @@ Computer B — Server host
   Tailscale Serve (TLS termination)
      │ http://127.0.0.1:8077
      ▼
-  deepbox server
+  AgentBridge server
   ├── SQLite metadata
   └── session DVR
      ▲
@@ -75,19 +87,30 @@ the Tailscale admin console is recommended.
 
 ```bat
 cd /d C:\Code
-git clone https://github.com/yusx-swapp/deepbox.git
+git clone --origin upstream https://github.com/yusx-swapp/AgentBridge.git deepbox
 cd /d C:\Code\deepbox
 py -3 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-If the repository already exists:
+The explicit `deepbox` destination preserves this guide's `C:\Code\deepbox`
+layout; without it, Git names a fresh checkout `AgentBridge`. Clone only into a
+new destination; do not rename or overwrite an existing `C:\Code\deepbox`
+worktree. For an existing **deployment-only** checkout, first
+confirm `upstream` points to the canonical repository, the worktree is clean and
+its checked-out deployment branch is intended to track published upstream `main`:
 
 ```bat
 cd /d C:\Code\deepbox
-git pull
+git fetch upstream
+git merge --ff-only upstream/main
 .venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+Do not apply that deployment update to an active development branch or live
+process without planning the update. For code changes, create a feature branch
+from canonical `upstream/main` and open a PR against **yusx-swapp/AgentBridge:main**;
+do not develop directly on `main` or use a fork as production upstream.
 
 ### 3.2 Configure Tailscale Serve
 
@@ -221,23 +244,26 @@ claude --version
 claude
 ```
 
-Complete the Claude Code sign-in locally on computer C first. deepbox never
+Complete the Claude Code sign-in locally on computer C first. AgentBridge never
 touches Claude credentials.
 
-### 5.2 Install the local `deepbox` command once
+### 5.2 Install the local `agentbridge` command once
 
 Run once in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/yusx-microsoft/deepbox/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/yusx-swapp/AgentBridge/main/scripts/install.ps1 | iex
 ```
 
 The installer maintains the connector source, an isolated venv, and a stable
-command under the current user's `~\.deepbox`, and adds `~\.deepbox\bin` to the
-user PATH. It downloads the connector payload from the public `yusx-swapp/deepbox`
-mirror. Later connections never clone, download, or refresh that directory; only
-an explicit `deepbox upgrade` reruns the installer. See
-[install.md](install.md) for details.
+command under the current user's `~\.agentbridge` for a fresh install, and adds
+that installation's `bin` directory to the user PATH. Existing `.deepbox` or
+custom roots can be reused; `.deepbox` in their output is compatibility, not the
+fresh-install name. The payload comes from canonical `yusx-swapp/AgentBridge`,
+not a mirror or fork. Later connections never clone, download, or refresh that
+directory; only an explicit `agentbridge upgrade` reruns the installer. Legacy
+`deepbox` aliases remain supported. See [install.md](install.md) for home selection,
+publication checks and [`SOURCE_ZIP` 404 troubleshooting](install.md#source_zip-http-404).
 
 ### 5.3 Verify the server is reachable
 
@@ -253,9 +279,9 @@ It must return `status=ok`. If the name does not resolve, check
 Set the token copied from the UI and run doctor:
 
 ```powershell
-$env:DEEPBOX_SERVER_URL = 'https://server-name.example-tailnet.ts.net'
-$env:DEEPBOX_TOKEN = 'hpc_box_...'
-deepbox doctor
+$env:AGENTBRIDGE_SERVER_URL = 'https://server-name.example-tailnet.ts.net'
+$env:AGENTBRIDGE_TOKEN = 'hpc_box_...'
+agentbridge doctor
 ```
 
 It checks URL/TLS, `/api/health`, protocol version, and token authentication in
@@ -267,11 +293,12 @@ reports `[OK]`.
 Keeping the same environment variables, run:
 
 ```powershell
-deepbox connect
+agentbridge connect
 ```
 
 This starts the already-installed connector from the current working directory.
-It never invokes the installer or refreshes `~\.deepbox\app`.
+It never invokes the installer or refreshes the selected installation's `app`
+directory (`~\.agentbridge\app` for a fresh install).
 
 The connector:
 
@@ -290,17 +317,17 @@ and browser history.
 
 The default command runs the compatible all-in-one mode. To let the network
 transport restart independently while the local PTYs keep running, use the same
-`DEEPBOX_SERVER_URL` and `DEEPBOX_TOKEN` in two terminals. Start the long-lived
+`AGENTBRIDGE_SERVER_URL` and `AGENTBRIDGE_TOKEN` in two terminals. Start the long-lived
 session supervisor first:
 
 ```powershell
-deepbox connect --mode supervisor
+agentbridge connect --mode supervisor
 ```
 
 Then start the restartable network transport:
 
 ```powershell
-deepbox connect --mode transport
+agentbridge connect --mode transport
 ```
 
 They communicate over a per-user Windows named pipe (a `0600` Unix socket on
@@ -398,9 +425,20 @@ and port). Restart the server after changing `.env`.
 
 ### The connector reports a protocol mismatch
 
-The server and computer C are on different repository versions. Run `git pull`
-on both ends and reinstall dependencies (rerun the installer or
-`deepbox upgrade` on computer C).
+The server and computer C are on incompatible versions. Plan an explicit update
+to compatible reviewed builds from canonical `yusx-swapp/AgentBridge`: update the
+server deployment checkout and dependencies, then rerun the canonical installer
+or `agentbridge upgrade` on computer C when the matching payload is published.
+The installed connector uses an archive, not a Git checkout; `git pull` on it is
+not an upgrade. Do not rewrite a feature branch or live data to fix a mismatch.
+
+### The installer reports SOURCE_ZIP HTTP 404
+
+Check the archive URL and both `AGENTBRIDGE_SOURCE_ZIP` / `DEEPBOX_SOURCE_ZIP`
+overrides. A missing/inaccessible archive or unpublished ref is not an install-home
+or token-migration problem. See the [step-by-step diagnosis and optional reviewed
+archive override](install.md#source_zip-http-404). A payload override cannot fix a
+404 for the raw installer itself; never switch production to a fork as a workaround.
 
 ### The connector returns 401 / 4001
 
@@ -446,7 +484,7 @@ Turn off Tailscale Serve, using the form for your current CLI:
 tailscale serve reset
 ```
 
-This does not delete deepbox data.
+This does not delete AgentBridge data.
 
 ---
 
@@ -458,5 +496,5 @@ This does not delete deepbox data.
   supervisor/transport mode to survive transport restarts.
 - This is not a public-internet deployment configuration.
 - Tailscale addresses network encryption and device reachability; it does not
-  replace deepbox application-layer authentication, permissions, and recording
+  replace AgentBridge application-layer authentication, permissions, and recording
   privacy.
