@@ -103,12 +103,20 @@ def serialize_screen(screen: pyte.Screen) -> str:
     return "".join(out)
 
 
+class _RecordingScreen(pyte.HistoryScreen):
+    def report_device_status(self, mode: int = 0, private: bool = False) -> None:
+        """Ignore DSR/DEC DSR: this observer never sends replies to the PTY.
+
+        pyte 0.8.2 dispatches DEC DSR with private=True, which its Screen rejects.
+        """
+
+
 class LiveSession:
     def __init__(self, session_id: str, cols: int, rows: int):
         self.session_id = session_id
         self.cols = cols
         self.rows = rows
-        self.screen = pyte.HistoryScreen(cols, rows, history=5000)
+        self.screen = _RecordingScreen(cols, rows, history=5000)
         self.stream = pyte.ByteStream(self.screen)
         self.ended = False
         self.exit_code: int | None = None

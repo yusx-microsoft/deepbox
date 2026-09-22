@@ -2,6 +2,7 @@ import asyncio
 import json
 import unittest
 import uuid
+from unittest.mock import patch
 
 import pyte
 
@@ -51,6 +52,37 @@ class ScreenRestoreTests(unittest.TestCase):
             live.feed_output("persistent hello")
             self.assertIn("persistent hello", live.restore_bytes())
             self.assertIn("persistent hello", live.cast_path.read_text(encoding="utf-8"))
+        finally:
+            live.mark_ended(0)
+            live.cast_path.unlink(missing_ok=True)
+
+    def test_device_status_queries_do_not_break_output_or_generate_input(self):
+        chunks = ["left\x1b[?", "6nright\x1b[5n\x1b[6n\x1b[?25n\r\n", "next"]
+        for method in ("feed_output", "feed_live_output", "feed_durable_events"):
+            with self.subTest(method=method):
+                live = LiveSession("test-" + uuid.uuid4().hex, 40, 5)
+                try:
+                    with patch.object(live.screen, "write_process_input") as reply:
+                        for index, chunk in enumerate(chunks):
+                            value = [(index, "o", chunk)] if method == "feed_durable_events" else chunk
+                            getattr(live, method)(value)
+                        reply.assert_not_called()
+                    self.assertEqual(live.screen.display[0].strip(), "leftright")
+                    self.assertEqual(live.screen.display[1].strip(), "next")
+                    if method == "feed_output":
+                        self.assertEqual([event[2] for event in live.cast_events()], chunks)
+                finally:
+                    live.mark_ended(0)
+                    live.cast_path.unlink(missing_ok=True)
+
+    def test_legacy_replay_preserves_output_after_private_device_status_query(self):
+        live = LiveSession("test-" + uuid.uuid4().hex, 40, 5)
+        data = "before\x1b[?6nafter"
+        try:
+            live._record("o", data)
+            live.replay_into_screen()
+            self.assertIn("beforeafter", live.restore_bytes())
+            self.assertEqual(live.cast_events()[0][2], data)
         finally:
             live.mark_ended(0)
             live.cast_path.unlink(missing_ok=True)

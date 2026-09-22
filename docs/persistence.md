@@ -32,6 +32,11 @@ The design distinguishes two needs:
    Handled by durable recording rows in the server database, exportable as
    asciicast v2 or as an events/checkpoints replay stream.
 
+The recording-only screen ignores standard and DEC-private device-status queries
+(DSR), including split sequences, without generating terminal input. This avoids
+pyte 0.8.2's unsupported `private` argument during live output or replay. Original
+terminal bytes still reach the browser and durable recording unchanged.
+
 ## 2. Ownership: who stores what
 
 | State | Owner | Storage |

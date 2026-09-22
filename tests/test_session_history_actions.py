@@ -632,3 +632,31 @@ def test_explicit_resume_reattaches_a_now_live_process_without_rotating_or_queue
                 assert status["launch_id"] == starting["launch_id"]
                 assert _current(client, sid)["launch_id"] == starting["launch_id"]
                 assert _commands(_connector_frames(connector)) == []
+
+
+def test_terminal_device_status_query_keeps_connector_live_and_keyboard_working(app_client):
+    client, main = app_client
+    box, aid, session = _history(client, main, historical=False, surface="terminal")
+    sid = session["id"]
+    with _connector(client, box) as connector:
+        with client.websocket_connect("/ws/term", headers=ORIGIN) as human:
+            _human_frames(human, {"type": "open", "session_id": sid})
+            launch = _one(_commands(_connector_frames(connector)), "open")
+            _connector_frames(connector, {**_ready(launch), "surface": "terminal"})
+            _human_frames(human)
+            data = "before\x1b[?6nafter"
+            replies = _connector_frames(connector, {
+                "type": "output", "session_id": sid, "agent_id": aid,
+                "launch_id": launch["launch_id"], "pty_instance_id": "pty-current",
+                "seq": 1, "data": data})
+            assert _one(replies, "ack")["session_id"] == sid
+            assert _one(_human_frames(human), "output")["data"] == data
+            assert _current(client, sid)["state"] == "live"
+            assert "beforeafter" in main.live_registry.get(sid).restore_bytes()
+            for kind, payload in (("resize", {"cols": 100, "rows": 30}), ("stdin", {"data": "x"})):
+                frames = _human_frames(human, {"type": kind, "session_id": sid,
+                    "launch_id": launch["launch_id"], **payload})
+                assert not any(frame["type"] == "error" for frame in frames)
+                command = _one(_commands(_connector_frames(connector)), kind)
+                assert all(command[key] == value for key, value in payload.items())
+            assert _commands(replies) == []  # The recording screen never answers terminal queries.

@@ -425,11 +425,11 @@
       try {
         return await dialogs.modal({
           title:'Machine token — shown once',
-          desc:'Copy the connect code now and run it on your Machine. It contains a private token and will not be stored by agentbridge in this browser.',
+          desc:'Copy the connect code now and run it on your Machine. It contains a private token and will not be stored by AgentBridge in this browser.',
           bodyHtml:`<div class="field"><label>Operating system<select data-token-os aria-label="Operating system"><option value="windows">Windows · PowerShell</option><option value="unix">macOS / Linux</option></select></label></div>
             <div class="token-head"><b>Connect code</b><button type="button" class="ghost compact" data-token-copy>Copy</button></div>
             <pre class="token token-command" data-connect-code tabindex="0"></pre>
-            <details class="local-action-guide"><summary>Install agentbridge once (new Machines only)</summary><p>Run this installer yourself, then run the connect code above. Connecting again never reinstalls agentbridge.</p>
+            <details class="local-action-guide"><summary>Install AgentBridge once (new Machines only)</summary><p>Run this installer yourself, then run the connect code above. Connecting again never reinstalls AgentBridge.</p>
               <pre class="token token-command" data-install-code></pre><button type="button" class="ghost compact" data-install-copy>Copy installer</button></details>
             <p class="modal-err" role="alert" data-token-error></p>`,
           actions:[{label:'Done', value:true, primary:true}],
@@ -511,7 +511,7 @@
       let target = machine(snapshot, machineId);
       if(!target || !canManage(snapshot)){ if(live(snapshot, pending.element)) dialogs.close(); return; }
       const runtimes = UI.runtimeOptions(target.capabilities);
-      if(!runtimes.length) return dialogs.alert('No runtimes reported', 'Start or reconnect this Machine so agentbridge can report its available runtime adapters.');
+      if(!runtimes.length) return dialogs.alert('No runtimes available', 'Open this Machine’s Runtimes list for installation instructions, then reconnect the Connector.');
       const contract = runtime=>Chat.runtimeContract({runtime});
       const projects = (item, runtime)=>[{value:'', label:contract(runtime).requiresRegisteredProject ? 'Select a registered local project (required)' : 'No project (runtime default)'}].concat(UI.localProjectOptions(item.projects).map(project=>({value:project.id, label:project.name})));
       const runtimeUis = new Map();
@@ -531,7 +531,7 @@
         title:'Add agent', desc:`Register an agent runtime on ${target.name}.`,
         fields:[
           {name:'handle', label:'Handle', type:'text', required:true},
-          {name:'runtime', label:'Runtime adapter', type:'select', options:runtimes, value:runtimes[0], required:true},
+          {name:'runtime', label:'Runtime', type:'select', options:runtimes, value:runtimes[0], required:true},
           {name:'local_project_id', label:'Local project', type:'select', options:projects(target, runtimes[0]), value:'',
             helpHtml:'<small data-project-help>Projects are connector-local. Add one below, then refresh.</small>'},
           ...Array.from(runtimeUis.values()).flatMap(({ui, config})=>ui.creationFields(config)),
@@ -746,7 +746,7 @@
       return dialogs.modal({
         title:`${title} on ${target.name}`,
         desc:kind === 'runtimes'
-          ? 'agentbridge never installs third-party CLIs or reads their credentials. Run setup yourself on this Machine and authenticate in the CLI. Reconnect agentbridge to reprobe runtimes, then refresh status here.'
+          ? 'Install runtimes on this Machine using the commands or setup guides below. Reconnect the Connector to reprobe runtimes, then refresh status here.'
           : 'Skills are installed locally into runtime-discovered directories. agentbridge stores only path-free metadata and never executes files from a skill package.',
         bodyHtml:`<div data-inventory></div><button type="button" class="ghost" data-refresh-inventory>Refresh ${kind === 'runtimes' ? 'status' : 'skills'}</button><p class="modal-err" data-inventory-error role="alert"></p>`,
         actions:[{label:'Close', value:true, primary:true}],

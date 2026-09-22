@@ -62,6 +62,7 @@ def test_optional_library_probe(data, installed, compatible):
     cap = probe_family("deeporca", runner=runner)
     assert len(calls) == 1 and calls[0][0][1] == "-c"
     assert (cap["installation"]["status"] == "installed") is installed
+    assert cap["installation"]["guidance"] == {"url": "https://aka.ms/deeporca"}
     assert availability(cap, "structured")[0] is compatible
     assert cap["agent_config"]["profile_modes"] == ["create"]
     features = cap["surfaces"][0]["features"]

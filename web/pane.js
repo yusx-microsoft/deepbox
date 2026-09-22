@@ -552,6 +552,7 @@
             break;
           case 'runtime.unavailable':
             liveActive = false; turnPending = false; wantOpen = false; stopReconnect(); stopHeartbeat();
+            for (const card of sessionCards) if (String(card.session.id) === sessionId && card.session.state === 'starting') card.session.state = 'inactive';
             nodes.resumeNote.hidden = true;
             setStatus('unavailable', 'Runtime unavailable');
             reportError(frame.message || ('Runtime unavailable: ' + String(frame.code || 'runtime_unavailable') + '. View History for available actions. No new session was created.'));
@@ -611,6 +612,7 @@
               'configuration_changed', 'context.not_found', 'context.changed', 'context.in_use',
               'context.recovery_required', 'context.writer_unavailable'].includes(frame.code)) {
               liveActive = false; turnPending = false; wantOpen = false; stopReconnect(); stopHeartbeat();
+              for (const card of sessionCards) if (String(card.session.id) === sessionId && card.session.state === 'starting') card.session.state = 'inactive';
               nodes.resumeNote.hidden = true;
               setStatus('unavailable', 'Session unavailable');
             }
