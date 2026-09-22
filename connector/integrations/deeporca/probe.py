@@ -71,7 +71,10 @@ def probe(adapter, *, runner, include_models=True, local_state_path=None) -> dic
         "schema_version": CAPABILITY_SCHEMA_VERSION,
         "runtime": "deeporca", "label": "DeepOrca", "backend": "python-library",
         "legacy_runtime_ids": ["deeporca"],
-        "installation": {"status": "installed" if installed else "missing", "version": version},
+        "installation": {
+            "status": "installed" if installed else "missing", "version": version,
+            "guidance": {"url": "https://aka.ms/deeporca"},
+        },
         "compatibility": {
             "status": "compatible" if compatible else "incompatible" if installed else "unknown",
             **({"reason": "embedded_api_unavailable"} if installed and not compatible else {}),

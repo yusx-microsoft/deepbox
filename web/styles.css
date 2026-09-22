@@ -299,8 +299,8 @@ code.command-inline{font-size:11px;color:var(--fg);overflow-wrap:anywhere}
 .local-command-fields{display:flex;align-items:flex-end;flex-wrap:wrap;gap:9px}
 .local-command-fields .field{flex:1;min-width:130px;margin:0}
 .local-action-footer{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}
-.runtime-setup-row{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:11px}
-.runtime-setup-row>div{flex:1;min-width:0}
+.runtime-setup-row{display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:11px}
+.runtime-setup-row>div{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 8px;flex:1 0 140px;min-width:0}
 .workspace-invitations{display:flex;flex-direction:column}
 .workspace-invite-row{display:flex;align-items:center;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:11px}
 .workspace-invite-row>div:first-child{flex:1;min-width:0;overflow-wrap:anywhere}

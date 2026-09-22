@@ -474,14 +474,31 @@ test('runtime inventory has safe setup guidance and refresh-only reprobe help', 
       compatibility:{status:'compatible'}, authentication:{status:'needs_auth'}},
     {runtime:'codex', label:'Codex', schema_version:2, surfaces:[],
       installation:{status:'missing', guidance:{command:'npm install -g codex', url:'https://example.test/setup'}}},
+    {runtime:'deeporca', label:'DeepOrca', schema_version:2, surfaces:[],
+      installation:{status:'missing', guidance:{url:'https://aka.ms/deeporca'}}},
   ];
   h.management.showRuntimes('m1'); await flush(); const root = h.root();
   assert.match(root.textContent, /reprobe/); assert.match(root.textContent, /needs_auth/);
-  assert.equal(root.querySelector('script'), null); assert.equal(root.querySelectorAll('a').length, 1);
-  assert.equal(root.querySelector('a').getAttribute('href'), 'https://example.test/setup');
+  assert.equal(root.querySelector('script'), null);
+  assert.deepEqual(root.querySelectorAll('a').map(link=>link.getAttribute('href')), ['https://example.test/setup', 'https://aka.ms/deeporca']);
+  const rows = root.querySelectorAll('[data-inventory] .runtime-setup-row');
+  assert.equal(rows.length, 3); assert.match(rows[2].textContent, /DeepOrca.*missing.*Setup guide/);
+  assert.equal(rows[2].querySelector('button'), null); assert.equal(rows[2].querySelector('pre'), null);
   assert.equal(h.mutations().length, 0); assert.equal(h.copied.length, 0);
   root.querySelector('[data-inventory-copy="0"]').click(); await flush(); assert.deepEqual(h.copied, ['claude auth login <manual>']);
+  h.ctx.devboxes[0].capabilities.runtimes[2].installation.status = 'installed';
   root.querySelector('[data-refresh-inventory]').click(); await flush(); assert.equal(h.refreshes, 2); assert.equal(h.mutations().length, 0);
+  assert.equal(root.querySelectorAll('[data-inventory] .runtime-setup-row').length, 3);
+  assert.equal(root.querySelectorAll('a')[1].getAttribute('href'), 'https://aka.ms/deeporca');
+  await h.close();
+});
+
+test('no available runtimes points to the shared Runtimes list without a creation form', async()=>{
+  const h = harness(); h.ctx.devboxes[0].capabilities.runtimes = [];
+  h.management.createAgent('m1'); await flush();
+  assert.match(h.root().textContent, /Runtimes list/);
+  assert.doesNotMatch(h.root().textContent, /adapter|DeepOrca/);
+  assert.equal(h.root().querySelector('form'), null); assert.equal(h.mutations().length, 0);
   await h.close();
 });
 
@@ -568,6 +585,9 @@ test('runtime UI creation owns configuration fields while management requires re
   h.management.createAgent('m1');await flush();
   const root=h.root(), runtime=root.querySelector('[data-field="runtime"]');
   const project=root.querySelector('[data-field="local_project_id"]');
+  assert.equal(runtime.closest('.field').querySelector('label').textContent, 'Runtime');
+  assert.doesNotMatch(root.textContent, /Runtime adapter/);
+  assert.ok(runtime.querySelectorAll('option').some(option=>option.value === 'deeporca'));
   const endpoint=root.querySelector('[data-field="base_url"]'), auth=root.querySelector('[data-field="auth_mode"]');
   assert.deepEqual(loaded,['runtime-catalog']);
   assert.equal(root.querySelector('[data-field="template"]'),null);

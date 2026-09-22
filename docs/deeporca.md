@@ -32,6 +32,15 @@ external-provider verification, deployment validation, or production readiness.
 The integration does not install DeepOrca automatically and does not change the
 installation requirements for other runtimes.
 
+In a Machine's **Runtimes** list, DeepOrca appears alongside the other reported
+runtimes, including when its SDK is missing. Its **Setup guide** links to
+[aka.ms/deeporca](https://aka.ms/deeporca) through the existing
+`installation.guidance.url` field; no install command or separate setup flow is
+added. **Add agent** uses the single **Runtime** selector for installed runtimes;
+adapters remain an internal implementation detail. After changing an installation,
+reconnect the Connector, then refresh the reported status. The shared inventory
+rows wrap on narrow screens rather than overlapping names and setup commands.
+
 ## 1. Install into the Connector's Python environment
 
 First follow [Install AgentBridge](install.md). Install a DeepOrca checkout or
