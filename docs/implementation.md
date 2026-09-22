@@ -324,7 +324,9 @@ exception/stderr text; no replacement session is created.
   retained draft on title conflict. History separates View history, Attach live,
   and explicit Resume; unsupported/terminal historical restart is disabled with
   a reason, not converted into New session. Preparation and safe resume failures
-  are visible; logical ready does not claim restored native history.
+  are visible; a failed startup/resume clears the matching card's `starting`
+  state to `inactive` while keeping input disabled and the error visible.
+  Logical ready does not claim restored native history.
 - **`app.js`** — shell composition, signed-in/workspace context, top navigation,
   collapsible sidebar, management, and optional keyboard/command affordances.
   **`main.js`** is the small bootstrap entry point.

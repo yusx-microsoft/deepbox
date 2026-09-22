@@ -1236,12 +1236,16 @@ test('Access revoked while loading history or before socket-open consumes Resume
 });
 
 test('Native resume errors stay visible and never fall back to create or automatic resume', async () => {
-  for (const code of ['resume_required', 'session_changed', 'context.not_found', 'context.in_use', 'context.recovery_required', 'cli_failed']) {
+  for (const type of ['error', 'runtime.unavailable']) for (const code of ['resume_required', 'session_changed', 'context.not_found', 'context.in_use', 'context.recovery_required', 'cli_failed']) {
     const h = harness(), { pane, root } = h.create('error-' + code);
     h.sessions.set('a', [archived()]); await pane.open({ kind: 'history', agentId: 'a' });
     ui(root, 'session-resume').click(); await flush();
     const socket = h.sockets[0]; socket.open();
-    socket.receive({ type: code === 'cli_failed' ? 'runtime.unavailable' : 'error', code, message: 'CLI reported ' + code });
+    socket.receive({ type: 'status', state: 'starting', launch_id: 'failed-launch' });
+    assert.match(ui(root, 'session-detail').textContent, /starting/);
+    socket.receive({ type, code, launch_id: 'failed-launch', message: 'CLI reported ' + code });
+    assert.match(ui(root, 'session-detail').textContent, /inactive/);
+    assert.doesNotMatch(ui(root, 'session-detail').textContent, /starting/);
     assert.match(ui(root, 'error').textContent, new RegExp(code.replace('.', '\\.')));
     assert.equal(ui(root, 'chat-input').disabled, true);
     socket.close(); assert.equal(h.timers.size, 0);
