@@ -316,17 +316,22 @@ exception/stderr text; no replacement session is created.
   focus, resize notification, and layout
   preferences keyed by user + workspace. Saved targets are whitelisted
   IDs/surface/kind alongside geometry, never messages, files, tokens, or roles.
-- **`pane.js`** — each pane's session/socket lifecycle, chat, terminal, replay,
+- **`pane.js`** — each pane's session/socket lifecycle, chat, terminal, saved history,
   reconnect, file reads, stale-response guards, and teardown. Closing detaches;
   it never terminates the backend session. New chat leaves the old session alive.
   Unsent drafts remain independent in memory and never enter layout storage.
-  History/replay and live session headers provide metadata-only Rename with a
+  History and live session headers provide metadata-only Rename with a
   retained draft on title conflict. History separates View history, Attach live,
   and explicit Resume; unsupported/terminal historical restart is disabled with
   a reason, not converted into New session. Preparation and safe resume failures
   are visible; a failed startup/resume clears the matching card's `starting`
   state to `inactive` while keeping input disabled and the error visible.
   Logical ready does not claim restored native history.
+  Saved history immediately renders the full structured transcript or the latest
+  terminal checkpoint plus remaining output, read-only. There is no timed player,
+  seek/speed UI, recording download, or retention/deletion toolbar. The legacy
+  `kind: 'replay'`, helper aliases, and `/replay` API remain compatible with saved
+  layouts and existing data; they do not imply playback or automatic Resume.
 - **`app.js`** — shell composition, signed-in/workspace context, top navigation,
   collapsible sidebar, management, and optional keyboard/command affordances.
   **`main.js`** is the small bootstrap entry point.
@@ -339,12 +344,13 @@ exception/stderr text; no replacement session is created.
   [optional key contract](agentbridge.md#optional-tmux-style-interaction).
 - **`ui.js`, `chat.js`, `replay.js`, `collaboration.js`** — shared helpers:
   fleet aggregation, filtering, command building, runtime label/option handling,
-  the canonical event reducer, JSONL parsing, replay seek/checkpoint logic, and
+  the canonical event reducer, JSONL parsing, saved-history event/checkpoint reconstruction, and
   collaboration view state, plus the transcript renderer.
 - **`terminal-assets.js`** — on-demand, retryable loader for the existing pinned
   jsDelivr xterm CSS/JS and fit addon. Chat/app boot never wait for the CDN;
-  terminal load failure is visible before any session-creation request. Terminal
-  replay keeps its toolbar when mounting xterm. No vendor downloads were performed
+  terminal load failure is visible before any session-creation request. Saved
+  terminal history keeps its metadata and an explicit renderer-failure notice if
+  xterm cannot load. No vendor downloads were performed
   during implementation; xterm has not been vendored or removed.
 
 Local deferred script order is `ui → chat → collaboration → replay → api → dialogs →

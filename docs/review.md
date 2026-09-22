@@ -60,13 +60,13 @@ Technical proposals elsewhere are not evidence that this draft has been accepted
   in CLI/package/service/log identifiers. Do not rename URLs, env keys, auth, or storage.
 - [ ] Verify local helper load order and chat boot with CDN requests blocked.
   Exercise terminal asset failure/retry with a stub: visible failure, no premature
-  session create, and no xterm initialization for chat/structured replay. Existing
+  session create, and no xterm initialization for Chat history. Existing
   pinned xterm is still a runtime CDN dependency, not newly vendored assets.
 - [ ] Split right/below up to four panes; reject a fifth. Drag row/column dividers,
   use axis arrow keys and Home, select/maximize/restore, and verify keyboard focus,
   accessible separator values, ratio persistence, and terminal resize notification.
 - [ ] Close one pane while other panes are active. Only its socket/listeners/timers
-  detach; the backend session and other pane sockets/chat/replay continue.
+  detach; the backend session and other pane sockets/chat/history remain intact.
 
 ### State, permission, and lifecycle review
 
@@ -74,15 +74,20 @@ Technical proposals elsewhere are not evidence that this draft has been accepted
   sign out/in as another user, and check isolation. Inspect saved JSON: geometry,
   selection, and target IDs/surface/kind only; no messages/files/tokens/roles or
   `forceNew`. Missing/deleted/ended saved live targets must not create sessions.
-- [ ] Exercise two structured chats, terminal + chat, and live + replay concurrently.
+- [ ] Exercise two structured chats, terminal + chat, and live + saved history concurrently.
   Reconnect, history loads, file reads, or responses from closed/replaced panes
   must not render into or mutate the current pane/workspace.
 - [ ] Keep distinct unsent drafts while focusing/resizing/splitting panes; no draft
   crosses panes or enters saved layout JSON. New chat must not replace another pane's
   draft or end the previous shared session.
 - [ ] Explicit Terminal reuses only a known live terminal, never Chat/unknown
-  surface. New chat and New session preserve old shared sessions; replay never
+  surface. New chat and New session preserve old shared sessions; View history never
   becomes a live create. End session remains separate and confirmed.
+- [ ] View history immediately shows the full saved Chat transcript or final Terminal
+  screen (latest checkpoint plus later output, without duplicate equal-time frames).
+  No role sees playback, seek/speed, download, retention, or recording-delete controls.
+  History remains read-only, opens no live socket, and creates no playback timer;
+  recording data/APIs, Rename, Attach live, and explicit Resume remain separate.
 - [ ] Operator/Admin/Owner can send structured input without keyboard ownership;
   Viewer cannot. Terminal input/resize/termination remain holder-only, including
   for an Admin/Owner. Structured termination requires current Operator/Admin/Owner

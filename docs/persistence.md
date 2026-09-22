@@ -282,7 +282,15 @@ confirmed reap can clear an active native-writer journal.
 ## 6. Retention and secure erase
 
 Retention is per session (`session.retention`), one of `none | 7d | 30d |
-permanent` (default `30d`). Enforcement lives in `RecordingStore`:
+permanent` (default `30d`).
+
+The workbench displays saved history as a read-only final transcript or terminal
+screen, not a timed recording player. It no longer exposes recording download,
+retention, or deletion controls. This UI change does not change existing data,
+retention policies, frame/checkpoint persistence, reconnect restore, or the
+authorized recording export/PATCH/DELETE APIs.
+
+Enforcement lives in `RecordingStore`:
 
 - `redact_expired()` walks each session and, for frames older than the policy
   window (`none` = redact immediately; `permanent` = never), blanks `data` to a

@@ -13,7 +13,6 @@
   'use strict';
 
   const OPERATORS = ['operator', 'admin', 'owner'];
-  const ADMINS = ['admin', 'owner'];
   const titleObservers = new Set();
   function publishTitle(workspaceId, sessionId, title) {
     for (const observer of titleObservers) observer(workspaceId, sessionId, title);
@@ -61,7 +60,7 @@
     let persistedRenderer = null, rendererView = null, rendererLoading = false, rendererFailed = false;
     let inputSequence = 0;
     let nativeSubmission = null;
-    let recording = null, replayTimer = null, replayPlaying = false, replaySpeed = 1, replayCursor = 0, replayGeneration = 0;
+    let recording = null;
     let nodes = {}, listeners = [];
     let sessionCards = [], sessionActionPending = false;
     const readers = new Set();
@@ -76,7 +75,6 @@
       return current(epoch) && !!target && OPERATORS.includes(workspace()?.role)
         && (!collaboration || collaboration.canOperate);
     }
-    function canManageRecording() { return current(epoch) && ADMINS.includes(workspace()?.role); }
     function connected() {
       return current(epoch) && target?.kind === 'live' && !!target.sessionId && wantOpen && liveActive
         && !!socket && socket.readyState === 1;
@@ -191,13 +189,6 @@
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    function pauseReplay() {
-      ++replayGeneration;
-      replayPlaying = false;
-      if (replayTimer !== null) window.clearTimeout(replayTimer);
-      replayTimer = null;
-      updateReplayUI();
-    }
     function detachSocket() {
       stopHeartbeat();
       if (inputSender) inputSender.close();
@@ -225,7 +216,7 @@
     function reset() {
       ++epoch; // Invalidate REST, dialogs, file reads, and already queued WS/DOM callbacks first.
       wantOpen = false; liveActive = false;
-      stopReconnect(); pauseReplay(); detachSocket(); disposeTerminal();
+      stopReconnect(); detachSocket(); disposeTerminal();
       if (abortController) abortController.abort();
       abortController = null;
       for (const reader of readers) { try { reader.abort(); } catch (_) {} }
@@ -240,7 +231,7 @@
       announcedCapability = null;
       rendererView?.destroy(); rendererView = null;
       persistedRenderer = null; rendererLoading = false; rendererFailed = false;
-      recording = null; replaySpeed = 1; replayCursor = 0;
+      recording = null;
       reconnectDelay = 500; endPending = false;
       root.textContent = '';
     }
@@ -299,7 +290,7 @@
       if (!target.surface && target.kind !== 'replay')
         target.surface = validSurface(UI.preferredSurface(capability())) || 'terminal';
       if (typeof window.AbortController === 'function') abortController = new window.AbortController();
-      status = 'opening'; statusText = target.kind === 'live' ? 'Opening session…' : 'Loading ' + target.kind + '…';
+      status = 'opening'; statusText = target.kind === 'live' ? 'Opening session…' : 'Loading history…';
       mountShell();
       setStatus(status, statusText);
       try {
@@ -309,7 +300,7 @@
         else await loadReplay(view);
       } catch (error) {
         if (current(view)) {
-          setStatus('error', 'Could not open ' + target.kind);
+          setStatus('error', 'Could not open ' + (target.kind === 'replay' ? 'history' : target.kind));
           reportError(error.message || 'The request failed. Use Reconnect to retry.');
         }
       }
@@ -1225,7 +1216,7 @@
       setStatus('history', 'Session history');
     }
     async function loadReplay(view) {
-      if (!target.sessionId) { unavailable('Choose a saved session from History to replay.', false); return; }
+      if (!target.sessionId) { unavailable('Choose a saved session from History to view.', false); return; }
       const sessionId = target.sessionId, agentId = target.agentId;
       const metadata = await request(sessionPath(sessionId));
       if (!current(view)) return;
@@ -1257,133 +1248,31 @@
         if (!current(view)) return;
       }
       const mounted = rendererReady && mountSurface();
-      // Surface initialization only owns its host, never this sibling toolbar.
-      mountReplayControls();
       if (mounted) {
-        replaySeek(target.surface === 'structured' ? replayDuration() : 0);
-        setStatus('replay', 'Replay · read-only');
+        renderSavedHistory();
+        setStatus('history', 'Session history · read-only');
       }
     }
-    function replayDuration() {
-      let duration = 0;
-      for (const items of [recording?.events || [], recording?.checkpoints || []])
-        for (const item of items) if (Number.isFinite(Number(item.time))) duration = Math.max(duration, Number(item.time));
-      return duration;
-    }
-    function mountReplayControls() {
-      const bar = element('div', 'replay-controls', 'pane-replay-controls');
-      nodes.play = button('replay-play', 'Play', () => { replayPlaying ? pauseReplay() : playReplay(); });
-      bar.append(nodes.play, button('replay-start', 'Start', () => { pauseReplay(); replaySeek(0); }),
-        button('replay-end', 'End', () => { pauseReplay(); replaySeek(replayDuration()); }));
-      const speed = element('select', 'replay-speed');
-      speed.setAttribute('aria-label', 'Replay speed');
-      for (const value of [0.5, 1, 2, 8]) {
-        const option = element('option', null, null, value + '×'); option.value = String(value); speed.appendChild(option);
-      }
-      speed.value = '1';
-      listen(speed, 'change', () => {
-        replaySpeed = [0.5, 1, 2, 8].includes(Number(speed.value)) ? Number(speed.value) : 1;
-        if (replayPlaying) { pauseReplay(); playReplay(); }
-      });
-      nodes.seek = element('input', 'replay-seek');
-      nodes.seek.type = 'range'; nodes.seek.min = '0'; nodes.seek.max = String(replayDuration()); nodes.seek.step = '0.01';
-      nodes.seek.setAttribute('aria-label', 'Replay position');
-      listen(nodes.seek, 'input', () => {
-        const time = Number(nodes.seek.value);
-        pauseReplay(); replaySeek(time);
-      });
-      nodes.time = element('span', 'replay-time', 'muted');
-      const download = element('a', 'replay-download', 'ghost', 'Download recording');
-      download.href = '/api/sessions/' + encodeURIComponent(target.sessionId) + '/recording';
-      download.setAttribute('download', '');
-      bar.append(speed, nodes.seek, nodes.time,
-        button('replay-final', target.surface === 'structured' ? 'Final transcript' : 'Final screen', () => { pauseReplay(); replaySeek(replayDuration()); }), download);
-      const label = element('label', null, null, 'Retention ');
-      const retention = element('select', 'replay-retention');
-      for (const [value, text] of [['none', 'None'], ['7d', '7 days'], ['30d', '30 days'], ['permanent', 'Permanent']]) {
-        const option = element('option', null, null, text); option.value = value; retention.appendChild(option);
-      }
-      retention.value = recording.retention || recording.metadata?.retention || 'permanent';
-      retention.disabled = !canManageRecording();
-      label.appendChild(retention);
-      const message = element('span', 'replay-retention-message', 'muted');
-      const sessionId = target.sessionId, view = epoch;
-      let savedRetention = retention.value, retentionPending = false, deletePending = false;
-      listen(retention, 'change', async () => {
-        if (!canManageRecording() || retentionPending) { retention.value = savedRetention; return; }
-        const value = retention.value;
-        if (!['none', '7d', '30d', 'permanent'].includes(value)) return;
-        retentionPending = true; retention.disabled = true;
-        try {
-          await request('/api/sessions/' + encodeURIComponent(sessionId) + '/retention', { method: 'PATCH', body: JSON.stringify({ retention: value }) });
-          if (current(view)) { savedRetention = value; message.textContent = 'Saved'; }
-        } catch (error) {
-          if (current(view)) { retention.value = savedRetention; message.textContent = error.message || 'Could not save retention.'; }
-        } finally {
-          if (current(view)) { retentionPending = false; retention.disabled = !canManageRecording(); }
-        }
-      });
-      const remove = button('replay-delete', 'Delete recording', async () => {
-        if (!canManageRecording() || deletePending) return;
-        deletePending = true; remove.disabled = true;
-        try {
-          const ok = services.confirm && await services.confirm('Delete recording?', 'Permanently erase this recorded transcript and checkpoints. This cannot be undone.', 'Delete recording');
-          if (!ok || !current(view) || !canManageRecording()) return;
-          await request('/api/sessions/' + encodeURIComponent(sessionId) + '/recording', { method: 'DELETE' });
-          if (current(view)) await open(snapshot());
-        } catch (error) { if (current(view)) message.textContent = error.message || 'Could not delete recording.'; }
-        finally { if (current(view)) { deletePending = false; remove.disabled = !canManageRecording(); } }
-      });
-      remove.disabled = !canManageRecording();
-      bar.append(label, message, remove);
-      root.appendChild(bar);
-      updateReplayUI();
-    }
-    function replaySeek(time) {
+    function renderSavedHistory() {
+      // Legacy target/API names stay compatible; saved history is a static final view.
       if (closed || target.kind !== 'replay' || !recording) return;
-      replayCursor = Math.max(0, Math.min(Number(time) || 0, replayDuration()));
       if (target.surface === 'structured') {
         chat = Chat.initialChatState();
-        for (const event of Replay.eventsBetween(recording.events, -Infinity, replayCursor))
+        for (const event of Replay.eventsBetween(recording.events, -Infinity, Infinity))
           if (event.kind === 'event' || event.type === 'event') chat = Chat.foldEventPayload(chat, event.data, false).state;
         renderChat();
       } else if (terminal) {
         terminal.reset();
-        const index = Replay.nearestCheckpointIndex(recording.checkpoints, replayCursor);
+        const index = Replay.nearestCheckpointIndex(recording.checkpoints, Infinity);
         let startTime = -Infinity, startCursor = null;
         if (index >= 0) {
           const checkpoint = recording.checkpoints[index];
           if (checkpoint.serialized_screen) terminal.write(checkpoint.serialized_screen);
           startTime = checkpoint.time; startCursor = checkpoint.cursor;
         }
-        for (const event of Replay.eventsBetween(recording.events, startTime, replayCursor, startCursor))
+        for (const event of Replay.eventsBetween(recording.events, startTime, Infinity, startCursor))
           if ((event.type === 'o' || event.type === 'output') && event.data != null) terminal.write(event.data);
       }
-      updateReplayUI();
-    }
-    function updateReplayUI() {
-      if (nodes.seek) nodes.seek.value = String(replayCursor);
-      if (nodes.time) nodes.time.textContent = Replay.formatClock(replayCursor) + ' / ' + Replay.formatClock(replayDuration());
-      if (nodes.play) nodes.play.textContent = replayPlaying ? 'Pause' : 'Play';
-    }
-    function playReplay() {
-      if (closed || target?.kind !== 'replay' || !recording || target.surface === 'terminal' && !terminal) return;
-      if (replayCursor >= replayDuration()) replaySeek(0);
-      replayPlaying = true; updateReplayUI(); scheduleReplayStep();
-    }
-    function scheduleReplayStep() {
-      if (!replayPlaying || !recording) return;
-      let time = Infinity;
-      for (const items of [recording.events, recording.checkpoints])
-        for (const item of items)
-          if (Number.isFinite(item.time) && item.time > replayCursor + 1e-9) time = Math.min(time, item.time);
-      if (!Number.isFinite(time)) { pauseReplay(); return; }
-      const view = epoch, ownRecording = recording, generation = replayGeneration;
-      replayTimer = window.setTimeout(() => {
-        if (!current(view) || recording !== ownRecording || !replayPlaying || generation !== replayGeneration) return;
-        replayTimer = null;
-        replaySeek(time); scheduleReplayStep();
-      }, Math.max(0, (time - replayCursor) * 1000 / replaySpeed));
     }
 
     function reconnect() {
@@ -1424,8 +1313,6 @@
       syncAccess();
       const create = root.querySelector('[data-ui="history-new"]');
       if (create) create.disabled = !canOperate();
-      for (const control of root.querySelectorAll('[data-ui="replay-retention"], [data-ui="replay-delete"]'))
-        control.disabled = !canManageRecording();
       notify();
     }
     return { id, open, getState, snapshot, focus, resize, close, reconnect, newSession, endSession,
