@@ -69,8 +69,10 @@ a compact collapsible sidebar, flexible panes, and restrained sans-serif UI type
 with monospace code/data. Subtle borders and spacing support light/dark themes;
 no green tmux status bar or forced full-screen TUI. Small local helpers separate
 shell/management from the split tree and each pane's connection and chat/terminal/
-replay lifecycle. The four-pane cap, independent in-memory drafts, safe restore,
-and existing roles remain. Closing only detaches; layout preferences are not
+history lifecycle. Saved history displays its final content immediately, read-only;
+the recording player and recording-management toolbar are removed, not the stored
+recordings, recovery pipeline, or explicit Resume. The four-pane cap, independent
+in-memory drafts, safe restore, and existing roles remain. Closing only detaches; layout preferences are not
 conversation, draft, or permission storage. See the [pane acceptance checklist](review.md#acceptance-checklist-pending).
 
 The existing pinned jsDelivr xterm dependency remains terminal-only and on demand;

@@ -277,7 +277,7 @@ test('compact pane header has an agent chooser, readable badges and only split/o
   h.bench.close();
 });
 
-test('header separates connection/activity from viewer, replay and terminal keyboard access',async()=>{
+test('header separates connection/activity from viewer, saved history and terminal keyboard access',async()=>{
   const h=mountedWorkbench();await h.bench.open({kind:'live',agentId:'builder',surface:'structured'});
   const pane=h.bench.getActive(), frame=pane.root.parentNode, input=pane.root.querySelector('[data-draft]');
   const status=frame.querySelector('.pane-status'), access=frame.querySelector('.pane-access');
@@ -293,8 +293,10 @@ test('header separates connection/activity from viewer, replay and terminal keyb
   assert.equal(access.dataset.access,'viewer');assert.match(access.title,/Read-only/);
   pane.updateState({canOperate:true});
   assert.equal(access.textContent,'Read-only');assert.equal(access.dataset.access,'readonly');
-  pane.updateState({kind:'replay',status:'replay',statusText:'Replay · read-only',canOperate:false});
-  assert.equal(status.textContent,'Replay');assert.equal(access.textContent,'Read-only');
+  pane.updateState({kind:'replay',status:'history',statusText:'Session history · read-only',canOperate:false});
+  assert.equal(status.textContent,'History');assert.equal(access.textContent,'Read-only');
+  pane.updateState({status:'replay',statusText:'Session history · read-only'});
+  assert.equal(status.textContent,'History','the legacy internal state is never labelled as a player');
   pane.updateState({kind:'live',surface:'terminal',status:'live',statusText:'Terminal ready',canOperate:true});
   assert.equal(access.textContent,'Keyboard free');assert.equal(access.dataset.access,'available');
   assert.match(access.title,/Read-only until you take the keyboard/);

@@ -15,7 +15,7 @@ auth, cookie, hash, IPC, or persistent identity contract.
 
 > AgentBridge is a **durable session control plane** for AI coding agents. Users connect the
 > agent CLIs already running on their own devbox — Claude Code, Codex CLI, GitHub Copilot
-> CLI — to the platform, then view, drive, resume, and replay those sessions from any
+> CLI — to the platform, then view, drive, resume, and inspect saved sessions from any
 > browser.
 >
 > This document is the durable product specification. For technical architecture see
@@ -44,7 +44,7 @@ Sessions should remain reachable when a browser closes or the server restarts.
 - A **connector** the user runs on their own machine, bridging the local agent CLI and the
   server.
 - A **web workspace** to browse agents, start and resume sessions, chat with structured
-  runtimes, drive the terminal fallback, and replay history.
+  runtimes, drive the terminal fallback, and view saved history.
 
 ### 1.2 What we do not provide
 
@@ -98,7 +98,8 @@ The transport underneath is a PTY, but the core product object is the **session*
    its output.
 3. With several agents and devboxes, I want to know which is online, which is working, and
    which is waiting for input.
-4. When a task finishes, I want to replay what the agent did, not only see the final result.
+4. When a task finishes, I want to read its saved transcript or final terminal screen
+   without restarting the agent.
 5. When collaborating, I want others to view a session while preventing several people from
    typing into it at once.
 
@@ -115,7 +116,7 @@ User / Workspace
                  ├── Live terminal or structured chat
                  ├── Viewers + keyboard lease
                  ├── Structured events / permission prompts
-                 └── Durable recording / replay
+                 └── Durable recording / read-only history
 ```
 
 - **User** — a person who signs in. Local username/password sign-in is supported; Azure
@@ -160,7 +161,7 @@ connector may retain the process and replay spooled output after reconnect.
 | Open agent | Resume a live session matching the chosen surface; create one when none matches |
 | Detach | Close this viewer only; keep the local process running |
 | Terminate | Explicitly request process shutdown; terminal requires the keyboard holder, structured requires current Operator/Admin/Owner access |
-| Replay | Read a durable recording without starting a process |
+| View history | Read the saved transcript or final terminal screen without starting a process |
 
 A WebSocket close is not process death. Multiple viewers may attach. A terminal has
 one active keyboard holder; a structured chat can accept messages from every Operator
@@ -179,8 +180,8 @@ opens a native chat before the first frame instead of scraping ANSI text.
   runtime adapter runs a `StructuredAgentSession`, emits a canonical event stream, and maps
   per-turn options to native control requests. The server checks only generic lifecycle/
   context features for Resume; the browser renders the generic feature/control schema.
-- **Legacy / TUI runtimes** fall back to `xterm.js` rendering raw PTY bytes, with resize,
-  reconnect, and replay behavior unchanged.
+- **Legacy / TUI runtimes** fall back to `xterm.js` rendering raw PTY bytes, with resize
+  and reconnect restore. Saved history shows the final terminal screen without playback.
 
 The browser uses the session's explicit `surface` and generic reported capabilities,
 not runtime names. Choosing **Terminal** never reuses a Chat or unknown-surface session.
@@ -203,9 +204,9 @@ from writing that conversation concurrently. Uncertain crash recovery requires
 explicit local confirmation, not an automatic lease timeout.
 
 **Current local changes:** Rename and explicit Resume are implemented separately
-from replay; this is not new live Workspace/real-CLI acceptance or a deployment claim.
+from read-only history; this is not new live Workspace/real-CLI acceptance or a deployment claim.
 
-- **Rename** changes only the display title, from a live header or History/replay.
+- **Rename** changes only the display title, from a live header or History.
   Current Operator/Admin/Owner access is required. Titles are trimmed, single-line,
   1–120 characters; a concurrent title change returns a conflict rather than
   overwriting it, and the dialog retains the draft for refresh/retry. Session,
@@ -329,14 +330,18 @@ Server stops
 → viewers reconnect automatically and restore
 ```
 
-### 6.6 Replay history
+### 6.6 View saved history
 
 ```text
 Open History for an agent
-→ choose a recorded session
-→ load recording metadata and checkpoints
-→ play / pause / seek / change speed
+→ choose a session's View history action
+→ load saved metadata, events, and checkpoints
+→ immediately show the full Chat transcript or final Terminal screen, read-only
 ```
+
+There are no playback, seek, speed, recording download, or retention/deletion
+controls in the workbench. Existing recordings and server-side retention/export/
+erase APIs remain intact. Reading history is not Resume and never starts an agent.
 
 ---
 
@@ -349,7 +354,7 @@ App shell
 ├── Refined top navigation: workspace, management, theme and account
 ├── Compact collapsible sidebar: Workspace → Devbox → Agent
 └── Workbench: one to four panes in a user-defined binary split tree
-    ├── Pane: quiet header and controls, chat / terminal / replay
+    ├── Pane: quiet header and controls, chat / terminal / saved history
     └── Row/column separator + sibling pane or nested split
 ```
 
@@ -367,7 +372,7 @@ not written into layout preferences or shared with another pane.
 User/workspace-scoped preferences retain layout geometry and target IDs/surface/kind,
 not messages, files, tokens, or roles. Restore never carries `forceNew` and never
 auto-creates sessions for missing or ended saved live targets. Pane teardown owns
-its socket/chat/terminal/replay resources; closing is not session termination.
+its socket/chat/terminal/history resources; closing is not session termination.
 See [implementation](implementation.md#5-web-web) for the actual module boundaries.
 
 ### 7.2 Session control surface
@@ -375,8 +380,8 @@ See [implementation](implementation.md#5-web-web) for the actual module boundari
 The pane header shows its name, surface and connection state, with compact controls
 and explicit permission/keyboard context. Opening an agent resumes
 its newest compatible live session or creates
-one when none is live. History lists recorded sessions with their creation time and derived
-state, and provides Replay.
+one when none is live. History lists sessions with their creation time and derived
+state, and separates View history, Attach live, and explicitly supported Resume.
 
 ### 7.3 Optional tmux-style shortcuts and command prompt
 
@@ -508,14 +513,15 @@ Resume; the web renders their generic schema, without runtime-name branches.
 - Production Origin allowlist, layered rate limits, and security headers.
 - Redacted JSON audit logging.
 - Token rotation and revocation that disconnect immediately.
-- Recording retention and secure erase by workspace admins and owners.
+- Recording retention and secure erase via server APIs for workspace admins and owners.
 
 ### 12.3 Recording privacy
 
 Terminal output can contain code, internal paths, URLs, environment details, and even
 accidentally printed secrets. Sessions are durably recorded with a per-session retention
 policy. Workspace members may view recordings according to workspace RBAC; workspace
-admins and owners may change retention or securely erase payloads.
+admins and owners may change retention or securely erase payloads through the
+recording APIs. The workbench has no recording-management toolbar.
 
 ---
 
@@ -575,7 +581,7 @@ This directly measures whether the platform delivers value a local terminal cann
 - Live sessions per week.
 - Ratio of Resume vs. rebuild.
 - Cross-device resume count.
-- Replay usage rate.
+- Saved-history access rate.
 
 ### 15.4 Non-goals
 

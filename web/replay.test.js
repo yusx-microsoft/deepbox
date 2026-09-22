@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock} = require('./replay.js');
+const {nearestCheckpointIndex, eventsBetween, normalizeReplay} = require('./replay.js');
 
 test('normalizeReplay maps server frame and checkpoint fields', () => {
   const replay = normalizeReplay({
@@ -21,7 +21,12 @@ test('checkpoint seek applies only frames after its durable cursor', () => {
   assert.deepEqual(eventsBetween(events, 1, 2, 4).map(e => e.cursor), [5, 6]);
 });
 
-test('formatClock is stable for replay controls', () => {
-  assert.equal(formatClock(0), '0:00');
-  assert.equal(formatClock(65.9), '1:05');
+test('final history selects the latest checkpoint and all remaining durable output', () => {
+  const recording = normalizeReplay({
+    events: [{time: 3, frame_id: 9, data: 'included'}, {time: 3, frame_id: 10, data: 'after'}],
+    checkpoints: [{time: 3, frame_id: 9, screen: 'latest'}, {time: 1, frame_id: 4, screen: 'old'}],
+  });
+  const checkpoint = recording.checkpoints[nearestCheckpointIndex(recording.checkpoints, Infinity)];
+  assert.equal(checkpoint.serialized_screen, 'latest');
+  assert.deepEqual(eventsBetween(recording.events, checkpoint.time, Infinity, checkpoint.cursor).map(e => e.data), ['after']);
 });

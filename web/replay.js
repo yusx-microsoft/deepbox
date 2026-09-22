@@ -37,12 +37,5 @@
     return Object.assign({}, payload, {events, checkpoints});
   }
 
-  function formatClock(seconds){
-    const value = Math.max(0, Number(seconds)||0);
-    const minutes = Math.floor(value/60);
-    const remainder = Math.floor(value%60);
-    return `${minutes}:${String(remainder).padStart(2,'0')}`;
-  }
-
-  return {nearestCheckpointIndex, eventsBetween, normalizeReplay, formatClock};
+  return {nearestCheckpointIndex, eventsBetween, normalizeReplay};
 });

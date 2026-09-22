@@ -359,12 +359,13 @@ for(const renderer of ['deeporca-chat-v1','https://untrusted.test/plugin.js']) f
   }
  }});
  await pane.open({kind:'replay',agentId:'archived',sessionId:'stored',surface:'structured'});await flush();
- assert.equal(pane.getState().status,'replay');assert.equal(pane.getState().readOnly,true);
+ assert.equal(pane.getState().status,'history');assert.equal(pane.getState().readOnly,true);
  assert.equal(!!root.querySelector('.deeporca-chat'),renderer==='deeporca-chat-v1');
  // Current history fetches identity/action metadata before the retained recording.
  assert.deepEqual(requests,['/api/sessions/stored','/api/sessions/stored/replay']);assert.equal(b.sockets.length,0);
  assert.equal(root.querySelector('[data-ui="session-title"]').textContent,'Archived conversation');
- assert.ok(root.querySelector('[data-ui="replay-controls"]'));
+ for(const control of ['controls','play','start','end','speed','seek','time','final','download','retention','delete'])
+  assert.equal(!!root.querySelector('[data-ui="replay-'+control+'"]'),false);
  assert.equal(root.querySelector('[data-ui="chat-renderer-notice"]').hidden,renderer==='deeporca-chat-v1');
  if(renderer!=='deeporca-chat-v1')assert.match(root.textContent,/Unsupported conversation renderer/);
  assert.equal(root.querySelector('[data-ui="chat-composer"]').hidden,true);

@@ -99,7 +99,7 @@
         ? state.permissionPending ? 'permission' : state.pending ? 'working' : 'idle' : 'idle';
       const labels = {empty:'', opening:'Opening', connecting:'Connecting', connected:'Waiting', live:'Live',
         offline:'Offline', disconnected:'Disconnected', reconnecting:'Reconnecting', unavailable:'Unavailable',
-        error:'Error', history:'History', replay:'Replay', inactive:'Ended', ended:'Ended', closed:'Closed'};
+        error:'Error', history:'History', replay:'History', inactive:'Ended', ended:'Ended', closed:'Closed'};
       const status = activity === 'permission' ? 'Permission needed' : activity === 'working' ? 'Working'
         : labels[connection] ?? connection;
       const detail = [status, state.statusText].filter((text, i, all)=>text && all.indexOf(text) === i).join(' · ');

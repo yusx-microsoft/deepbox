@@ -344,8 +344,9 @@ Each AgentBridge session has a persisted mapping to a native DeepOrca session.
 DeepOrca saves model context in its managed profile; continuing the same mapped
 session can therefore resume context after a worker/Connector restart.
 AgentBridge's normalized text/tool records and bounded native-event records
-serve browser display/replay. They are **not** re-fed to the model to reconstruct
-context, and a replayed transcript is not proof that native context was saved.
+serve live display and read-only saved history, without a recording player. They
+are **not** re-fed to the model to reconstruct context, and a displayed transcript
+is not proof that native context was saved.
 Large tool results can be displayed as labeled previews without truncating the
 SDK's own model context. A native `done` event alone is not a durable commit marker.
 
@@ -357,7 +358,7 @@ after authorization and generation checks, the Server routes it to the library
 session's `open` operation, not a CLI native-context adoption or writer lease.
 DeepOrca continuation is not offered for ended conversations or viewers. Supported
 CLI runtimes retain their separate native-writer/resume lifecycle. Ordinary
-Replay, opening an inactive conversation, and workspace-layout restore remain
+View history, opening an inactive conversation, and workspace-layout restore remain
 read-only: the one-shot continuation choice is not saved in layout state.
 
 Termination advances the Server's lifecycle generation immediately. A late exit

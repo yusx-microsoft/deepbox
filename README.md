@@ -70,7 +70,7 @@ CLI/package identifier and the basis for the `AGENTBRIDGE_*` environment prefix;
 - Up to **four visible panes** (not four managed agents), split right or below in a binary tree. Drag a separator or
   focus it and use the axis arrow keys; `Home` resets its ratio. Select, maximize,
   restore, or close a pane without replacing the other panes' sessions.
-- Each pane owns its socket, chat/terminal/replay state, and teardown. **Close
+- Each pane owns its socket, chat/terminal/history state, and teardown. **Close
   pane** only detaches; **New chat** preserves the old shared session. Ending a
   session is a separate, confirmed, permission-checked action.
 - Unsent drafts stay pane-local; focusing, resizing, or splitting another pane
@@ -78,6 +78,9 @@ CLI/package identifier and the basis for the `AGENTBRIDGE_*` environment prefix;
 - Layout preferences are scoped to the signed-in user and workspace. They contain
   geometry and target IDs/surface/kind, not messages, files, tokens, or roles.
   Restoring missing or ended targets never auto-creates sessions.
+- **View history** opens a read-only final transcript or terminal screen, without
+  playback, seeking, recording downloads, or retention/deletion controls. Saved
+  recordings and their server APIs remain unchanged; viewing history does not Resume.
 - Local helpers load in deterministic order. Chat and app boot do not wait for
   a CDN. `terminal-assets.js` loads the **existing pinned jsDelivr xterm dependency**
   only for terminal use; failure is visible before a session is created. No vendor
@@ -111,7 +114,7 @@ CLI/package identifier and the basis for the `AGENTBRIDGE_*` environment prefix;
 - Production Origin allowlist, tiered rate limiting, and security headers.
 - Redacted JSON audit logging.
 - Immediate disconnect on credential revocation.
-- Secure erase of durable recordings for workspace admins and owners.
+- Secure erase of durable recordings through the server API for workspace admins and owners.
 
 See [`docs/design.md`](docs/design.md) for how the durable recording pipeline
 (frames, checkpoints, replay, and retention) works.

@@ -210,10 +210,6 @@ svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-wi
 .history-item b{font-weight:400;font-size:11px;overflow-wrap:anywhere}
 .history-item>.muted{flex-basis:100%;font-size:10px}
 .history-item button{padding:3px 8px;font-size:10px}
-.pane-replay-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border-top:1px solid var(--line);padding:8px 10px;flex:none;font-size:10px;background:var(--panel)}
-.pane-replay-controls button,.pane-replay-controls select,.pane-replay-controls a{font-size:10px;padding:3px 6px}
-.pane-replay-controls input[type="range"]{flex:1;min-width:60px}
-.pane-replay-controls label{display:flex;align-items:center;gap:4px}
 
 /* Scoped dialogs and lightweight menus. */
 .overlay{position:fixed;inset:0;display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:10vh 20px 20px;background:rgba(7,13,23,.42);z-index:100}

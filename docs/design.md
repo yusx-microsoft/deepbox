@@ -525,7 +525,8 @@ Startup flow:
 ## 8. Web client (`web/`)
 
 The single-page workbench provides compact navigation, native chat, terminal, and
-replay. `app.js`/`main.js` compose the shell; API/dialogs/management are separate
+read-only saved history without a recording player. `app.js`/`main.js` compose the
+shell; API/dialogs/management are separate
 from the split-tree/workbench/pane lifecycle. Each pane owns its socket and surface,
 not a singleton session stage. See the [module map](implementation.md#5-web-web).
 

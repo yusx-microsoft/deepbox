@@ -6,6 +6,11 @@ const plain = value => JSON.parse(JSON.stringify(value));
 const flush = async () => { for (let i = 0; i < 8; ++i) await Promise.resolve(); };
 const ui = (root, name) => root.querySelector('[data-ui="' + name + '"]');
 const inputFrames = socket => socket.frames.filter(frame => frame.type === 'input');
+function assertNoRecordingControls(root) {
+  for (const name of ['replay-controls', 'replay-play', 'replay-start', 'replay-end', 'replay-speed',
+    'replay-seek', 'replay-time', 'replay-final', 'replay-download', 'replay-retention', 'replay-delete'])
+    assert.equal(Boolean(ui(root, name)), false, name + ' must not be rendered');
+}
 const session = (id, surface = 'structured', state = 'live', extra = {}) => ({ id, surface, state, ...extra });
 const payload = (...events) => events.map(event => JSON.stringify(event)).join('\n') + '\n';
 const collaboration = (role = 'operator', holder = false) => ({
@@ -134,15 +139,17 @@ test('metadata refresh resolves a promotion without bypassing either permission 
   pane.close();
 });
 
-test('catalog refresh updates recording permissions without recreating a pane',async()=>{
+test('catalog promotion keeps saved history read-only without restoring recording controls',async()=>{
   const h=harness({role:'viewer'});
   h.recordings.set('recorded',{surface:'structured',events:[],retention:'7d'});
   const {pane,root}=h.create('recording-roles');
   await pane.open({kind:'replay',agentId:'agent',sessionId:'recorded',surface:'structured'});
-  const select=ui(root,'replay-retention');assert.equal(select.disabled,true);
+  const transcript=ui(root,'chat-scroll');assertNoRecordingControls(root);
   const count=h.requests.length;h.workspace.role='owner';pane.refreshAccess();
-  assert.equal(select.disabled,false);assert.equal(h.requests.length,count);
-  assert.strictEqual(ui(root,'replay-retention'),select);
+  assertNoRecordingControls(root);assert.equal(h.requests.length,count);
+  assert.strictEqual(ui(root,'chat-scroll'),transcript);
+  assert.equal(pane.getState().readOnly,true);
+  assert.equal(ui(root,'chat-composer').hidden,true);
   pane.close();
 });
 
@@ -195,13 +202,15 @@ test('a cancelled renderer load never creates a stale terminal session', async (
   pane.close();
 });
 
-test('recording controls remain available if optional terminal assets fail', async () => {
+test('failed terminal assets preserve history metadata and errors without recording controls', async () => {
   const h = harness({role:'owner'});
   h.recordings.set('recorded',{surface:'terminal',events:[],checkpoints:[],retention:'7d'});
   const {pane,root} = h.create('replay-without-assets',{ensureTerminal:async()=>{ throw new Error('Renderer unavailable'); }});
   await pane.open({kind:'replay',agentId:'agent',sessionId:'recorded',surface:'terminal'});
-  assert.ok(ui(root,'replay-retention'));
-  assert.ok(ui(root,'replay-download'));
+  assertNoRecordingControls(root);
+  assert.ok(ui(root,'session-header'));
+  assert.equal(h.sockets.length,0);
+  assert.equal(h.timers.size,0);
   assert.match(root.textContent,/Renderer unavailable/);
   pane.close();
 });
@@ -333,7 +342,7 @@ test('restore never creates for absent, missing, inactive, ended or unavailable 
     session('offline', 'structured', 'live', { available: false }), session('resumable')]);
   for (const id of ['missing', 'ended', 'inactive', 'offline']) {
     await pane.open({ kind: 'live', agentId: 'a', sessionId: id, surface: 'structured', restore: true });
-    assert.ok(['unavailable', 'replay'].includes(pane.getState().status));
+    assert.ok(['unavailable', 'history'].includes(pane.getState().status));
   }
   await h.attach(pane, 'a', 'structured', { sessionId: 'resumable', restore: true, forceNew: true });
   assert.equal(pane.getState().sessionId, 'resumable');
@@ -542,7 +551,7 @@ test('canonical restore replaces provisional chat and settings without losing a 
   pane.close();
 });
 
-test('structured replay initializes no xterm and keeps controls connected, with read-only permissions and hidden composer', async () => {
+test('saved Chat displays its full transcript immediately without playback or writable permissions', async () => {
   const h = harness({ terminal: false }), { pane, root } = h.create('chat-replay');
   h.recordings.set('rec', { surface: 'structured', events: [
     { time: 1, kind: 'event', data: payload({ ev: 'message.delta', text: 'recorded' }) },
@@ -552,39 +561,52 @@ test('structured replay initializes no xterm and keeps controls connected, with 
   assert.equal(h.terminals.length, 0);
   assert.equal(pane.getState().replay, true);
   assert.equal(pane.getState().readOnly, true);
-  assert.ok(ui(root, 'replay-controls').isConnected);
+  assert.equal(pane.getState().status, 'history');
+  assert.equal(pane.getState().statusText, 'Session history · read-only');
+  assertNoRecordingControls(root);
   assert.equal(ui(root, 'chat-composer').hidden, true);
   assert.equal(root.querySelector('.chat-perm-allow').disabled, true);
   assert.match(ui(root, 'chat-scroll').textContent, /recorded/);
-  ui(root, 'replay-start').click();
-  assert.doesNotMatch(ui(root, 'chat-scroll').textContent, /recorded/);
-  ui(root, 'replay-play').click();
-  assert.equal(h.timers.size, 1);
-  h.runTimer([...h.timers.keys()][0]);
-  assert.match(ui(root, 'chat-scroll').textContent, /recorded/);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.sockets.length, 0);
+  assert.ok(h.requests.every(request => !request.method || request.method === 'GET'));
   pane.close();
   assert.equal(h.timers.size, 0);
 });
 
-test('terminal replay keeps sibling toolbar intact and checkpoint cursor avoids duplicated equal-time output', async () => {
+test('saved Terminal immediately shows its final screen without duplicated equal-time output', async () => {
   const h = harness(), { pane, root } = h.create('terminal-replay');
   h.recordings.set('rec', { surface: 'terminal', checkpoints: [{ time: 1, cursor: 1, serialized_screen: 'A' }],
     events: [{ time: 1, cursor: 1, type: 'o', data: 'A' }, { time: 1, cursor: 2, type: 'o', data: 'B' }, { time: 2, cursor: 3, type: 'o', data: 'C' }] });
   await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'rec' });
-  const bar = ui(root, 'replay-controls'), terminal = h.terminals[0];
-  assert.ok(bar.isConnected);
-  ui(root, 'replay-final').click();
+  const terminal = h.terminals[0];
   assert.equal(terminal.output, 'ABC');
-  assert.equal(bar, ui(root, 'replay-controls'));
-  const seek = ui(root, 'replay-seek'); seek.value = '1'; seek.dispatchEvent({ type: 'input' });
-  assert.equal(terminal.output, 'AB');
+  assertNoRecordingControls(root);
+  assert.equal(pane.getState().status, 'history');
+  assert.equal(h.timers.size, 0);
   terminal.emit('not writable'); pane.resize();
   assert.equal(h.sockets.length, 0);
   pane.close();
   assert.ok(terminal.disposed);
 });
 
-test('history attaches exact live surfaces and ended records replay without spawning', async () => {
+test('saved Terminal supports output-only and checkpoint-only records without a player', async () => {
+  for (const [recording, expected] of [
+    [{ events: [{ time: 0, type: 'o', data: 'first' }, { time: 3, type: 'o', data: 'last' }] }, 'firstlast'],
+    [{ checkpoints: [{ time: 7, serialized_screen: 'latest' }, { time: 1, serialized_screen: 'old' }] }, 'latest'],
+  ]) {
+    const h = harness(), { pane, root } = h.create('saved-terminal');
+    h.recordings.set('saved', { surface: 'terminal', ...recording });
+    await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'saved' });
+    assert.equal(h.terminals[0].output, expected);
+    assertNoRecordingControls(root);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.sockets.length, 0);
+    pane.close();
+  }
+});
+
+test('history attaches exact live surfaces and opens ended records read-only without spawning', async () => {
   const h = harness(), { pane, root } = h.create('history');
   h.sessions.set('a', [session('live'), session('ended', 'structured', 'ended'), { id: 'unknown', state: 'live' }]);
   await pane.open({ kind: 'history', agentId: 'a', surface: 'structured' });
@@ -602,31 +624,27 @@ test('history attaches exact live surfaces and ended records replay without spaw
   pane.close();
 });
 
-test('replay retention/delete recheck Admin/Owner and stale confirmation cannot mutate a newer target', async () => {
-  const h = harness({ role: 'owner' }), { pane, root } = h.create('recording');
-  await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'rec', surface: 'structured' });
-  const retention = ui(root, 'replay-retention');
-  retention.value = '7d'; retention.dispatchEvent({ type: 'change' }); await flush();
-  assert.equal(h.requests.at(-1).method, 'PATCH');
-  assert.equal(JSON.parse(h.requests.at(-1).body).retention, '7d');
-  assert.match(ui(root, 'replay-retention-message').textContent, /Saved/);
-  const confirmation = deferred(); h.confirmOverride = () => confirmation.promise;
-  ui(root, 'replay-delete').click();
-  await pane.open({ kind: 'history', agentId: 'b' });
-  confirmation.resolve(true); await flush();
-  assert.ok(!h.requests.some(request => request.method === 'DELETE'));
-  h.workspace.role = 'viewer';
-  await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'rec', surface: 'structured' });
-  assert.equal(ui(root, 'replay-retention').disabled, true);
-  const remove = ui(root, 'replay-delete'); remove.disabled = false; remove.click();
-  ui(root, 'replay-retention').value = 'none'; ui(root, 'replay-retention').dispatchEvent({ type: 'change' });
-  await flush();
-  assert.equal(h.requests.filter(request => request.method === 'PATCH').length, 1);
-  assert.equal(h.confirms.length, 1);
-  pane.close();
+test('no role or surface exposes recording playback, download, retention or deletion', async () => {
+  for (const role of ['viewer', 'operator', 'admin', 'owner']) for (const surface of ['structured', 'terminal']) {
+    const h = harness({ role }), { pane, root } = h.create(role + '-' + surface);
+    const saved = { surface, events: [], checkpoints: [], retention: '30d' };
+    h.recordings.set('rec', saved);
+    await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'rec', surface });
+    assertNoRecordingControls(root);
+    assert.equal(pane.getState().readOnly, true);
+    assert.equal(pane.getState().status, 'history');
+    assert.match(ui(root, 'recording-notice').textContent, /No recorded transcript/);
+    assert.equal(h.sockets.length, 0);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.confirms.length, 0);
+    assert.ok(h.requests.every(request => !request.method || request.method === 'GET'));
+    assert.strictEqual(h.recordings.get('rec'), saved, 'existing data and retention are untouched');
+    assert.equal(saved.retention, '30d');
+    pane.close();
+  }
 });
 
-test('stale replay/history responses and recording mutation errors do not replace newer DOM', async () => {
+test('stale saved-history responses and read failures cannot replace newer DOM', async () => {
   const h = harness({ role: 'admin' }), { pane, root } = h.create('rest');
   const replay = deferred();
   h.apiOverride = path => path.endsWith('/slow/replay') ? replay.promise : undefined;
@@ -641,13 +659,14 @@ test('stale replay/history responses and recording mutation errors do not replac
   await h.attach(pane, 'b');
   history.resolve([session('stale')]); await loading;
   assert.equal(ui(root, 'history'), null);
-  await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'rec' });
-  const patch = deferred();
-  h.apiOverride = (path, options) => options.method === 'PATCH' ? patch.promise : undefined;
-  const retention = ui(root, 'replay-retention'); retention.value = 'none'; retention.dispatchEvent({ type: 'change' });
+  const failed = deferred();
+  h.apiOverride = path => path.endsWith('/failed/replay') ? failed.promise : undefined;
+  const failedRead = pane.open({ kind: 'replay', agentId: 'a', sessionId: 'failed' });
+  await flush();
   await h.attach(pane, 'b');
-  patch.reject(new Error('old retention failure')); await flush();
-  assert.doesNotMatch(root.textContent, /old retention failure/);
+  failed.reject(new Error('old history failure')); await failedRead;
+  assert.doesNotMatch(root.textContent, /old history failure/);
+  assert.ok(h.requests.every(request => !['PATCH', 'DELETE'].includes(request.method)));
   pane.close();
 });
 
@@ -747,7 +766,7 @@ test('multiple file controls share a hard memory-only attachment byte limit', as
   pane.close();
 });
 
-test('End confirmation and already queued replay timers cannot act on replacement targets or playbacks', async () => {
+test('End confirmation cannot affect replacement targets and historical views create no playback timers', async () => {
   const h = harness(), { pane, root } = h.create('queued');
   const sa = await h.attach(pane, 'a', 'terminal', {}, 'operator', true);
   const confirmation = deferred(); h.confirmOverride = () => confirmation.promise;
@@ -760,14 +779,16 @@ test('End confirmation and already queued replay timers cannot act on replacemen
     { time: 5, kind: 'event', data: payload({ ev: 'message.delta', text: 'last' }) },
   ] });
   await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'rec' });
-  ui(root, 'replay-play').click();
-  const queued = [...h.timers.values()][0].callback;
-  const seek = ui(root, 'replay-seek'); seek.value = '2'; seek.dispatchEvent({ type: 'input' });
-  ui(root, 'replay-play').click();
-  queued();
-  assert.equal(seek.value, '2', 'cancelled playback cannot seek the replacement playback backwards');
-  assert.equal(h.timers.size, 1);
-  pane.close(); queued();
+  assert.match(ui(root, 'chat-scroll').textContent, /firstlast/);
+  assertNoRecordingControls(root);
+  assert.equal(h.timers.size, 0);
+  h.recordings.set('replacement', { surface: 'structured', events: [
+    { time: 1, kind: 'event', data: payload({ ev: 'message.delta', text: 'new saved view' }) },
+  ] });
+  await pane.open({ kind: 'replay', agentId: 'a', sessionId: 'replacement' });
+  assert.match(ui(root, 'chat-scroll').textContent, /new saved view/);
+  assert.doesNotMatch(ui(root, 'chat-scroll').textContent, /firstlast/);
+  pane.close();
   assert.equal(h.timers.size, 0);
 });
 
